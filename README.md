@@ -6,7 +6,7 @@
 
 [简体中文](README.zh-CN.md) | **English**
 
-> Helping you turn any vague idea into a top-tier journal-level paper — evidence-tracked, integrity-gated, and safe by default.
+> Helping you turn any vague idea into a top-tier journal-level paper.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)

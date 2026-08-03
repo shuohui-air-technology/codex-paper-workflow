@@ -6,7 +6,7 @@
 
 **简体中文** | [English](README.md)
 
-> 帮助您将任何一个模糊的想法落地为顶刊级别的论文 —— 证据可追踪、完整性有闸门、默认安全。
+> 帮助您将任何一个模糊的想法落地为顶刊级别的论文。
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
