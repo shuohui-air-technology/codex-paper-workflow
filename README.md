@@ -1,3 +1,5 @@
+![Paper Workflow Orchestrator Banner](assets/banner.jpg)
+
 # Paper Workflow Orchestrator
 
 [简体中文](README.zh-CN.md) | **English**
