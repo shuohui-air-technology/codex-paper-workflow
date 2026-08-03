@@ -2,8 +2,6 @@
 
 **简体中文** | [English](README.md)
 
-![Logo](assets/logo.png)
-
 > 一个面向 Codex 的、可审计的科研到论文工作流控制器 —— 证据可追踪、完整性有闸门、默认安全。
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)

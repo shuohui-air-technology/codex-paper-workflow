@@ -2,8 +2,6 @@
 
 [简体中文](README.zh-CN.md) | **English**
 
-![Logo](assets/logo.png)
-
 > An auditable, gated research-to-paper workflow controller for Codex — evidence-tracked, integrity-gated, and safe by default.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
