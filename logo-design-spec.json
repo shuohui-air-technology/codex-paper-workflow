@@ -1,0 +1,103 @@
+{
+  "name": "Paper Workflow Orchestrator Logo",
+  "version": "1.0",
+  "design_language": "Constructivism reinterpreted through Codex brand vocabulary",
+  "core_concept": "A single flower-shaped mark where each petal is also a rising bar, and the center negative space forms a terminal >_ prompt. The whole shape reads as both Codex flower and research ladder.",
+
+  "canvas": {
+    "width": 512,
+    "height": 512,
+    "background": "transparent",
+    "safe_margin": 40
+  },
+
+  "shape": {
+    "type": "single_flower_with_rising_petals",
+    "description": "Seven rounded petals arranged radially. Each petal is a vertical, slightly tapered bar whose top edge rises as you move clockwise — the shortest at 7 o'clock, the tallest at 1 o'clock. The petals share edges and are not separated by gaps. Together they form a continuous flower silhouette.",
+    "petal_count": 7,
+    "arrangement": {
+      "base_radius": 160,
+      "max_petal_height": 280,
+      "min_petal_height": 160,
+      "clockwise_rise": true,
+      "base_form": "circle",
+      "top_form": "rounded_caps_with_flat_tops"
+    },
+    "unified_surface": "The entire flower is one continuous vector path. No strokes, no outlines, no floating elements."
+  },
+
+  "color": {
+    "palette": "Codex blue-violet spectrum, applied as hard-edged bands (not gradients)",
+    "steps": [
+      { "name": "bloom", "hex": "#C084FC", "usage": "shortest petal and adjacent left segments" },
+      { "name": "iris", "hex": "#818CF8", "usage": "next two petals" },
+      { "name": "cobalt", "hex": "#4F46E5", "usage": "next two petals" },
+      { "name": "abyss", "hex": "#1E3A8A", "usage": "tallest petal and adjacent right segments" }
+    ],
+    "negative_space": "#FFFFFF",
+    "rules": [
+      "No gradients.",
+      "Each petal is one flat color.",
+      "Color follows height: shorter = lighter violet, taller = deeper blue.",
+      "Color progression suggests research moving from idea to evidence."
+    ]
+  },
+
+  "terminal_symbol": {
+    "description": "Formed by the negative space between the two tallest petals and the central circular core.",
+    "shape": "hard-edged geometric >_ prompt",
+    "greater_than": {
+      "type": "negative_space_triangle_cut",
+      "position": "between tallest and second-tallest petals",
+      "fill": "background color (white on light, dark on dark)"
+    },
+    "underscore": {
+      "type": "horizontal_rectangular_gap",
+      "position": "center of flower core",
+      "height": 24,
+      "width": 48
+    },
+    "note": "The >_ is not drawn as a separate object. It is the hole left by the petal geometry and the core, making the symbol inseparable from the flower."
+  },
+
+  "center_core": {
+    "type": "circular_void",
+    "diameter": 120,
+    "fill": "negative space",
+    "function": "Holds the underscore and anchors all petals."
+  },
+
+  "style": {
+    "surface": "flat",
+    "edges": "hard, clean vectors",
+    "roundness": "petal tips are softly rounded (radius 16px), but color boundaries are sharp",
+    "shadows": "none",
+    "outlines": "none",
+    "gradients": "none",
+    "gloss": "none"
+  },
+
+  "typography": {
+    "logotype": "codex-paper-workflow",
+    "font": "geometric sans-serif, uppercase, medium weight, wide tracking",
+    "placement": "below the mark, left-aligned with the mark center",
+    "color": "#1E293B"
+  },
+
+  "meaning": {
+    "flower": "Codex identity and organic growth of knowledge",
+    "rising_petals": "Research stages ascending from idea to finalized paper",
+    "hard_edges": "Constructivist precision, structure, and intentionality",
+    "negative_space_prompt": "Code/Codex is the invisible engine inside the research workflow"
+  },
+
+  "constraints": [
+    "Single connected shape. No separate icons, badges, or decorations.",
+    "Every visual element must be readable as part of the same form.",
+    "Color bands are flat and geometric, not blended.",
+    "The >_ must be negative space, not an overlay.",
+    "No text inside the mark."
+  ],
+
+  "export_formats": ["SVG", "PNG (512x512)", "favicon (64x64)"]
+}
