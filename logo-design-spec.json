@@ -1,103 +1,88 @@
 {
   "name": "Paper Workflow Orchestrator Logo",
-  "version": "1.0",
-  "design_language": "Constructivism reinterpreted through Codex brand vocabulary",
-  "core_concept": "A single flower-shaped mark where each petal is also a rising bar, and the center negative space forms a terminal >_ prompt. The whole shape reads as both Codex flower and research ladder.",
+  "version": "2.0",
+  "design_language": "Constructivism: hard-edged geometric forms, high contrast, functional symbolism",
+  "core_concept": "A black geometric cloud/brain silhouette contains a white terminal >_ prompt; a red upward arrow cuts diagonally through the form, turning the static Codex symbol into a research progression mark.",
 
-  "canvas": {
-    "width": 512,
-    "height": 512,
-    "background": "transparent",
-    "safe_margin": 40
+  "mark": {
+    "type": "single_connected_emblem",
+    "elements": [
+      {
+        "name": "cloud_brain",
+        "shape": "geometric, faceted cloud-like silhouette built from straight line segments and chamfered corners",
+        "color": "#1A1A1A",
+        "meaning": "Codex identity and the accumulated knowledge of the research process"
+      },
+      {
+        "name": "terminal_prompt",
+        "shape": "negative-space >_ cut into the black form",
+        "color": "background (cream on light, dark on dark)",
+        "meaning": "Codex / command-line is the invisible engine inside the workflow"
+      },
+      {
+        "name": "rising_arrow",
+        "shape": "bold diagonal arrow ascending from lower-left to upper-right",
+        "color": "#E63946",
+        "meaning": "Research stages advancing from idea to finalized paper"
+      }
+    ],
+    "composition": "The arrow pierces the cloud/brain, creating dynamic tension; the terminal prompt sits in the negative space, tying the mark back to Codex."
   },
 
-  "shape": {
-    "type": "single_flower_with_rising_petals",
-    "description": "Seven rounded petals arranged radially. Each petal is a vertical, slightly tapered bar whose top edge rises as you move clockwise — the shortest at 7 o'clock, the tallest at 1 o'clock. The petals share edges and are not separated by gaps. Together they form a continuous flower silhouette.",
-    "petal_count": 7,
-    "arrangement": {
-      "base_radius": 160,
-      "max_petal_height": 280,
-      "min_petal_height": 160,
-      "clockwise_rise": true,
-      "base_form": "circle",
-      "top_form": "rounded_caps_with_flat_tops"
+  "banner": {
+    "layout": "icon left, logotype right",
+    "background": "#FAF6EF",
+    "logotype": {
+      "text": "PAPER WORKFLOW ORCHESTRATOR",
+      "font": "geometric sans-serif, uppercase, bold weight, wide tracking",
+      "color": "#1A1A1A"
     },
-    "unified_surface": "The entire flower is one continuous vector path. No strokes, no outlines, no floating elements."
+    "tagline": {
+      "text": "GATED RESEARCH-TO-PAPER WORKFLOW FOR CODEX",
+      "font": "geometric sans-serif, uppercase, regular weight, wide tracking",
+      "color": "#1A1A1A"
+    }
   },
 
   "color": {
-    "palette": "Codex blue-violet spectrum, applied as hard-edged bands (not gradients)",
+    "palette": "high-contrast constructivist triad",
     "steps": [
-      { "name": "bloom", "hex": "#C084FC", "usage": "shortest petal and adjacent left segments" },
-      { "name": "iris", "hex": "#818CF8", "usage": "next two petals" },
-      { "name": "cobalt", "hex": "#4F46E5", "usage": "next two petals" },
-      { "name": "abyss", "hex": "#1E3A8A", "usage": "tallest petal and adjacent right segments" }
+      { "name": "ink", "hex": "#1A1A1A", "usage": "primary mark, logotype" },
+      { "name": "signal_red", "hex": "#E63946", "usage": "rising arrow, accent" },
+      { "name": "parchment", "hex": "#FAF6EF", "usage": "banner background, terminal negative space" }
     ],
-    "negative_space": "#FFFFFF",
     "rules": [
       "No gradients.",
-      "Each petal is one flat color.",
-      "Color follows height: shorter = lighter violet, taller = deeper blue.",
-      "Color progression suggests research moving from idea to evidence."
+      "Flat color fills only.",
+      "High contrast between ink and parchment.",
+      "Red arrow is the single accent color and must remain prominent."
     ]
-  },
-
-  "terminal_symbol": {
-    "description": "Formed by the negative space between the two tallest petals and the central circular core.",
-    "shape": "hard-edged geometric >_ prompt",
-    "greater_than": {
-      "type": "negative_space_triangle_cut",
-      "position": "between tallest and second-tallest petals",
-      "fill": "background color (white on light, dark on dark)"
-    },
-    "underscore": {
-      "type": "horizontal_rectangular_gap",
-      "position": "center of flower core",
-      "height": 24,
-      "width": 48
-    },
-    "note": "The >_ is not drawn as a separate object. It is the hole left by the petal geometry and the core, making the symbol inseparable from the flower."
-  },
-
-  "center_core": {
-    "type": "circular_void",
-    "diameter": 120,
-    "fill": "negative space",
-    "function": "Holds the underscore and anchors all petals."
   },
 
   "style": {
     "surface": "flat",
-    "edges": "hard, clean vectors",
-    "roundness": "petal tips are softly rounded (radius 16px), but color boundaries are sharp",
+    "edges": "hard, clean vectors; chamfered corners on cloud/brain",
+    "roundness": "none on arrow; minimal on cloud/brain chamfers",
     "shadows": "none",
     "outlines": "none",
     "gradients": "none",
     "gloss": "none"
   },
 
-  "typography": {
-    "logotype": "codex-paper-workflow",
-    "font": "geometric sans-serif, uppercase, medium weight, wide tracking",
-    "placement": "below the mark, left-aligned with the mark center",
-    "color": "#1E293B"
-  },
-
   "meaning": {
-    "flower": "Codex identity and organic growth of knowledge",
-    "rising_petals": "Research stages ascending from idea to finalized paper",
-    "hard_edges": "Constructivist precision, structure, and intentionality",
-    "negative_space_prompt": "Code/Codex is the invisible engine inside the research workflow"
+    "cloud_brain": "Codex identity and organic growth of knowledge",
+    "rising_arrow": "Research stages ascending from idea to finalized paper",
+    "terminal_prompt": "Code/Codex is the invisible engine inside the research workflow",
+    "hard_edges": "Constructivist precision, structure, and intentionality"
   },
 
   "constraints": [
-    "Single connected shape. No separate icons, badges, or decorations.",
+    "Single connected emblem; no separate floating decorations.",
     "Every visual element must be readable as part of the same form.",
-    "Color bands are flat and geometric, not blended.",
+    "Color is flat and geometric, not blended.",
     "The >_ must be negative space, not an overlay.",
-    "No text inside the mark."
+    "No text inside the mark; text belongs in the banner lockup only."
   ],
 
-  "export_formats": ["SVG", "PNG (512x512)", "favicon (64x64)"]
+  "export_formats": ["PNG banner (1448x1086)", "PNG logo (512x512)", "favicon (64x64)"]
 }
