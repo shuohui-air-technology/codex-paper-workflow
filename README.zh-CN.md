@@ -2,9 +2,11 @@
 
 # Paper Workflow Orchestrator
 
+**从模糊想法到高质量论文的完整工作流控制器。**
+
 **简体中文** | [English](README.md)
 
-> 一个完整的工作流控制器：帮助您将任何一个模糊的想法落地为顶刊级别的论文 —— 证据可追踪、完整性有闸门、默认安全。
+> 帮助您将任何一个模糊的想法落地为顶刊级别的论文 —— 证据可追踪、完整性有闸门、默认安全。
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
