@@ -4,7 +4,7 @@
 
 [简体中文](README.zh-CN.md) | **English**
 
-> A complete workflow controller that turns any vague idea into a top-tier journal-level paper — evidence-tracked, integrity-gated, and safe by default.
+> An auditable, gated research-to-paper workflow controller for Codex — evidence-tracked, integrity-gated, and safe by default.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
@@ -13,13 +13,13 @@
 
 ## Overview
 
-Paper Workflow Orchestrator is a Codex skill that transforms a fuzzy research idea into a publishable, high-quality paper. It covers the full pipeline — from idea refinement, literature discovery, and study design through experimentation, drafting, integrity audit, peer review, revision, and AI handoff — as a stage-gated, evidence-tracked process.
+Paper Workflow Orchestrator is a Codex skill that organizes the full research-to-paper pipeline — from idea, literature, and study design through experimentation, writing, integrity audit, peer review, revision, and AI handoff — into a stage-gated, evidence-tracked process.
 
 The main model acts as editor-in-chief: it owns routing, the evidence ledger, prompt design, conflict resolution, and final synthesis. Codex-internal subagents execute only bounded, independently reviewable tasks. Every stage ends with a confirmation gate; the workflow never advances silently.
 
 ## Features
 
-Every feature below serves one goal: moving a vague idea closer to a finished, journal-ready manuscript. Each maps to a concrete component in this repository:
+Each feature maps to a concrete component in this repository:
 
 | Feature | Implementation |
 |---|---|
@@ -36,27 +36,18 @@ Every feature below serves one goal: moving a vague idea closer to a finished, j
 
 ## Workflow Stages
 
-The orchestrator routes one primary downstream skill per stage. The 11 stages are grouped into five phases that trace the journey from a vague idea to a delivered paper:
+The orchestrator routes one primary downstream skill per stage. Each stage produces required artifacts and ends with a user gate.
 
-**Phase 1 — Ideation** (turning a fuzzy thought into a locked research question)
 1. **Intake** — diagnose input, confirm entry mode and constraints
 2. **Directions** — explore 3–5 candidate research directions
 3. **Literature** — discover and triage verified sources
 4. **Topic** — gap / contribution / feasibility verdict and question lock
-
-**Phase 2 — Design** (building a falsifiable plan)
 5. **Design** — falsifiable study design and experiment matrix
 6. **Architecture** — freeze paper structure, section profile, outline
-
-**Phase 3 — Drafting** (producing the manuscript)
 7. **Drafting** — bounded internal agents write sections; main model synthesizes
-
-**Phase 4 — Integrity & Review** (ensuring the paper holds up)
 8. **Integrity** — audit citations, numbers, claims, leakage, reproducibility
 9. **Naturalization** — format-safe humanizer pass with claim/evidence diff
 10. **Review** — peer-review simulation and revision matrix
-
-**Phase 5 — Finalization** (delivery)
 11. **Finalize** — final audit, handoff card, and delivery
 
 At every gate the user receives completed work, a progress snapshot, remaining risks, 2–5 next-step options (one marked **Recommended**), and the exact confirmation needed to continue. The abstract is written only after the body, results, interpretation, and conclusion are stable; a conclusion is always mandatory.
