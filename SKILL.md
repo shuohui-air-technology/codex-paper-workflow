@@ -13,6 +13,7 @@ Use `research-skill-router` first. Activate this orchestrator for an end-to-end 
 
 - **guided_idea** (default): an underspecified idea becomes a defensible research question and paper plan.
 - **draft_audit**: an existing manuscript, repository, or citation bundle is audited or prepared for revision; do not force it through idea exploration.
+  An exported citation bundle (for example, a `.bib` file with PDFs) submitted for reference verification, source-ID mapping, or audit is `draft_audit`, even when no manuscript is provided and the user has not yet decided whether to continue the paper. Do not route such a request to `use_narrow_skill_directly` merely because the immediate operation is reference verification.
 - **write_or_revise**: a confirmed design or draft enters outline, drafting, review, or revision.
 - **autonomous_experiment**: only an explicit bounded experiment request with a complete experiment contract; `autoresearch` becomes the sole run controller.
 
@@ -187,6 +188,7 @@ stage_receipt_sha256:
 validity_status: clear
 ```
 
+Evaluate fields in the exact order listed in the contract schema and report the first missing or invalid field; do not skip ahead or infer satisfaction from later fields.
 Missing any field is a hard block. Before loading `autoresearch`, run the
 dependency-free validator and require its JSON `status: pass`:
 
