@@ -1,0 +1,25 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Codex and project-private state
+.research/
+.paper/
+.codex/
+.trae/
+
+# Local experiment and editor files
+*.log
+*.tmp
+*.bak
+.env
+.env.*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
