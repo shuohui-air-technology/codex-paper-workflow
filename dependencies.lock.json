@@ -1,0 +1,63 @@
+{
+  "schema_version": "workflow-dependencies-v1",
+  "generated_from": "shuohui-air-technology/codex-paper-workflow",
+  "profiles": {
+    "core": [
+      "paper-workflow-orchestrator",
+      "research-skill-router",
+      "academic-manuscript-final-editor"
+    ],
+    "standard": [
+      "paper-workflow-orchestrator",
+      "research-skill-router",
+      "academic-manuscript-final-editor",
+      "clarify-research-idea",
+      "research-hub",
+      "literature-triage-matrix",
+      "gap-to-topic",
+      "research-design-helper",
+      "paper-memory-builder",
+      "ml-paper-writing",
+      "academic-paper",
+      "academic-paper-reviewer",
+      "humanizer",
+      "scientific-visualization"
+    ],
+    "full": [
+      "paper-workflow-orchestrator",
+      "research-skill-router",
+      "academic-manuscript-final-editor",
+      "clarify-research-idea",
+      "research-hub",
+      "literature-triage-matrix",
+      "gap-to-topic",
+      "research-design-helper",
+      "paper-memory-builder",
+      "ml-paper-writing",
+      "academic-paper",
+      "academic-paper-reviewer",
+      "humanizer",
+      "scientific-visualization",
+      "autoresearch",
+      "ara-rigor-reviewer"
+    ]
+  },
+  "skills": {
+    "paper-workflow-orchestrator": {"source": "repository", "path": ".", "license": "MIT"},
+    "research-skill-router": {"source": "bundled", "path": "companion-skills/research-skill-router", "license": "MIT"},
+    "academic-manuscript-final-editor": {"source": "bundled", "path": "companion-skills/academic-manuscript-final-editor", "license": "MIT"},
+    "scientific-visualization": {"source": "github", "repository": "K-Dense-AI/scientific-agent-skills", "commit": "36d8f13a1e754618794bf42f417884940077b4ae", "path": "skills/scientific-visualization", "license": "MIT"},
+    "clarify-research-idea": {"source": "github", "repository": "cpt13-g/clarify-research-idea", "commit": "1f8334d144b39f9fb029293d26e1dc16196212d2", "path": ".agents/skills/clarify-research-idea", "license": "Not declared in upstream repository"},
+    "research-hub": {"source": "github", "repository": "WenyuChiou/research-hub", "commit": "3143d2d62f798960731cae5a2b4f91aeaca25e75", "path": "skills/research-hub", "license": "MIT"},
+    "literature-triage-matrix": {"source": "github", "repository": "WenyuChiou/research-hub", "commit": "3143d2d62f798960731cae5a2b4f91aeaca25e75", "path": "skills/literature-triage-matrix", "license": "MIT"},
+    "gap-to-topic": {"source": "github", "repository": "WenyuChiou/research-hub", "commit": "3143d2d62f798960731cae5a2b4f91aeaca25e75", "path": "skills/gap-to-topic", "license": "MIT"},
+    "research-design-helper": {"source": "github", "repository": "WenyuChiou/research-hub", "commit": "3143d2d62f798960731cae5a2b4f91aeaca25e75", "path": "skills/research-design-helper", "license": "MIT"},
+    "paper-memory-builder": {"source": "github", "repository": "WenyuChiou/research-hub", "commit": "3143d2d62f798960731cae5a2b4f91aeaca25e75", "path": "skills/paper-memory-builder", "license": "MIT"},
+    "ml-paper-writing": {"source": "github", "repository": "Orchestra-Research/AI-Research-SKILLs", "commit": "773a52944ba4747a18bd4ae9ade53fff041adcbc", "path": "20-ml-paper-writing/ml-paper-writing", "license": "MIT"},
+    "academic-paper": {"source": "github", "repository": "Imbad0202/academic-research-skills", "commit": "5debcd2efb686dce0205ba9094b6413dae5f89c0", "path": "academic-paper", "license": "CC BY-NC 4.0"},
+    "academic-paper-reviewer": {"source": "github", "repository": "Imbad0202/academic-research-skills", "commit": "5debcd2efb686dce0205ba9094b6413dae5f89c0", "path": "academic-paper-reviewer", "license": "CC BY-NC 4.0"},
+    "humanizer": {"source": "github", "repository": "blader/humanizer", "commit": "e2e92e7b4b8229253ed5c8e81dc65463fdeddda5", "path": ".", "license": "MIT"},
+    "autoresearch": {"source": "github", "repository": "Orchestra-Research/AI-Research-SKILLs", "commit": "773a52944ba4747a18bd4ae9ade53fff041adcbc", "path": "0-autoresearch-skill", "license": "MIT"},
+    "ara-rigor-reviewer": {"source": "github", "repository": "Orchestra-Research/AI-Research-SKILLs", "commit": "773a52944ba4747a18bd4ae9ade53fff041adcbc", "path": "22-agent-native-research-artifact/rigor-reviewer", "license": "MIT"}
+  }
+}
