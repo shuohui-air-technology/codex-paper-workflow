@@ -11,7 +11,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
 ![Codex Skill](https://img.shields.io/badge/Codex-Skill-8A2BE2.svg)
-![Dependencies](https://img.shields.io/badge/Dependencies-None-success.svg)
+![核心依赖](https://img.shields.io/badge/Core%20dependencies-Python%20stdlib-success.svg)
 
 ## 概述
 
@@ -37,7 +37,9 @@ Paper Workflow Orchestrator 是一个 Codex skill，将完整的科研到论文�
 | 格式安全的 humanizer 适配器：契约缺失即 fail-closed | `scripts/humanizer_preflight.py`、`references/humanizer-adapter.md` |
 | 自主实验启动前必须通过实验合同验证 | `scripts/experiment_contract_validator.py` |
 | 论文结构闸门：必需章节与顺序校验 | `scripts/paper_section_validator.py`、`references/paper-section-contract.md` |
-| 零运行时依赖（仅 Python 标准库） | 全部 `scripts/*.py` |
+| 科研图件路由：主张绑定收据与 fail-closed 验证 | `references/scientific-visualization-integration.md`、`scripts/figure_contract_validator.py` |
+| core、standard、full 三种配置的固定版本一键安装 | `dependencies.lock.json`、`scripts/install_workflow.py` |
+| 编排器核心脚本仅使用 Python 标准库 | 全部 `scripts/*.py` |
 
 ## 工作流阶段
 
@@ -71,24 +73,65 @@ paper-workflow-orchestrator/
 │   ├── paper-section-contract.md     # 标题/摘要/方法/结果/结论契约
 │   ├── progress-schema.md            # 进度记忆 v0.4 schema 与错误规则
 │   ├── stage-contracts.md            # 阶段表、委派与验收谓词
+│   ├── scientific-visualization-integration.md # 图件路由与收据契约
 │   ├── final-editor-integration.md   # 作者引导终稿编辑握手协议
 │   └── humanizer-adapter.md          # 格式安全 humanizer 适配器协议
 ├── scripts/
 │   ├── progress_manager.py           # 进度初始化/验证/迁移/记录/恢复
+│   ├── install_workflow.py            # 跨平台固定版本 Skill 安装器
+│   ├── figure_contract_validator.py   # 图件来源与输出验证器
 │   ├── humanizer_preflight.py        # humanizer 预检（fail-closed）
 │   ├── paper_section_validator.py    # 章节顺序与必需章节检查
 │   ├── final_edit_receipt_validator.py # 终稿编辑受保护收据验证器
 │   └── experiment_contract_validator.py  # 有界实验合同验证器
+├── dependencies.lock.json             # 固定 GitHub 来源与安装配置
+├── tests/                             # 零依赖工作流与安装器测试
 └── companion-skills/
+    ├── research-skill-router/         # 内置路由 skill
     └── academic-manuscript-final-editor/  # 终稿编辑阶段的配套 skill
 ```
 
 ## 安装
 
-本仓库包含两个 skill，需分别安装：
+推荐在仓库根目录执行一条命令：
 
-1. **`paper-workflow-orchestrator`** —— 主工作流控制器。将仓库根目录的 skill 文件复制到 Codex skills 目录（`CODEX_HOME/skills`，未设置 `CODEX_HOME` 时默认为 `~/.codex/skills`）。
-2. **`academic-manuscript-final-editor`** —— 作者引导终稿编辑阶段使用的配套 skill。将 `companion-skills/academic-manuscript-final-editor/` 作为独立目录复制到同一个 skills 目录。
+```bash
+python scripts/install_workflow.py
+```
+
+Windows 建议使用 `py -3`（或已正确配置的 `python`）；macOS/Linux 建议使用
+`python3`。`core` 配置和仅安装仓库内置 skill 的手动方式可以离线运行。
+`standard` 与 `full` 会通过 HTTPS 从 GitHub 下载固定提交，因此安装前必须能
+访问 GitHub。
+
+默认 `standard` 配置会安装 orchestrator、router、终稿编辑器、研究阶段、
+写作/审稿 skill、humanizer 以及 `scientific-visualization`。使用
+`--profile core` 只安装仓库内置工作流，使用 `--profile full` 额外安装受
+明确授权约束的 `autoresearch` 和 ARA 审查器。已安装不等于同时加载；路由器
+仍然保证每个阶段只选择一个主 skill。
+
+安装器使用上游公开名称 `academic-paper`。如果宿主已经提供
+`academic-research-suite`，可以继续将其作为向后兼容的通用论文别名使用；
+安装器不会重复安装一个同名副本。
+
+常用选项：
+
+```bash
+python scripts/install_workflow.py --profile standard --dry-run
+python scripts/install_workflow.py --profile standard --verify
+python scripts/install_workflow.py --profile standard --update
+# 有意缩小已安装配置时：
+python scripts/install_workflow.py --profile core --update --prune
+```
+
+安装器从 `dependencies.lock.json` 指定的固定 Git 提交下载外部 skill，拒绝
+不安全压缩包路径和符号链接；仅将经过校验、且目标仍在压缩包内的相对目录别名
+安全地物化为普通目录；检测被修改的非托管目录，通过临时目录安装，
+并写入 `.paper-workflow-install.json` 验证收据。它只安装 Skill 文件，不会
+静默安装 Python、`uv`、Chrome/Chromium 或绘图库。缩小已安装配置默认会阻断；
+`--prune` 是显式请求，并会先备份再移除不在目标配置中的既有托管 skill。
+
+如需手动/离线安装仓库内置 skill：
 
 **Windows PowerShell**（在仓库根目录执行）：
 
@@ -97,7 +140,12 @@ $skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else {
 $main = Join-Path $skillsHome 'paper-workflow-orchestrator'
 New-Item -ItemType Directory -Force -Path $main | Out-Null
 Copy-Item -Recurse -Force SKILL.md, agents, assets, references, scripts $main
-Copy-Item -Recurse -Force companion-skills\academic-manuscript-final-editor (Join-Path $skillsHome 'academic-manuscript-final-editor')
+Copy-Item -Force LICENSE (Join-Path $main 'LICENSE')
+$finalEditor = Join-Path $skillsHome 'academic-manuscript-final-editor'
+$router = Join-Path $skillsHome 'research-skill-router'
+New-Item -ItemType Directory -Force -Path $finalEditor, $router | Out-Null
+Copy-Item -Recurse -Force companion-skills\academic-manuscript-final-editor\* $finalEditor
+Copy-Item -Recurse -Force companion-skills\research-skill-router\* $router
 ```
 
 **macOS / Linux**（在仓库根目录执行）：
@@ -106,12 +154,28 @@ Copy-Item -Recurse -Force companion-skills\academic-manuscript-final-editor (Joi
 SKILLS_HOME="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$SKILLS_HOME/paper-workflow-orchestrator"
 cp -R SKILL.md agents assets references scripts "$SKILLS_HOME/paper-workflow-orchestrator/"
-cp -R companion-skills/academic-manuscript-final-editor "$SKILLS_HOME/"
+cp -f LICENSE "$SKILLS_HOME/paper-workflow-orchestrator/LICENSE"
+mkdir -p "$SKILLS_HOME/academic-manuscript-final-editor" "$SKILLS_HOME/research-skill-router"
+cp -R companion-skills/academic-manuscript-final-editor/. "$SKILLS_HOME/academic-manuscript-final-editor/"
+cp -R companion-skills/research-skill-router/. "$SKILLS_HOME/research-skill-router/"
 ```
 
 安装后重新打开 Codex，或重新加载 skills 列表。
 
-作者引导终稿编辑阶段需要配套的 `academic-manuscript-final-editor` skill，最低版本为 `2.1.0`，并且其 YAML frontmatter 必须声明 `capability_schema: final-editor-v1`；匹配版本已收录在 `companion-skills/` 中。若该 Skill 不可用或不兼容，orchestrator 会报告能力缺失，并询问是安装还是明确跳过该阶段，不会伪造终稿编辑收据。
+科研图件路由需要来自 [K-Dense scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills/tree/36d8f13a1e754618794bf42f417884940077b4ae/skills/scientific-visualization)
+的固定版本 `scientific-visualization` 子 skill。其示例需要 Python 3.11+、
+`uv` 和所选绘图库；这些是运行时前提，不是安装器的隐藏操作。作者引导终稿
+编辑阶段需要 `academic-manuscript-final-editor` 2.1.0 或更高版本，并在
+YAML frontmatter 声明 `capability_schema: final-editor-v1`。
+
+### 固定的第三方来源
+
+外部 skill 只会按 [`dependencies.lock.json`](dependencies.lock.json) 中记录的
+固定提交下载，安装器不会静默跟随可变分支。每个条目的上游许可证也记录在
+清单中：K-Dense 科研绘图（MIT）、research-hub（MIT）、Orchestra AI Research
+Skills（MIT）、humanizer（MIT）以及 Academic Research Skills（CC BY-NC 4.0）。
+`clarify-research-idea` 的固定仓库未声明许可证，重新分发前请自行审阅其条款。
+安装 skill 不会授予超出上游许可证的权利。
 
 ## 使用方式
 
@@ -123,7 +187,8 @@ Use paper-workflow-orchestrator to run a gated, evidence-tracked research-to-pap
 
 该 skill 是工作流控制器，不是单一任务工具。当仅需文献矩阵、研究设计、论文润色或引用审计时，应让 `research-skill-router` 选择更窄的专用 skill，避免不必要地加载完整工作流。
 
-所有脚本只使用 Python 标准库（Python 3.10+），无需安装任何第三方依赖。
+编排器和验证器只使用 Python 标准库（Python 3.10+）。科研图件执行路径遵循
+上游 Skill 的 Python 3.11+ / `uv` 要求。
 
 ## 安全边界
 
