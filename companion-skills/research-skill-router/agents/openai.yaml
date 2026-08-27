@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Skill Router"
+  short_description: "Route academic and AI/ML work to one primary skill"
+  default_prompt: "Choose the smallest appropriate research skill for this task"
