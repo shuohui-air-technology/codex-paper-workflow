@@ -42,6 +42,7 @@ Do not load every research skill together. Select exactly one downstream primary
 | Existing draft audit | `paper-memory-builder` then ARS integrity workflow | claims/figures memory and read-only audit inputs |
 | ML paper drafting | `ml-paper-writing` | venue-aware paper structure and prose |
 | General paper drafting | `academic-research-suite` (`academic-paper`) | general academic draft |
+| Scientific figure production / audit | `scientific-visualization` after figure inputs are frozen | claim-bound figure artifacts and a validated figure receipt |
 | Author-guided final editing | `academic-manuscript-final-editor` after review/revision and integrity | author-rule ledger, whole-manuscript analogue dispositions, protected final-edit receipt |
 | Prose naturalization | `humanizer` | natural, non-mechanical prose with claims preserved |
 | Bounded autonomous experiments | `autoresearch` after contract validation | bounded experiment log and results |
@@ -58,9 +59,19 @@ semantics. A venue may rename or combine headings, but it may not remove the
 abstract-after-body rule, the mandatory conclusion, or the discussion
 interpretation function.
 
+For claim-bearing data plots, read [scientific-visualization-integration.md](references/scientific-visualization-integration.md)
+only when the frozen figure plan selects that route. Do not load the complete
+upstream K-Dense collection, and do not load this downstream skill for prose-only
+or figure-free work.
+
 ## Required project state
 
 At project start, locate or create the user-approved project `.research/` directory and initialize `.research/progress.md`. Read it before every new stage, after resuming a session, and before dispatching subagents. Use the bundled `scripts/progress_manager.py` for initialization, transactional updates, recovery, and validation when possible. Read [progress-schema.md](references/progress-schema.md) for the canonical format and error-governance rules.
+
+Use the normalized machine stage IDs from `progress-schema.md` for events and
+blockers. In particular, record figure work under `scientific_figures` (not a
+free-form display label such as `figures`) and record the abstract/title/keyword,
+author-edit, and final-audit checkpoints under their normalized IDs.
 
 If an existing project has a v0.2 or v0.3 progress file, do not overwrite it or guess its mode. Run `progress_manager.py migrate --file ... --mode ... --confirm` only after the user confirms the mode; supply `--current-stage` if its stage is not normalized.
 
@@ -88,6 +99,7 @@ Persist the complete handoff set, not only the final manuscript:
 .research/final_edit_audit_receipt.json
 .research/final/
 .research/stage_receipts/
+.research/figures/<figure_id>/
 ```
 
 Create these only when their stages are selected; never create empty placeholders:
@@ -153,9 +165,22 @@ Agents return drafts or structured evidence plus a `progress_delta`; they never 
 
 Before dispatch, write a stage receipt containing the context-pack manifest, included/excluded artifacts, source IDs, glossary/style profile, output schema, per-agent token/output cap, and hashes of the inputs. Merge structured outputs before loading prose into the main context. If a cap is exceeded or an agent returns an unbounded transcript, keep the artifact out of the next prompt and record a warning.
 
+### 6a. Produce and audit scientific figures
+
+When `figure_plan.yml` contains a claim-bearing data plot or image panel, freeze
+its claim, source data, units, transformations, uncertainty, missing-data policy,
+palette, target width, and panel numbering before dispatch. Route the figure task
+to `scientific-visualization` as the sole downstream primary. Each agent returns
+figure files and a `progress_delta`; only the main model writes progress and
+accepts the resulting `figure_receipt.json`. Render at final physical size,
+inspect the preview, run `figure_contract_validator.py`, and keep the figure out
+of Results, captions, Abstract, and Conclusion until the receipt passes. A
+claim/evidence mismatch or any potentially misleading encoding is a
+`critical_validity_blocker`, not a cosmetic revision.
+
 ### 7. Audit, review, revise, final-edit, naturalize, finalize
 
-Run an integrity audit before language editing and again before finalization. Check citations, numbers, equations, figures, claims, leakage, and reproducibility. Block the transition on a failed audit and record the failure as an error rule. A missing or misleading Discussion heading is not itself a failure when the required interpretation, comparison, boundary, and limitation functions are present elsewhere; a missing Conclusion is always a failure.
+Run an integrity audit before language editing and again before finalization. Check citations, numbers, equations, figures, claims, leakage, and reproducibility. Every claim-bearing figure must have a passing figure receipt and a claim/evidence match. Block the transition on a failed audit and record the failure as an error rule. A missing or misleading Discussion heading is not itself a failure when the required interpretation, comparison, boundary, and limitation functions are present elsewhere; a missing Conclusion is always a failure.
 
 If any data, measurement, identification, leakage, model-assumption, baseline,
 or robustness issue could change the core conclusion, record a

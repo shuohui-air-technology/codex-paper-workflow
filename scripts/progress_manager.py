@@ -49,8 +49,10 @@ CURRENT_WORKFLOW_VERSION = "paper-workflow-orchestrator-v0.4"
 LEGACY_WORKFLOW_VERSIONS = {"paper-workflow-orchestrator-v0.2", "paper-workflow-orchestrator-v0.3"}
 ALLOWED_MODES = {"guided_idea", "draft_audit", "write_or_revise", "autonomous_experiment"}
 ALLOWED_STAGES = {
-    "intake", "directions", "literature", "topic", "design", "outline",
-    "drafting", "integrity", "prose_naturalization", "review", "revision",
+    "intake", "directions", "literature", "topic", "design", "draft_audit",
+    "venue_outline", "outline", "drafting", "scientific_figures",
+    "abstract_title_keywords", "integrity", "review", "revision",
+    "author_guided_final_editing", "prose_naturalization", "final_editorial_audit",
     "experiments", "finalize",
 }
 ALLOWED_HUB_STATUS = {"ready", "degraded", "missing", "not_applicable"}

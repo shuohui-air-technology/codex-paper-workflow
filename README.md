@@ -11,7 +11,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
 ![Codex Skill](https://img.shields.io/badge/Codex-Skill-8A2BE2.svg)
-![Dependencies](https://img.shields.io/badge/Dependencies-None-success.svg)
+![Core dependencies](https://img.shields.io/badge/Core%20dependencies-Python%20stdlib-success.svg)
 
 ## Overview
 
@@ -37,7 +37,9 @@ Each feature maps to a concrete component in this repository:
 | Format-safe humanizer adapter that fails closed on any missing contract | `scripts/humanizer_preflight.py`, `references/humanizer-adapter.md` |
 | Experiment-contract validation required before any autonomous run | `scripts/experiment_contract_validator.py` |
 | Paper structure gates: required sections and their order | `scripts/paper_section_validator.py`, `references/paper-section-contract.md` |
-| Zero runtime dependencies (Python stdlib only) | all `scripts/*.py` |
+| Scientific figure route with claim-bound receipts and fail-closed validation | `references/scientific-visualization-integration.md`, `scripts/figure_contract_validator.py` |
+| Pinned one-click installation for core, standard, and full profiles | `dependencies.lock.json`, `scripts/install_workflow.py` |
+| Core scripts use only the Python standard library | all `scripts/*.py` |
 
 ## Workflow Stages
 
@@ -71,33 +73,82 @@ paper-workflow-orchestrator/
 │   ├── paper-section-contract.md     # Title/abstract/methods/results/conclusion contract
 │   ├── progress-schema.md            # Progress memory v0.4 schema & error rules
 │   ├── stage-contracts.md            # Stage table, delegation & acceptance predicates
+│   ├── scientific-visualization-integration.md # Figure routing and receipt contract
 │   ├── final-editor-integration.md   # Author-guided final-edit handshake
 │   └── humanizer-adapter.md          # Format-safe humanizer adapter protocol
 ├── scripts/
 │   ├── progress_manager.py           # Progress init/validate/migrate/record/restore
+│   ├── install_workflow.py            # Cross-platform pinned Skill installer
+│   ├── figure_contract_validator.py   # Figure provenance and output validator
 │   ├── humanizer_preflight.py        # Humanizer preflight (fail-closed)
 │   ├── paper_section_validator.py    # Section order & required-section checks
 │   ├── final_edit_receipt_validator.py # Protected final-edit receipt validator
 │   └── experiment_contract_validator.py  # Bounded experiment contract validator
+├── dependencies.lock.json             # Pinned GitHub sources and install profiles
+├── tests/                             # Dependency-free workflow and installer tests
 └── companion-skills/
-    └── academic-manuscript-final-editor/  # Companion skill for the final-edit stage
+    ├── research-skill-router/         # Bundled routing skill
+    └── academic-manuscript-final-editor/  # Companion skill for final editing
 ```
 
 ## Installation
 
-This repository contains two skills, installed separately:
+The recommended installation is one command from the repository root:
 
-1. **`paper-workflow-orchestrator`** — the main workflow controller. Copy the skill files from the repository root into your Codex skills folder (`CODEX_HOME/skills`, defaults to `~/.codex/skills` when `CODEX_HOME` is unset).
-2. **`academic-manuscript-final-editor`** — the companion skill used by the author-guided final-edit stage. Copy `companion-skills/academic-manuscript-final-editor/` into the same skills folder as its own directory.
+```bash
+python scripts/install_workflow.py
+```
 
-**Windows PowerShell** (run from the repository root):
+On Windows, use `py -3` (or `python`) when that is the configured Python
+launcher; on macOS/Linux, use `python3`. The `core` profile and the manual
+repository-only installation work offline. `standard` and `full` fetch pinned
+third-party archives over HTTPS from GitHub, so network access to GitHub is an
+installation prerequisite.
+
+The default `standard` profile installs the orchestrator, router, final editor,
+research stages, writing/review skills, humanizer, and
+`scientific-visualization`. Use `--profile core` for only the bundled workflow
+skills, or `--profile full` to add the explicitly gated `autoresearch` and ARA
+reviewer. Installed skills are not loaded simultaneously; the router still
+selects one primary skill per stage.
+
+`academic-paper` is the public upstream name used by the installer. Hosts that
+already expose `academic-research-suite` may keep using that name as the
+backwards-compatible general-paper alias; it is not installed a second time.
+
+Useful options:
+
+```bash
+python scripts/install_workflow.py --profile standard --dry-run
+python scripts/install_workflow.py --profile standard --verify
+python scripts/install_workflow.py --profile standard --update
+# when intentionally shrinking a previously installed profile:
+python scripts/install_workflow.py --profile core --update --prune
+```
+
+The installer downloads external skills at fixed Git commit SHAs from
+`dependencies.lock.json`, rejects unsafe archive paths and symlink targets, materializes
+only validated relative in-archive directory aliases, and refuses
+changed unmanaged destinations, installs through a staging directory, and
+writes `.paper-workflow-install.json` as a verification receipt. It installs
+Skill files only; it does not silently install Python, `uv`, Chrome/Chromium,
+or third-party plotting packages.
+Profile reduction is blocked by default; `--prune` is an explicit, backed-up
+request to remove previously managed skills outside the selected profile.
+
+For a manual/offline installation of the repository-owned skills:
 
 ```powershell
 $skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex\skills' }
 $main = Join-Path $skillsHome 'paper-workflow-orchestrator'
 New-Item -ItemType Directory -Force -Path $main | Out-Null
 Copy-Item -Recurse -Force SKILL.md, agents, assets, references, scripts $main
-Copy-Item -Recurse -Force companion-skills\academic-manuscript-final-editor (Join-Path $skillsHome 'academic-manuscript-final-editor')
+Copy-Item -Force LICENSE (Join-Path $main 'LICENSE')
+$finalEditor = Join-Path $skillsHome 'academic-manuscript-final-editor'
+$router = Join-Path $skillsHome 'research-skill-router'
+New-Item -ItemType Directory -Force -Path $finalEditor, $router | Out-Null
+Copy-Item -Recurse -Force companion-skills\academic-manuscript-final-editor\* $finalEditor
+Copy-Item -Recurse -Force companion-skills\research-skill-router\* $router
 ```
 
 **macOS / Linux** (run from the repository root):
@@ -106,12 +157,31 @@ Copy-Item -Recurse -Force companion-skills\academic-manuscript-final-editor (Joi
 SKILLS_HOME="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$SKILLS_HOME/paper-workflow-orchestrator"
 cp -R SKILL.md agents assets references scripts "$SKILLS_HOME/paper-workflow-orchestrator/"
-cp -R companion-skills/academic-manuscript-final-editor "$SKILLS_HOME/"
+cp -f LICENSE "$SKILLS_HOME/paper-workflow-orchestrator/LICENSE"
+mkdir -p "$SKILLS_HOME/academic-manuscript-final-editor" "$SKILLS_HOME/research-skill-router"
+cp -R companion-skills/academic-manuscript-final-editor/. "$SKILLS_HOME/academic-manuscript-final-editor/"
+cp -R companion-skills/research-skill-router/. "$SKILLS_HOME/research-skill-router/"
 ```
 
 Reload Codex or refresh the skills list after installing.
 
-The author-guided final-edit stage requires the companion `academic-manuscript-final-editor` skill, version `2.1.0` or newer, with `capability_schema: final-editor-v1` in its YAML frontmatter; the matching version is bundled in `companion-skills/`. If it is unavailable or incompatible, the orchestrator reports the missing capability and asks whether to install it or explicitly skip that stage.
+The scientific figure route requires the pinned `scientific-visualization`
+subskill from [K-Dense scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills/tree/36d8f13a1e754618794bf42f417884940077b4ae/skills/scientific-visualization).
+Its examples require Python 3.11+, `uv`, and selected plotting packages; these
+are runtime prerequisites, not hidden installer actions. The author-guided
+final-edit stage requires `academic-manuscript-final-editor` version `2.1.0`
+or newer with `capability_schema: final-editor-v1`.
+
+### Pinned third-party sources
+
+External skills are fetched at the exact commits recorded in
+[`dependencies.lock.json`](dependencies.lock.json); the installer does not
+silently follow a moving branch. The upstream license is recorded beside each
+entry: K-Dense scientific visualization (MIT), research-hub (MIT), Orchestra
+AI Research Skills (MIT), humanizer (MIT), and Academic Research Skills (CC
+BY-NC 4.0). `clarify-research-idea` does not declare a license in its pinned
+repository, so review its terms before redistribution. Installing a skill does
+not grant rights beyond the upstream license.
 
 ## Usage
 
@@ -123,7 +193,9 @@ Use paper-workflow-orchestrator to run a gated, evidence-tracked research-to-pap
 
 This skill is a workflow controller, not a single-task tool. When you only need a literature matrix, study design, prose polishing, or citation audit, let `research-skill-router` select a narrower dedicated skill instead of loading the full pipeline.
 
-All scripts use only the Python standard library (Python 3.10+); no third-party packages are required.
+The orchestrator and validators use only the Python standard library (Python
+3.10+). The optional scientific figure execution path uses the upstream Skill's
+Python 3.11+ / `uv` requirements.
 
 ## Safety Boundaries
 

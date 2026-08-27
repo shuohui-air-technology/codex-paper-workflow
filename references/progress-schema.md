@@ -2,6 +2,14 @@
 
 Use `.research/progress.md` as the canonical, append-aware project memory. Keep the headings stable so another AI can parse the file without the full conversation.
 
+Use these normalized machine stage IDs in `current_stage`, event records, stage
+receipts, and blocker checks (human-facing headings may still be translated):
+`intake`, `directions`, `literature`, `topic`, `design`, `draft_audit`,
+`venue_outline`, `outline`, `drafting`, `scientific_figures`,
+`abstract_title_keywords`, `integrity`, `review`, `revision`,
+`author_guided_final_editing`, `prose_naturalization`, `final_editorial_audit`,
+`experiments`, and `finalize`.
+
 ## Canonical sections
 
 ```markdown

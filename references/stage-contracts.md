@@ -23,6 +23,7 @@ The orchestrator owns stage transitions and user gates. Downstream skills perfor
 | draft audit | `paper-memory-builder` then ARS integrity | `.paper/claims.yml`, `.paper/figures.yml`, `integrity_report.md` | keep read-only unless explicitly authorized |
 | venue/outline | `ml-paper-writing` or `academic-paper` | `outline.md`, `figure_plan.yml`, section profile receipt (`paper_type`, language, method profile, Discussion mode) | freeze architecture |
 | drafting | selected writing skill | `draft/`, agent reports | approve complete draft |
+| scientific figures | `scientific-visualization` after frozen figure inputs | `.research/figures/<figure_id>/figure_receipt.json` and rendered outputs | pass figure contract and visual review |
 | abstract/title/keywords | orchestrator after drafting | accepted body, abstract candidates, terminology record | user confirms factual emphasis and consistency |
 | integrity | audit agent | `integrity_report.md` | pass audit |
 | review | `academic-research-suite` internal `academic-paper-reviewer` workflow | `reviews/`, `revision_matrix.md` | accept revision plan |
@@ -32,6 +33,13 @@ The orchestrator owns stage transitions and user gates. Downstream skills perfor
 | final editorial audit | `academic-manuscript-final-editor` in read-only `Audit` mode | validated `final_edit_audit_receipt.json` | accept author-voice fidelity |
 | experiments | `autoresearch` only after contract validation | `experiment_contract.yml`, logs, results | confirm bounded handoff |
 | finalize | document/PDF skill as needed | `final/` | accept delivery |
+
+Progress events use normalized IDs rather than display labels: the figure row is
+`scientific_figures`, the abstract/title/keywords row is
+`abstract_title_keywords`, author-guided editing is
+`author_guided_final_editing`, and the final editorial audit is
+`final_editorial_audit`. The complete vocabulary is defined in
+`progress-schema.md` and enforced by `progress_manager.py`.
 
 ## Canonical artifact ownership
 
@@ -49,6 +57,7 @@ Downstream skills may use their own native outputs. The orchestrator creates a s
 | `experiment_matrix.yml` | design/experiment adapter | ML experiments | contract and run logs |
 | `claim_evidence_matrix.yml` | orchestrator/paper memory | drafting or audit | claim IDs and evidence refs |
 | `figure_plan.yml` | outline stage | paper drafting | claim and data refs |
+| `.research/figures/<figure_id>/figure_receipt.json` | scientific-visualization adapter | claim-bearing figure | source/code/output hashes and visual review |
 | `stage_receipts/` | orchestrator | every delegated stage | context hashes, budgets, statuses |
 | `author_style_ledger.yml` | final editor + orchestrator wrapper | author-guided final editing | author feedback IDs and scoped rules |
 | `editorial_scan.json` | final-editor scanner | author-guided final editing | input hashes and candidate findings |
@@ -65,6 +74,7 @@ Do not advance merely because a file exists:
 - topic: the user has accepted the gap/contribution/feasibility verdict;
 - design: the design is locked, has no unresolved TODO/placeholder segments, and includes validation and risk checks;
 - outline: all core claims map to evidence or explicitly marked future experiments;
+- figures: every claim-bearing data plot has a passing receipt from `figure_contract_validator.py` (vector PDF/SVG), while image panels require publication-grade raster output; missing provenance, frozen-plan/ledger hash drift, misleading encoding, or an unresolved visual defect blocks downstream prose;
 - integrity: `integrity_report.md` has `validation_status: pass`;
 - author-guided final editing: substantive revision and integrity have passed; `validity_status: clear`; a time-limited edit authorization binds the exact canonical hash, files, sections, mode, and scope; the authoritative language, author evidence, citation-numbering policy, immutable baseline, distinct candidate, equal-content rollback target, canonical-bound scan/dispositions, recomputed claim inventory, canonical-derived protected manifest, trusted validator implementation receipt, validator-recomputed actual changes within authorized scope, bilingual parity, and canonical/candidate-bound claim/evidence diff are bound in `final_edit_receipt.json`; Markdown/TXT/LaTeX and DOCX OOXML parts receive deterministic protected-content comparison; DOCX also receives candidate-bound full-structure and all-page receipts; `final_edit_receipt_validator.py` returns `status: pass`; a separate apply decision then binds the accepted candidate hash and sections;
 - final editorial audit: `final_edit_audit_receipt.json` binds the accepted Humanizer candidate and receipt, author-voice verifier, hashed drift findings, and complete hashed dispositions whose unique IDs form an exact one-to-one set and carry decisions plus evidence; the same validator returns `status: pass` before final integrity or rendering;
