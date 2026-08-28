@@ -2,145 +2,186 @@
 
 # Paper Workflow Orchestrator
 
-**From vague idea to high-quality paper — a complete workflow controller.**
+**Helping you turn any vague idea into a paper built to top-journal standards.**
 
 [简体中文](README.zh-CN.md) | **English**
 
-> Organize research questions, evidence, experiments, and writing in one gated workflow.
-
+![Release: v1.0 Stable](https://img.shields.io/badge/release-v1.0%20stable-2EA44F.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
 ![Codex Skill](https://img.shields.io/badge/Codex-Skill-8A2BE2.svg)
 ![Core dependencies](https://img.shields.io/badge/Core%20dependencies-Python%20stdlib-success.svg)
 
-**Workflow version: v1.0**
+Paper Workflow Orchestrator is a research workflow distributed as a Codex skill package. It selects the right specialist skill for the research goal and current project stage, then connects topic selection, literature, study design, experiments, writing, review, and final delivery into one continuous, traceable paper workflow.
 
-## Overview
+It is designed for paper projects that span multiple files and sessions. You can begin with a vague idea, an existing draft, a confirmed study design, or a bounded experiment. The workflow identifies the current stage, activates the appropriate capability, preserves the important evidence, and pauses for confirmation at consequential decisions.
 
-Paper Workflow Orchestrator is a Codex skill for the full research-to-paper pipeline. It connects idea development, literature, study design, experiments, writing, integrity checks, peer review, and revision through explicit stages and evidence records.
+## Core design: Router Skills
 
-The main model acts as editor-in-chief. It owns routing, the evidence ledger, prompt design, conflict resolution, and final synthesis. Codex-internal subagents handle bounded tasks that can be reviewed independently. Each stage ends with a confirmation gate, so the workflow does not advance silently.
+A complete paper project draws on many specialist capabilities: direction exploration, literature discovery, topic evaluation, study design, experiments, academic writing, scientific figures, citation review, and final editing. Paper Workflow Orchestrator adds two layers of Router Skills above those capabilities, so researchers can start from their goal while the routers handle skill selection and sequencing.
 
-## Features
+- **`research-skill-router` selects the capability**: it interprets the immediate task and research stage, then chooses one primary skill from the available options.
+- **`paper-workflow-orchestrator` coordinates the process**: it takes over multi-stage projects, invokes specialist skills in sequence, connects their outputs, and maintains project progress, evidence, and decisions.
 
-Each feature maps to a concrete component in this repository:
+```mermaid
+flowchart TD
+    U["User describes a research goal"] --> R["Research Skill Router"]
 
-| Feature | Implementation |
-|---|---|
-| 13-stage gated workflow with a user confirmation gate at every stage | `SKILL.md`, `references/stage-contracts.md` |
-| Four entry modes: guided idea, draft audit, write/revise, experiment | `SKILL.md` |
-| Durable, concurrency-safe append-only progress memory and evidence ledger (v1.0) | `scripts/progress_manager.py`, `references/progress-schema.md` |
-| Critical validity blockers that stop the abstract, review, and finalization | `references/progress-schema.md` |
-| Bounded subagent delegation with per-stage context packs and dispatch receipts | `references/stage-contracts.md` |
-| Author-guided final-edit stage gated by validated protected receipts | `references/final-editor-integration.md`, `scripts/final_edit_receipt_validator.py` |
-| Bundled companion skill: author-voice final editing in Revise / Audit / Learn modes | `companion-skills/academic-manuscript-final-editor/SKILL.md` |
-| Read-only whole-manuscript style scan with four severity levels and CI exit codes | `companion-skills/academic-manuscript-final-editor/scripts/scan_manuscript_style.py` |
-| Author-style editing rules for full-draft revision and bilingual sync | `companion-skills/academic-manuscript-final-editor/references/author-style-rules.md` |
-| Format-safe humanizer adapter that fails closed on any missing contract | `scripts/humanizer_preflight.py`, `references/humanizer-adapter.md` |
-| Experiment-contract validation required before any autonomous run | `scripts/experiment_contract_validator.py` |
-| Paper structure gates: required sections and their order | `scripts/paper_section_validator.py`, `references/paper-section-contract.md` |
-| Scientific figure route with claim-bound receipts and fail-closed validation | `references/scientific-visualization-integration.md`, `scripts/figure_contract_validator.py` |
-| Pinned one-click installation for core, standard, and full profiles | `dependencies.lock.json`, `scripts/install_workflow.py` |
-| Core scripts use only the Python standard library | all `scripts/*.py` |
+    R -->|"Focused task"| S["Select one specialist skill"]
+    R -->|"Multi-stage project"| O["Paper Workflow Orchestrator"]
+    R -->|"Ambiguous goal"| Q["Clarify the goal and current stage"]
+    Q --> R
 
-## Workflow stages
+    S --> T["Complete the research task"]
 
-The orchestrator routes one primary downstream skill per stage. Each stage produces its required artifacts and ends with a user gate.
+    O --> C["Identify the current stage"]
+    C --> D["Invoke the stage-specific skill"]
+    D --> V["Review and record the result"]
+    V --> G{"Confirm the next step"}
 
-1. **Intake:** diagnose input, confirm entry mode and constraints
-2. **Directions:** explore 3 to 5 candidate research directions
-3. **Literature:** discover and triage verified sources
-4. **Topic:** gap, contribution, and feasibility verdict; then lock the question
-5. **Design:** falsifiable study design and experiment matrix
-6. **Architecture:** freeze paper structure, section profile, and outline
-7. **Drafting:** bounded internal agents write sections; the main model synthesizes
-8. **Integrity:** audit citations, numbers, claims, leakage, and reproducibility
-9. **Review & Revision:** peer-review simulation, revision matrix, and substantive revision
-10. **Author-Guided Final Edit:** learn from author feedback, scan full-text analogues, and validate protected content
-11. **Naturalization:** optional format-safe humanizer pass with a claim/evidence diff
-12. **Final Editorial Audit:** read-only author-voice verification after naturalization
-13. **Finalize:** final integrity audit, rendering, and delivery
-
-At every gate, the user receives a progress snapshot, completed work, remaining risks, 2 to 5 next-step options, and the exact confirmation needed to continue. One option is marked **Recommended**. The abstract is written only after the body, results, interpretation, and conclusion are stable. The conclusion is always mandatory.
-
-## Project structure
-
-```
-paper-workflow-orchestrator/
-├── SKILL.md                          # Orchestrator skill definition & routing
-├── CHANGELOG.md                      # Release history
-├── agents/
-│   └── openai.yaml                   # Agent interface declaration
-├── assets/                           # Logo and README banner
-├── references/
-│   ├── paper-section-contract.md     # Title/abstract/methods/results/conclusion contract
-│   ├── progress-schema.md            # Progress memory v1.0 schema & error rules
-│   ├── stage-contracts.md            # Stage table, delegation & acceptance predicates
-│   ├── scientific-visualization-integration.md # Figure routing and receipt contract
-│   ├── final-editor-integration.md   # Author-guided final-edit handshake
-│   └── humanizer-adapter.md          # Format-safe humanizer adapter protocol
-├── scripts/
-│   ├── progress_manager.py           # Progress init/validate/migrate/record/restore
-│   ├── install_workflow.py            # Cross-platform pinned Skill installer
-│   ├── figure_contract_validator.py   # Figure provenance and output validator
-│   ├── humanizer_preflight.py        # Humanizer preflight (fail-closed)
-│   ├── paper_section_validator.py    # Section order & required-section checks
-│   ├── final_edit_receipt_validator.py # Protected final-edit receipt validator
-│   └── experiment_contract_validator.py  # Bounded experiment contract validator
-├── dependencies.lock.json             # Pinned GitHub sources and install profiles
-├── tests/                             # Dependency-free workflow and installer tests
-└── companion-skills/
-    ├── research-skill-router/         # Bundled routing skill
-    └── academic-manuscript-final-editor/  # Companion skill for final editing
+    G -->|"Continue"| C
+    G -->|"Revise or extend"| D
+    G -->|"Finish"| F["Complete the paper and project"]
 ```
 
-## Installation
+### What Router Skills change
 
-Run this command from the repository root to install the default profile:
+**Start with the research goal**
+
+You can ask to “evaluate whether this topic is worth pursuing,” “compare the methods in these papers,” or “continue this paper from an existing draft.” The router maps the request to the appropriate capability and clarifies the scope when the goal is still ambiguous.
+
+**Keep one primary capability in focus**
+
+Direction exploration, topic evaluation, and study design are related, but they solve different problems. The router selects one primary skill for the current stage, keeping the task context focused and reducing interference between overlapping instructions.
+
+**Preserve specialist depth**
+
+Literature discovery, academic writing, scientific visualization, and integrity review remain separate specialist skills. Each capability can be used, upgraded, or replaced independently while continuing to participate in the routed workflow.
+
+**Connect outputs across stages**
+
+Literature evidence shapes topic selection, study design constrains experiments, experimental results determine paper claims, and review findings may send the project back for more evidence. The orchestrator manages these transitions so each validated result becomes usable input for the next stage.
+
+**Support focused tasks and long-running projects**
+
+A narrowly scoped request can go directly to a specialist skill. A request involving a complete paper, durable project state, or multiple research stages enters the orchestrator. The same capability system therefore supports both one-off research tasks and long-running paper projects.
+
+## Workflow
+
+The workflow chooses its entry point and route from the state of the project. The diagram below groups the internal stages into five user-facing parts and shows the feedback loops created by experiments, review, and revision.
+
+```mermaid
+flowchart TD
+    A["Define the goal and research direction"] --> B["Discover literature and evaluate the topic"]
+    B --> C["Design the study"]
+    C --> D{"Are experiments required?"}
+
+    D -->|"Yes"| E["Run experiments and validate results"]
+    D -->|"No"| F["Define the paper structure"]
+    E --> F
+
+    F --> G["Collaborative writing and figure production"]
+    G --> H["Citation and integrity review"]
+    H --> I["Peer-review simulation and substantive revision"]
+
+    I -->|"More evidence required"| C
+    I -->|"Approved"| J["Final editing"]
+
+    J --> K{"Is prose naturalization needed?"}
+    K -->|"Yes"| L["Improve language"]
+    K -->|"No"| M["Final review and delivery"]
+    L --> M
+```
+
+The user confirms consequential decisions such as topic selection, study design, experiment scope, and final acceptance. Detailed stages, inputs, outputs, and acceptance rules are documented in [`references/stage-contracts.md`](references/stage-contracts.md).
+
+## Core capabilities
+
+| Capability | What the user gets | Primary implementation |
+|---|---|---|
+| Research-task routing | One primary skill selected from the research intent and current stage | `companion-skills/research-skill-router/` |
+| End-to-end paper orchestration | Continuous progress from a research idea or existing draft to final delivery | `SKILL.md`, `references/stage-contracts.md` |
+| Project continuity | Progress, evidence, decisions, risks, and stage-transition records | `scripts/progress_manager.py`, `references/progress-schema.md` |
+| Research and experiment preparation | A defined research question, validation method, and execution scope before experiments begin | `scripts/experiment_contract_validator.py` |
+| Paper-structure validation | Checks for required sections and their order | `scripts/paper_section_validator.py`, `references/paper-section-contract.md` |
+| Scientific-figure workflow | Figures bound to source data, paper claims, and validation records | `scripts/figure_contract_validator.py`, `references/scientific-visualization-integration.md` |
+| Integrity and peer review | Citation, number, claim, and reproducibility checks followed by substantive revision | `SKILL.md`, `references/stage-contracts.md` |
+| Author-guided final editing | Manuscript-wide editing guided by author feedback with protected-content validation | `companion-skills/academic-manuscript-final-editor/` |
+| Prose naturalization | Mechanical prose cleanup after scientific content stabilizes, with content-difference checks | `scripts/humanizer_preflight.py`, `references/humanizer-adapter.md` |
+| Reproducible installation | Fixed-source installation through `core`, `standard`, or `full` profiles | `dependencies.lock.json`, `scripts/install_workflow.py` |
+
+The orchestrator's core scripts use only the Python standard library and support Python 3.10 or later.
+
+## When to use it
+
+- You have an early research idea and need to turn it into a testable question.
+- You have a known set of papers and need to compare their methods, data, claims, and limitations.
+- You have chosen a topic and need a study design, experiment plan, and paper structure.
+- You have a draft and need to review its citations, claims, figures, and argumentative integrity.
+- You need to coordinate multiple rounds of writing, review, revision, and final editing.
+- You need project state to persist across multiple Codex sessions.
+- You know the research outcome you need and want the router to select the appropriate specialist skill.
+
+## Quick installation
+
+Clone the repository and run the installer:
+
+```bash
+git clone https://github.com/shuohui-air-technology/codex-paper-workflow.git
+cd codex-paper-workflow
+python3 scripts/install_workflow.py
+```
+
+If `python` already points to Python 3, the equivalent command is:
 
 ```bash
 python scripts/install_workflow.py
 ```
 
-On Windows, use `py -3` or `python`, depending on your configured launcher. On
-macOS and Linux, use `python3`. The `core` profile and the manual
-repository-only installation work offline. The `standard` and `full` profiles
-fetch pinned third-party archives over HTTPS from GitHub, so those profiles
-require network access during installation.
+On Windows, use:
 
-The default `standard` profile installs the orchestrator, router, final editor,
-research stages, writing and review skills, humanizer, and
-`scientific-visualization`. Use `--profile core` for the bundled workflow only.
-Use `--profile full` to add the explicitly gated `autoresearch` and ARA
-reviewer. Installation does not load all skills at once. The router still
-selects one primary skill per stage.
-
-The installer uses the public upstream name `academic-paper`. If the host
-already exposes `academic-research-suite`, that name remains a compatible alias
-for general paper writing; the installer does not install a duplicate.
-
-Useful options:
-
-```bash
-python scripts/install_workflow.py --profile standard --dry-run
-python scripts/install_workflow.py --profile standard --verify
-python scripts/install_workflow.py --profile standard --update
-# when intentionally shrinking a previously installed profile:
-python scripts/install_workflow.py --profile core --update --prune
+```powershell
+py -3 scripts/install_workflow.py
 ```
 
-The installer reads fixed Git commit SHAs from `dependencies.lock.json`. It
-rejects unsafe archive paths and symlink targets, materializes only validated
-relative directory aliases, and blocks changes to unmanaged destinations. It
-installs through a staging directory and writes `.paper-workflow-install.json`
-as a verification receipt. It installs Skill files only; it does not silently
-install Python, `uv`, Chrome/Chromium, or plotting packages.
+The installer uses the `standard` profile by default. Reopen Codex or reload the skills list after installation.
 
-Profile reduction is blocked by default. Use `--prune` only when you intend to
-remove previously managed skills outside the selected profile; the installer
-backs them up first.
+### Installation profiles
 
-For a manual/offline installation of the repository-owned skills:
+| Profile | Contents | Best for |
+|---|---|---|
+| `core` | Orchestrator, Research Skill Router, and the bundled final editor | Offline installation and a minimal workflow |
+| `standard` | `core` plus research, writing, review, prose-naturalization, and scientific-visualization skills | Most paper projects |
+| `full` | `standard` plus autonomous experimentation and ARA review | Projects with a confirmed experiment contract and advanced review requirements |
+
+Common commands:
+
+```bash
+# Preview the standard installation
+python3 scripts/install_workflow.py --profile standard --dry-run
+
+# Verify the current installation
+python3 scripts/install_workflow.py --profile standard --verify
+
+# Update to the versions recorded in the lock file
+python3 scripts/install_workflow.py --profile standard --update
+
+# Reduce an existing installation to core, backing up and pruning managed skills
+python3 scripts/install_workflow.py --profile core --update --prune
+```
+
+`dependencies.lock.json` records the repository, path, fixed commit, and license for every external skill. The installer uses that manifest for download, validation, and updates, then writes a local `.paper-workflow-install.json` installation record.
+
+The `core` profile supports offline installation. The `standard` and `full` profiles retrieve the external skills recorded in the manifest over HTTPS and require access to GitHub.
+
+The scientific-figure workflow uses Python 3.11+, `uv`, and the plotting libraries selected for the task. Configure that Python runtime after installing the skills.
+
+<details>
+<summary>Manual installation of bundled skills</summary>
+
+### Windows PowerShell
+
+Run from the repository root:
 
 ```powershell
 $skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex\skills' }
@@ -148,6 +189,7 @@ $main = Join-Path $skillsHome 'paper-workflow-orchestrator'
 New-Item -ItemType Directory -Force -Path $main | Out-Null
 Copy-Item -Recurse -Force SKILL.md, agents, assets, references, scripts $main
 Copy-Item -Force LICENSE (Join-Path $main 'LICENSE')
+
 $finalEditor = Join-Path $skillsHome 'academic-manuscript-final-editor'
 $router = Join-Path $skillsHome 'research-skill-router'
 New-Item -ItemType Directory -Force -Path $finalEditor, $router | Out-Null
@@ -155,71 +197,101 @@ Copy-Item -Recurse -Force companion-skills\academic-manuscript-final-editor\* $f
 Copy-Item -Recurse -Force companion-skills\research-skill-router\* $router
 ```
 
-**macOS / Linux** (run from the repository root):
+### macOS / Linux
+
+Run from the repository root:
 
 ```bash
 SKILLS_HOME="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$SKILLS_HOME/paper-workflow-orchestrator"
 cp -R SKILL.md agents assets references scripts "$SKILLS_HOME/paper-workflow-orchestrator/"
 cp -f LICENSE "$SKILLS_HOME/paper-workflow-orchestrator/LICENSE"
+
 mkdir -p "$SKILLS_HOME/academic-manuscript-final-editor" "$SKILLS_HOME/research-skill-router"
 cp -R companion-skills/academic-manuscript-final-editor/. "$SKILLS_HOME/academic-manuscript-final-editor/"
 cp -R companion-skills/research-skill-router/. "$SKILLS_HOME/research-skill-router/"
 ```
 
-Reload Codex or refresh the skills list after installing.
-
-The scientific figure route uses the pinned `scientific-visualization`
-subskill from [K-Dense scientific-agent-skills](https://github.com/K-Dense-AI/scientific-agent-skills/tree/36d8f13a1e754618794bf42f417884940077b4ae/skills/scientific-visualization).
-Its examples require Python 3.11+, `uv`, and selected plotting packages. These
-are runtime prerequisites, not hidden installer actions. The author-guided
-final-edit stage requires `academic-manuscript-final-editor` version `2.1.0`
-or newer with `capability_schema: final-editor-v1`.
-
-### Pinned third-party sources
-
-External skills are fetched at the exact commits recorded in
-[`dependencies.lock.json`](dependencies.lock.json); the installer never
-silently follows a moving branch. Each entry records its upstream license:
-K-Dense scientific visualization (MIT), research-hub (MIT), Orchestra AI
-Research Skills (MIT), humanizer (MIT), and Academic Research Skills (CC BY-NC
-4.0). The pinned `clarify-research-idea` repository does not declare a license,
-so review its terms before redistribution. Installing a skill does not grant
-rights beyond the applicable upstream license.
+</details>
 
 ## Usage
 
-Start the full workflow with:
+### Start the complete paper workflow
 
+```text
+Use paper-workflow-orchestrator to continue from the current research materials with stage confirmation and durable progress tracking.
 ```
-Use paper-workflow-orchestrator to run a gated, evidence-tracked research-to-paper workflow.
+
+### Start from an existing draft
+
+```text
+Use paper-workflow-orchestrator to audit this draft, identify the current stage and evidence gaps, and propose the next revision plan.
 ```
 
-This skill is a workflow controller, not a single-task tool. For a literature
-matrix, study design, prose polishing, or citation audit, let
-`research-skill-router` select the narrower skill instead of loading the full
-pipeline.
+### Let the router choose a specialist skill
 
-The orchestrator and validators use only the Python standard library on Python
-3.10+. The optional scientific figure path follows the upstream Skill's Python
-3.11+ and `uv` requirements.
+```text
+Use research-skill-router to choose the right skill for this task: compare the methods, data, and main claims in these papers.
+```
 
-## Safety boundaries
+### Start a bounded experiment
 
-- `autoresearch` never loads automatically and cannot start unattended experiments without an explicit, complete, validated contract.
-- Subagents cannot change the research direction, edit the final manuscript, write `progress.md` directly, or invent citations, numbers, or results.
-- Humanizer passes must use the format adapter, protected manifest, claim/evidence diff, integrity receipt, and rollback target.
-- The final editor stays dormant until substantive revision and integrity checks pass. It produces a candidate and a bound rollback receipt instead of overwriting the canonical manuscript.
-- DOCX, PDF, and LaTeX require a format-specific adapter. If parsing is insufficient, the stage remains `blocked`.
-- Critical validity problems cannot be concealed by rewriting the abstract, conclusion, or prose.
+```text
+Use paper-workflow-orchestrator to define an experiment contract and confirm its goal, resources, evaluation method, and stopping conditions before execution.
+```
+
+The `research-skill-router` selects a specialist capability for a focused research task. The `paper-workflow-orchestrator` manages tasks that require multiple stages or durable project state.
+
+## Repository structure
+
+```text
+paper-workflow-orchestrator/
+├── SKILL.md                              # Orchestrator definition and stage routing
+├── agents/
+│   └── openai.yaml                       # Agent interface declaration
+├── assets/                               # Logo and README banner
+├── references/
+│   ├── paper-section-contract.md         # Paper-section contract
+│   ├── progress-schema.md                # Project progress and evidence format
+│   ├── stage-contracts.md                # Stage, delegation, and acceptance rules
+│   ├── scientific-visualization-integration.md
+│   ├── final-editor-integration.md
+│   └── humanizer-adapter.md
+├── scripts/
+│   ├── progress_manager.py               # Progress initialization, migration, recording, and recovery
+│   ├── install_workflow.py               # Cross-platform fixed-version installer
+│   ├── experiment_contract_validator.py  # Experiment-contract validation
+│   ├── figure_contract_validator.py      # Scientific-figure validation
+│   ├── paper_section_validator.py        # Paper-section validation
+│   ├── final_edit_receipt_validator.py   # Final-edit result validation
+│   └── humanizer_preflight.py            # Prose-naturalization preflight
+├── dependencies.lock.json                # External skill sources and version manifest
+├── tests/                                 # Workflow and installer tests
+└── companion-skills/
+    ├── research-skill-router/             # Research-task routing entry point
+    └── academic-manuscript-final-editor/  # Author-guided final editing
+```
+
+## Third-party skill sources
+
+External skills are retrieved at the fixed commits recorded in [`dependencies.lock.json`](dependencies.lock.json). The manifest also records each upstream project's license:
+
+- K-Dense scientific visualization: MIT
+- research-hub: MIT
+- Orchestra AI Research Skills: MIT
+- humanizer: MIT
+- Academic Research Skills: CC BY-NC 4.0
+
+The pinned upstream repository for `clarify-research-idea` does not currently declare a license. Review its terms separately before use or redistribution.
+
+Each upstream project's original license continues to apply after skill installation.
 
 ## Contributing
 
-Contributions are welcome. Keep scripts dependency-free, using only the Python
-standard library, and describe how you verified each change. Do not commit
-personal papers, `.research/`, `.paper/`, experiment data, credentials, or
-local caches.
+Issues and improvements are welcome. Code contributions should keep the orchestrator's core scripts within the Python standard library and describe the verification performed in the pull request.
+
+Keep personal papers, `.research/`, `.paper/`, experimental data, credentials, and machine-generated caches local and managed through `.gitignore`.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is released under the [MIT License](LICENSE).

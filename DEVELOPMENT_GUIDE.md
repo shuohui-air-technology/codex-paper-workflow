@@ -106,11 +106,11 @@ paper-workflow-orchestrator/
 
 ## 6. README 与公开内容约束
 
-未经用户明确同意，不得修改以下副标题：
+中英文 README 使用以下 v1.0 正式版副标题：
 
 ```text
-From vague idea to high-quality paper — a complete workflow controller.
-从模糊想法到高质量论文的完整工作流控制器。
+Helping you turn any vague idea into a paper built to top-journal standards.
+帮助您将任何一个模糊的想法落地为顶刊级别的论文。
 ```
 
 公开 README 不应把内部连续性元数据描述成单独的用户功能。现有测试会阻止重新加入已经删除的相关表述。

@@ -74,13 +74,13 @@ class ProgressVersionTests(unittest.TestCase):
                 self.assertNotIn("handoff", text)
                 self.assertNotIn("交接", text)
 
-    def test_public_readmes_preserve_original_subtitles(self):
+    def test_public_readmes_use_v10_release_subtitles(self):
         self.assertIn(
-            "**From vague idea to high-quality paper — a complete workflow controller.**",
+            "**Helping you turn any vague idea into a paper built to top-journal standards.**",
             (ROOT / "README.md").read_text(encoding="utf-8"),
         )
         self.assertIn(
-            "**从模糊想法到高质量论文的完整工作流控制器。**",
+            "**帮助您将任何一个模糊的想法落地为顶刊级别的论文。**",
             (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
         )
 
