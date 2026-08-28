@@ -51,7 +51,13 @@ class ProgressVersionTests(unittest.TestCase):
                 self.assertTrue(progress.validate_text(migrated)["valid"])
 
     def test_public_docs_identify_v10_as_current_workflow_version(self):
-        for relative in ("README.md", "README.zh-CN.md", "references/progress-schema.md", "CHANGELOG.md"):
+        for relative in (
+            "README.md",
+            "README.zh-CN.md",
+            "DEVELOPMENT_GUIDE.md",
+            "references/progress-schema.md",
+            "CHANGELOG.md",
+        ):
             with self.subTest(relative=relative):
                 text = (ROOT / relative).read_text(encoding="utf-8")
                 self.assertIn("v1.0", text)
@@ -77,6 +83,23 @@ class ProgressVersionTests(unittest.TestCase):
             "**从模糊想法到高质量论文的完整工作流控制器。**",
             (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
         )
+
+    def test_development_guide_is_a_complete_entrypoint(self):
+        guide = (ROOT / "DEVELOPMENT_GUIDE.md").read_text(encoding="utf-8")
+        for required in (
+            "## 2. 开始开发前的阅读顺序",
+            "## 4. 目录与职责",
+            "## 5. 不可破坏的工作流约束",
+            "## 7. 开发与测试规则",
+            "## 9. 版本升级清单",
+            "## 10. Git 与发布流程",
+            "python -B -m unittest discover -s tests -v",
+            "git archive --format=zip",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, guide)
+        self.assertNotIn("TBD", guide)
+        self.assertNotIn("TODO", guide)
 
     def test_release_metadata_is_bound_to_the_installer_receipt(self):
         import json
