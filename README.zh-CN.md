@@ -2,7 +2,7 @@
 
 # Paper Workflow Orchestrator
 
-**面向 Codex 的科研到论文工作流控制器。**
+**从模糊想法到高质量论文的完整工作流控制器。**
 
 **简体中文** | [English](README.md)
 

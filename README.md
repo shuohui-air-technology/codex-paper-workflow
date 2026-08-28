@@ -2,7 +2,7 @@
 
 # Paper Workflow Orchestrator
 
-**A Codex workflow controller for turning research ideas into auditable papers.**
+**From vague idea to high-quality paper — a complete workflow controller.**
 
 [简体中文](README.zh-CN.md) | **English**
 

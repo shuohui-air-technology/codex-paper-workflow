@@ -68,6 +68,16 @@ class ProgressVersionTests(unittest.TestCase):
                 self.assertNotIn("handoff", text)
                 self.assertNotIn("交接", text)
 
+    def test_public_readmes_preserve_original_subtitles(self):
+        self.assertIn(
+            "**From vague idea to high-quality paper — a complete workflow controller.**",
+            (ROOT / "README.md").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "**从模糊想法到高质量论文的完整工作流控制器。**",
+            (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
+        )
+
     def test_release_metadata_is_bound_to_the_installer_receipt(self):
         import json
 
