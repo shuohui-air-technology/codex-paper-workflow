@@ -21,7 +21,7 @@ receipts, and blocker checks (human-facing headings may still be translated):
 - current_stage:
 - target_venue:
 - document_format:
-- workflow_version: paper-workflow-orchestrator-v0.4
+- workflow_version: paper-workflow-orchestrator-v1.0
 - mode: guided_idea | draft_audit | write_or_revise | autonomous_experiment
 
 ## Current Snapshot
@@ -180,13 +180,14 @@ The next AI must read `Project Metadata`, `Current Snapshot`, active `Error Avoi
 
 If the progress file fails validation, do not continue from its contents. Use the validated `.bak` generation and the `progress_manager.py restore` command, or stop and ask the user to resolve the state conflict. The `.lock` file is a persistent advisory-lock container; do not delete it while another process may be active. Restore appends a recovery event and archives the replaced generation under a unique `.corrupt-*` name.
 
-For a valid pre-v0.4 file that lacks `mode` or the newer snapshot fields, run
-`progress_manager.py migrate --confirm` with a user-confirmed mode. Migration
-preserves the legacy generation as `.legacy-v0.2` or `.legacy-v0.3`, adds
-`validity_status: pending`, and gives legacy rules
+For a valid pre-v1.0 file (v0.2 through v0.6) that lacks `mode` or newer
+snapshot fields, run `progress_manager.py migrate --confirm` with a
+user-confirmed mode. Migration preserves the legacy generation as
+`.legacy-v<version>` and adds a unique suffix when that path already exists.
+It adds `validity_status: pending` and gives legacy rules
 `severity: unspecified`/`blocking: false` without guessing their importance.
 If a legacy rule already explicitly has `status: active` and `blocking: true`,
 migration preserves that evidence and sets `validity_status: blocked`; otherwise
-it uses `pending`. It creates a validated v0.4 `.bak` recovery point and appends
+it uses `pending`. It creates a validated v1.0 `.bak` recovery point and appends
 a migration event; it never silently guesses the project mode or resolves a
 possible blocker.

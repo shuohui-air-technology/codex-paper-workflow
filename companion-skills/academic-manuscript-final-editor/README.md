@@ -102,7 +102,7 @@ skill 的完整决策规则在 `SKILL.md` 与 `references/author-style-rules.md`
 
 编排器模式下必须生成候选稿而不是直接覆盖规范原稿，并返回结构化 `progress_delta`。原稿、候选稿、回滚副本、扫描报告、主张/证据差异和受保护内容检查应绑定到编排器的终稿编辑收据；收据通过后仍需用户确认才能应用。
 
-兼容要求：`paper-workflow-orchestrator` v0.4 且包含 `references/final-editor-integration.md`、`scripts/final_edit_receipt_validator.py` 和 `final-editor-v1` 能力检查。两者在同一个仓库中配套发布：orchestrator 位于仓库根目录，本 skill 位于 `companion-skills/academic-manuscript-final-editor/`。
+兼容要求：`paper-workflow-orchestrator` v1.0 且包含 `references/final-editor-integration.md`、`scripts/final_edit_receipt_validator.py` 和 `final-editor-v1` 能力检查。两者在同一个仓库中配套发布：orchestrator 位于仓库根目录，本 skill 位于 `companion-skills/academic-manuscript-final-editor/`。
 
 ## 版本说明
 

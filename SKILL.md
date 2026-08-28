@@ -1,6 +1,9 @@
 ---
 name: paper-workflow-orchestrator
 description: Orchestrate an explicitly requested, gated, evidence-tracked end-to-end research-to-paper workflow for AI, machine-learning, and other academic projects, including multi-stage routing, Codex-internal subagents, progress memory, citation/integrity gates, peer-review simulation, revision, and AI handoff. Use for a full paper pipeline or workflow design, not for a single obvious task that belongs to a narrower research skill. This skill is the workflow controller; it routes one primary downstream research skill per stage and never auto-starts autonomous experiments.
+metadata:
+  version: "1.0.0"
+  workflow_version: "paper-workflow-orchestrator-v1.0"
 ---
 
 # Paper Workflow Orchestrator
@@ -73,7 +76,7 @@ blockers. In particular, record figure work under `scientific_figures` (not a
 free-form display label such as `figures`) and record the abstract/title/keyword,
 author-edit, and final-audit checkpoints under their normalized IDs.
 
-If an existing project has a v0.2 or v0.3 progress file, do not overwrite it or guess its mode. Run `progress_manager.py migrate --file ... --mode ... --confirm` only after the user confirms the mode; supply `--current-stage` if its stage is not normalized.
+If an existing project has a pre-v1.0 progress file (v0.2 through v0.6), do not overwrite it or guess its mode. Run `progress_manager.py migrate --file ... --mode ... --confirm` only after the user confirms the mode; supply `--current-stage` if its stage is not normalized.
 
 Persist the complete handoff set, not only the final manuscript:
 

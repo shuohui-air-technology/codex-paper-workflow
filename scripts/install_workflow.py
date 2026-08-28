@@ -26,6 +26,9 @@ TRANSACTION_RECEIPT = ".paper-workflow-install.transaction.json"
 PROFILES = {"core", "standard", "full"}
 SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+RELEASE_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+WORKFLOW_VERSION_RE = re.compile(r"^paper-workflow-orchestrator-v[0-9]+\.[0-9]+$")
+RELEASE_METADATA_FIELDS = ("release_version", "workflow_version")
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_MEMBER_UNCOMPRESSED = 64 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED = 512 * 1024 * 1024
@@ -98,6 +101,25 @@ def _validate_manifest_path(raw: Any, field: str) -> str:
     return normalised.rstrip("/") or "."
 
 
+def _validate_release_metadata(value: dict[str, Any], label: str) -> None:
+    """Validate optional release metadata when a manifest or receipt carries it."""
+    present = {field for field in RELEASE_METADATA_FIELDS if field in value}
+    if present and present != set(RELEASE_METADATA_FIELDS):
+        missing = sorted(set(RELEASE_METADATA_FIELDS) - present)
+        raise InstallError(f"{label} release metadata is incomplete; missing: {', '.join(missing)}")
+    if not present:
+        return
+    release_version = value.get("release_version")
+    workflow_version = value.get("workflow_version")
+    if not isinstance(release_version, str) or not RELEASE_VERSION_RE.fullmatch(release_version):
+        raise InstallError(f"{label} has an invalid release_version")
+    if not isinstance(workflow_version, str) or not WORKFLOW_VERSION_RE.fullmatch(workflow_version):
+        raise InstallError(f"{label} has an invalid workflow_version")
+    expected_workflow = "paper-workflow-orchestrator-v" + ".".join(release_version.split(".")[:2])
+    if workflow_version != expected_workflow:
+        raise InstallError(f"{label} release/workflow version mismatch")
+
+
 def _safe_relative_source(root: Path, raw: Any, field: str) -> Path:
     if not isinstance(raw, str) or not raw.strip():
         raise InstallError(f"{field} must be a non-empty relative path")
@@ -132,6 +154,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise InstallError("dependency manifest must contain profiles and skills objects")
     if value.get("schema_version") != "workflow-dependencies-v1":
         raise InstallError("unsupported dependency manifest schema_version")
+    _validate_release_metadata(value, "dependency manifest")
     skills = value["skills"]
     for name, entry in skills.items():
         _validate_skill_name(name)
@@ -521,8 +544,11 @@ def _validate_receipt_shape(receipt: dict[str, Any]) -> dict[str, Any]:
         raise InstallError("installation receipt must be a JSON object")
     if receipt.get("schema_version") != "paper-workflow-install-v1":
         raise InstallError("unsupported or incomplete installation receipt")
-    if set(receipt) != {"schema_version", "profile", "skills"}:
+    required = {"schema_version", "profile", "skills"}
+    allowed = required | set(RELEASE_METADATA_FIELDS)
+    if not required.issubset(receipt) or not set(receipt).issubset(allowed):
         raise InstallError("installation receipt has unexpected or missing fields")
+    _validate_release_metadata(receipt, "installation receipt")
     profile = receipt.get("profile")
     if profile not in PROFILES:
         raise InstallError("installation receipt has an invalid profile")
@@ -715,6 +741,7 @@ def _prepare_target(target: Path, staged: dict[str, Path], update: bool, prune: 
 
 
 def install(manifest: dict[str, Any], profile: str, target: Path, repository_root: Path, *, dry_run: bool = False, update: bool = False, prune: bool = False) -> dict[str, Any]:
+    _validate_release_metadata(manifest, "dependency manifest")
     entries = resolve_profile(manifest, profile)
     target = target.expanduser()
     if _is_link(target):
@@ -763,6 +790,7 @@ def install(manifest: dict[str, Any], profile: str, target: Path, repository_roo
             and set(adopted) == set(staged)
             and set(existing_managed or {}) == set(expected_sources)
             and all(_canonical_json(existing_managed[name]["source"]) == _canonical_json(expected_sources[name]) for name in expected_sources)
+            and all(existing_receipt.get(field) == manifest.get(field) for field in RELEASE_METADATA_FIELDS)
         ):
             summary["backups"] = {}
             return summary
@@ -851,6 +879,9 @@ def install(manifest: dict[str, Any], profile: str, target: Path, repository_roo
                 "profile": profile,
                 "skills": {name: {"tree_hash": _tree_hash(target / name), "source": next(e for e in entries if e["name"] == name)} for name in staged},
             }
+            for field in RELEASE_METADATA_FIELDS:
+                if field in manifest:
+                    new_receipt[field] = manifest[field]
             receipt_tmp = target / f".{INSTALL_RECEIPT}.tmp-{os.getpid()}-{time.time_ns()}"
             try:
                 receipt_tmp.write_text(json.dumps(new_receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -958,6 +989,7 @@ def verify(target: Path, profile: str | None = None, manifest: dict[str, Any] | 
     if profile is not None:
         if manifest is None:
             raise InstallError("manifest is required when verifying a requested profile")
+        _validate_release_metadata(manifest, "dependency manifest")
         expected_entries = resolve_profile(manifest, profile)
         expected = {entry["name"]: entry for entry in expected_entries}
         if receipt.get("profile") != profile:
@@ -968,6 +1000,10 @@ def verify(target: Path, profile: str | None = None, manifest: dict[str, Any] | 
             actual = managed.get(name, {}).get("source") if isinstance(managed.get(name), dict) else None
             if actual is not None and _canonical_json(actual) != _canonical_json(entry):
                 errors.append(f"installation receipt source metadata mismatch: {name}")
+        for field in RELEASE_METADATA_FIELDS:
+            expected_value = manifest.get(field)
+            if expected_value is not None and receipt.get(field) != expected_value:
+                errors.append(f"installation receipt {field} mismatch: expected {expected_value}, found {receipt.get(field)}")
     for name, data in managed.items():
         path = target / name
         if _is_link(path) or not path.is_dir():

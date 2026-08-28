@@ -1,5 +1,7 @@
 {
   "schema_version": "workflow-dependencies-v1",
+  "release_version": "1.0.0",
+  "workflow_version": "paper-workflow-orchestrator-v1.0",
   "generated_from": "shuohui-air-technology/codex-paper-workflow",
   "profiles": {
     "core": [

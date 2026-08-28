@@ -45,8 +45,14 @@ ALLOWED_RULE_STATUS = {"active", "superseded", "resolved"}
 ALLOWED_RULE_SEVERITY = {"critical", "major", "minor", "unspecified"}
 ALLOWED_BLOCKING = {"true", "false"}
 ALLOWED_VALIDITY_STATUS = {"pending", "clear", "blocked"}
-CURRENT_WORKFLOW_VERSION = "paper-workflow-orchestrator-v0.4"
-LEGACY_WORKFLOW_VERSIONS = {"paper-workflow-orchestrator-v0.2", "paper-workflow-orchestrator-v0.3"}
+CURRENT_WORKFLOW_VERSION = "paper-workflow-orchestrator-v1.0"
+LEGACY_WORKFLOW_VERSIONS = {
+    "paper-workflow-orchestrator-v0.2",
+    "paper-workflow-orchestrator-v0.3",
+    "paper-workflow-orchestrator-v0.4",
+    "paper-workflow-orchestrator-v0.5",
+    "paper-workflow-orchestrator-v0.6",
+}
 ALLOWED_MODES = {"guided_idea", "draft_audit", "write_or_revise", "autonomous_experiment"}
 ALLOWED_STAGES = {
     "intake", "directions", "literature", "topic", "design", "draft_audit",
@@ -532,6 +538,18 @@ def _atomic_copy(source: Path, destination: Path) -> None:
                 pass
 
 
+def _new_backup_path(path: Path, label: str, *, always_unique: bool = False) -> Path:
+    """Return a non-link backup path without overwriting an older generation."""
+    direct = Path(str(path) + label)
+    if not always_unique and not direct.exists() and not direct.is_symlink():
+        return direct
+    for _ in range(16):
+        candidate = Path(f"{direct}-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise ProgressError(f"could not allocate an immutable backup path for {path}")
+
+
 def atomic_write(path: Path, text: str, *, keep_backup: bool = True) -> None:
     """Write UTF-8 text with a same-directory temp file and atomic replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -775,7 +793,7 @@ def cmd_record_error(args: argparse.Namespace) -> int:
 
 
 def _ensure_legacy_rule_fields(text: str) -> str:
-    """Add v0.4 rule fields without guessing legacy severity."""
+    """Add rule fields missing from legacy progress without guessing severity."""
     bounds = _section_bounds(text)
     start, end = bounds["## Error Avoidance Rules"]
     section = text[start:end]
@@ -831,15 +849,11 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         if current_version == CURRENT_WORKFLOW_VERSION:
             existing = validate_text(text)
             if not existing["valid"]:
-                raise ProgressError("progress is already v0.4 but invalid: " + "; ".join(existing["errors"]))
+                raise ProgressError("progress is already v1.0 but invalid: " + "; ".join(existing["errors"]))
             print(f"already current: {path}")
             return 0
         if current_version and current_version not in LEGACY_WORKFLOW_VERSIONS:
             raise ProgressError(f"unsupported legacy workflow_version: {current_version}")
-        legacy_suffix = "v0.3" if current_version.endswith("v0.3") else "v0.2"
-        legacy_backup = Path(str(path) + f".legacy-{legacy_suffix}")
-        if path.exists():
-            _atomic_copy(path, legacy_backup)
         current_stage = _section_field(_section(text, "## Project Metadata", bounds), "current_stage")
         if current_stage not in ALLOWED_STAGES:
             if not args.current_stage:
@@ -856,13 +870,30 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         text = _upsert_field(text, "## Current Snapshot", "hub_status", "not_applicable")
         text = _upsert_field(text, "## Current Snapshot", "last_stage_receipt", "none")
         text = _replace_handoff(text)
-        text = _append_event(text, current_stage, "decision", "migrated progress state to v0.4", "progress.md")
+        text = _append_event(text, current_stage, "decision", "migrated progress state to v1.0", "progress.md")
+        validation = validate_text(text)
+        if not validation["valid"]:
+            raise ProgressError("refusing to write invalid migrated progress: " + "; ".join(validation["errors"]))
+
+        # Allocate and validate every recovery destination before copying or
+        # replacing anything. Existing generations are retained verbatim.
+        legacy_suffix = current_version.rsplit("-", 1)[-1] if current_version else "v0.2"
+        legacy_backup = _new_backup_path(path, f".legacy-{legacy_suffix}")
+        recovery_backup = Path(str(path) + ".bak")
+        previous_recovery: Path | None = None
+        if recovery_backup.exists() or recovery_backup.is_symlink():
+            if recovery_backup.is_symlink() or not recovery_backup.is_file():
+                raise ProgressError(f"existing recovery backup is not a regular file: {recovery_backup}")
+            previous_recovery = _new_backup_path(path, ".bak-previous", always_unique=True)
+
+        if path.exists():
+            _atomic_copy(path, legacy_backup)
+        if previous_recovery is not None:
+            _atomic_copy(recovery_backup, previous_recovery)
         # Stage the upgraded recovery point before replacing the legacy main
-        # file.  A crash before the second replace therefore leaves either
-        # the old main plus a valid v0.4 backup, or both at v0.4.
-        if not validate_text(text)["valid"]:
-            raise ProgressError("refusing to write invalid migrated progress")
-        atomic_write(Path(str(path) + ".bak"), text, keep_backup=False)
+        # file. A crash before the second replace therefore leaves either the
+        # old main plus a valid v1.0 backup, or both at v1.0.
+        atomic_write(recovery_backup, text, keep_backup=False)
         atomic_write(path, text, keep_backup=False)
     print(f"migrated: {path}")
     return 0
@@ -922,7 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
     error.add_argument("--refs", default="")
     error.set_defaults(func=cmd_record_error)
 
-    migrate = sub.add_parser("migrate", help="migrate a legacy progress file to v0.4")
+    migrate = sub.add_parser("migrate", help="migrate a legacy progress file to v1.0")
     migrate.add_argument("--file", required=True)
     migrate.add_argument("--mode", required=True)
     migrate.add_argument("--current-stage", default="")
