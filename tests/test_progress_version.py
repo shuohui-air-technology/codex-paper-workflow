@@ -84,20 +84,27 @@ class ProgressVersionTests(unittest.TestCase):
             (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
         )
 
-    def test_development_guide_is_a_complete_entrypoint(self):
+    def test_development_guide_is_developer_focused_and_complete(self):
         guide = (ROOT / "DEVELOPMENT_GUIDE.md").read_text(encoding="utf-8")
         for required in (
-            "## 2. 开始开发前的阅读顺序",
-            "## 4. 目录与职责",
-            "## 5. 不可破坏的工作流约束",
-            "## 7. 开发与测试规则",
-            "## 9. 版本升级清单",
-            "## 10. Git 与发布流程",
+            "本文面向希望理解、调试或扩展本项目的人类开发者",
+            "## 2. 仓库结构",
+            "## 3. 建立本地开发环境",
+            "## 4. 按开发目标寻找入口",
+            "## 5. Python 代码的共同模式",
+            "## 6. 测试结构与运行方法",
+            "## 7. 常见修改场景",
+            "## 8. 安装器的安全模型",
+            "## 9. 版本与兼容性",
+            "## 10. 提交前检查",
+            "## 11. 调试提示",
             "python -B -m unittest discover -s tests -v",
-            "git archive --format=zip",
+            "git diff --check",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, guide)
+        self.assertNotIn("后续 Agent", guide)
+        self.assertNotIn("repository_read:", guide)
         self.assertNotIn("TBD", guide)
         self.assertNotIn("TODO", guide)
 
