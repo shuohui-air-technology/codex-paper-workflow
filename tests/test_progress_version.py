@@ -74,6 +74,13 @@ class ProgressVersionTests(unittest.TestCase):
                 self.assertNotIn("handoff", text)
                 self.assertNotIn("交接", text)
 
+    def test_public_readmes_do_not_advertise_author_guided_editing(self):
+        english = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+        chinese = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
+        self.assertNotIn("author-guided", english)
+        self.assertNotIn("author feedback", english)
+        self.assertNotIn("作者", chinese)
+
     def test_public_readmes_use_v10_release_subtitles(self):
         self.assertIn(
             "**Helping you turn any vague idea into a paper built to top-journal standards.**",

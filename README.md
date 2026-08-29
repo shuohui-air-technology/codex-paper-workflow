@@ -106,7 +106,7 @@ The user confirms consequential decisions such as topic selection, study design,
 | Paper-structure validation | Checks for required sections and their order | `scripts/paper_section_validator.py`, `references/paper-section-contract.md` |
 | Scientific-figure workflow | Figures bound to source data, paper claims, and validation records | `scripts/figure_contract_validator.py`, `references/scientific-visualization-integration.md` |
 | Integrity and peer review | Citation, number, claim, and reproducibility checks followed by substantive revision | `SKILL.md`, `references/stage-contracts.md` |
-| Author-guided final editing | Manuscript-wide editing guided by author feedback with protected-content validation | `companion-skills/academic-manuscript-final-editor/` |
+| Final editing | Manuscript-wide editing with protected-content validation | `companion-skills/academic-manuscript-final-editor/` |
 | Prose naturalization | Mechanical prose cleanup after scientific content stabilizes, with content-difference checks | `scripts/humanizer_preflight.py`, `references/humanizer-adapter.md` |
 | Reproducible installation | Fixed-source installation through `core`, `standard`, or `full` profiles | `dependencies.lock.json`, `scripts/install_workflow.py` |
 
@@ -269,7 +269,7 @@ paper-workflow-orchestrator/
 ├── tests/                                 # Workflow and installer tests
 └── companion-skills/
     ├── research-skill-router/             # Research-task routing entry point
-    └── academic-manuscript-final-editor/  # Author-guided final editing
+    └── academic-manuscript-final-editor/  # Final editing
 ```
 
 ## Third-party skill sources

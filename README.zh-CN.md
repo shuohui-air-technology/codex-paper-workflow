@@ -106,7 +106,7 @@ flowchart TD
 | 论文结构检查 | 检查必需章节及其顺序 | `scripts/paper_section_validator.py`、`references/paper-section-contract.md` |
 | 科研图件工作流 | 将图件与数据来源、论文主张和验证记录关联 | `scripts/figure_contract_validator.py`、`references/scientific-visualization-integration.md` |
 | 完整性与同行评审 | 检查引用、数字、主张、可复现性并组织实质修订 | `SKILL.md`、`references/stage-contracts.md` |
-| 作者引导终稿编辑 | 根据作者反馈统一全文表达并验证受保护内容 | `companion-skills/academic-manuscript-final-editor/` |
+| 终稿编辑 | 统一全文表达并验证受保护内容 | `companion-skills/academic-manuscript-final-editor/` |
 | 语言自然化 | 在科学内容稳定后优化机械化表达并检查内容差异 | `scripts/humanizer_preflight.py`、`references/humanizer-adapter.md` |
 | 可复现安装 | 使用固定来源安装 core、standard 或 full 配置 | `dependencies.lock.json`、`scripts/install_workflow.py` |
 
@@ -269,7 +269,7 @@ paper-workflow-orchestrator/
 ├── tests/                                 # 工作流与安装器测试
 └── companion-skills/
     ├── research-skill-router/             # 科研任务路由入口
-    └── academic-manuscript-final-editor/  # 作者引导终稿编辑
+    └── academic-manuscript-final-editor/  # 终稿编辑
 ```
 
 ## 第三方 skill 来源
