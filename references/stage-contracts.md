@@ -28,15 +28,15 @@ The orchestrator owns stage transitions and user gates. Downstream skills perfor
 | integrity | audit agent | `integrity_report.md` | pass audit |
 | review | `academic-research-suite` internal `academic-paper-reviewer` workflow | `reviews/`, `revision_matrix.md` | accept revision plan |
 | revision | selected writing skill | revised draft, response letter | approve final audit |
-| author-guided final editing | `academic-manuscript-final-editor` | `author_style_ledger.yml`, `editorial_scan.json`, `final_edit_receipt.json` | accept exact candidate or sections |
+| final editing | `academic-manuscript-final-editor` | `editorial_style_ledger.yml`, `editorial_scan.json`, `final_edit_receipt.json` | accept exact candidate or sections |
 | prose naturalization | `humanizer` | humanized draft plus claim/evidence diff | choose apply scope |
-| final editorial audit | `academic-manuscript-final-editor` in read-only `Audit` mode | validated `final_edit_audit_receipt.json` | accept author-voice fidelity |
+| final editorial audit | `academic-manuscript-final-editor` in read-only `Audit` mode | validated `final_edit_audit_receipt.json` | accept manuscript-voice fidelity |
 | experiments | `autoresearch` only after contract validation | `experiment_contract.yml`, logs, results | confirm bounded handoff |
 | finalize | document/PDF skill as needed | `final/` | accept delivery |
 
 Progress events use normalized IDs rather than display labels: the figure row is
 `scientific_figures`, the abstract/title/keywords row is
-`abstract_title_keywords`, author-guided editing is
+`abstract_title_keywords`, final editing retains the compatibility ID
 `author_guided_final_editing`, and the final editorial audit is
 `final_editorial_audit`. The complete vocabulary is defined in
 `progress-schema.md` and enforced by `progress_manager.py`.
@@ -59,8 +59,8 @@ Downstream skills may use their own native outputs. The orchestrator creates a s
 | `figure_plan.yml` | outline stage | paper drafting | claim and data refs |
 | `.research/figures/<figure_id>/figure_receipt.json` | scientific-visualization adapter | claim-bearing figure | source/code/output hashes and visual review |
 | `stage_receipts/` | orchestrator | every delegated stage | context hashes, budgets, statuses |
-| `author_style_ledger.yml` | final editor + orchestrator wrapper | author-guided final editing | author feedback IDs and scoped rules |
-| `editorial_scan.json` | final-editor scanner | author-guided final editing | input hashes and candidate findings |
+| `editorial_style_ledger.yml` | final editor + orchestrator wrapper | final editing | feedback IDs and scoped editorial rules |
+| `editorial_scan.json` | final-editor scanner | final editing | input hashes and candidate findings |
 | `final_edit_receipt.json` | orchestrator | revised final-edit candidate | protected comparison and rollback bindings |
 
 Optional artifacts are marked by the stage condition; do not create empty placeholders just to satisfy a manifest.
@@ -76,8 +76,8 @@ Do not advance merely because a file exists:
 - outline: all core claims map to evidence or explicitly marked future experiments;
 - figures: every claim-bearing data plot has a passing receipt from `figure_contract_validator.py` (vector PDF/SVG), while image panels require publication-grade raster output; missing provenance, frozen-plan/ledger hash drift, misleading encoding, or an unresolved visual defect blocks downstream prose;
 - integrity: `integrity_report.md` has `validation_status: pass`;
-- author-guided final editing: substantive revision and integrity have passed; `validity_status: clear`; a time-limited edit authorization binds the exact canonical hash, files, sections, mode, and scope; the authoritative language, author evidence, citation-numbering policy, immutable baseline, distinct candidate, equal-content rollback target, canonical-bound scan/dispositions, recomputed claim inventory, canonical-derived protected manifest, trusted validator implementation receipt, validator-recomputed actual changes within authorized scope, bilingual parity, and canonical/candidate-bound claim/evidence diff are bound in `final_edit_receipt.json`; Markdown/TXT/LaTeX and DOCX OOXML parts receive deterministic protected-content comparison; DOCX also receives candidate-bound full-structure and all-page receipts; `final_edit_receipt_validator.py` returns `status: pass`; a separate apply decision then binds the accepted candidate hash and sections;
-- final editorial audit: `final_edit_audit_receipt.json` binds the accepted Humanizer candidate and receipt, author-voice verifier, hashed drift findings, and complete hashed dispositions whose unique IDs form an exact one-to-one set and carry decisions plus evidence; the same validator returns `status: pass` before final integrity or rendering;
+- final editing: substantive revision and integrity have passed; `validity_status: clear`; a time-limited edit authorization binds the exact canonical hash, files, sections, mode, and scope; the canonical language, editorial feedback, citation-numbering policy, immutable baseline, distinct candidate, equal-content rollback target, canonical-bound scan/dispositions, recomputed claim inventory, canonical-derived protected manifest, trusted validator implementation receipt, validator-recomputed actual changes within authorized scope, bilingual parity, and canonical/candidate-bound claim/evidence diff are bound in `final_edit_receipt.json`; Markdown/TXT/LaTeX and DOCX OOXML parts receive deterministic protected-content comparison; DOCX also receives candidate-bound full-structure and all-page receipts; `final_edit_receipt_validator.py` returns `status: pass`; a separate apply decision then binds the accepted candidate hash and sections;
+- final editorial audit: `final_edit_audit_receipt.json` binds the accepted Humanizer candidate and receipt, manuscript-voice verifier, hashed drift findings, and complete hashed dispositions whose unique IDs form an exact one-to-one set and carry decisions plus evidence; the same validator returns `status: pass` before final integrity or rendering;
 - humanizer: `humanizer_preflight.py` passes with an executed, bounded adapter self-test, adapter/parser version, humanizer skill hash/version, workspace-contained entrypoint, immutable-copy and candidate hashes, input/candidate-bound integrity receipt, protected manifest (and hashed mapping receipt when needed), candidate-bound verifier receipt, claim inventory/count and protected-field diff, and non-empty grounded claim/evidence diff; protected-region and claim/evidence checks pass before any apply decision;
 - experiments: the contract is complete, bounded, and locally reportable before `autoresearch` starts.
 
@@ -97,7 +97,7 @@ within 90 days; renew it after that horizon.
 - abstract: the body, verified results, interpretation, and Conclusion are complete; the abstract contains no unsupported claim, new evidence, or citation and passes the body-consistency check;
 - discussion: a standalone heading may be omitted only when interpretation, comparison, application boundary, and limitations are present in an explicitly named combined section;
 - conclusion: a mandatory Conclusion answers the research question, states the finite contribution and boundary, and contains no new evidence;
-- validity: an active critical blocker or `validity_status: blocked` prevents drafting the final abstract, Conclusion, review, author-guided final editing, humanizer pass, or final output.
+- validity: an active critical blocker or `validity_status: blocked` prevents drafting the final abstract, Conclusion, review, final editing, humanizer pass, or final output.
 
 Run `<resolved-orchestrator-skill-root>/scripts/paper_section_validator.py` for the body, abstract, and final
 receipts, passing the recorded `paper_type`, language, method profile, and
@@ -150,7 +150,7 @@ Parallelize only independent tasks after their inputs are frozen:
 - introduction, related-work, figure, and reproducibility planning after the outline;
 - independent reviewer roles after the complete draft.
 
-Keep dependent tasks serial: final results prose waits for verified logs; final synthesis waits for all accepted section artifacts; revision waits for the review matrix; author-guided final editing waits for accepted substantive revision and integrity; Humanizer waits for the accepted final-edit candidate; the final author-voice audit waits for Humanizer. A failed or over-budget agent is marked `warn` or `fail` and does not silently become evidence.
+Keep dependent tasks serial: final results prose waits for verified logs; final synthesis waits for all accepted section artifacts; revision waits for the review matrix; final editing waits for accepted substantive revision and integrity; Humanizer waits for the accepted final-edit candidate; the final manuscript-voice audit waits for Humanizer. A failed or over-budget agent is marked `warn` or `fail` and does not silently become evidence.
 
 The Abstract and final Title are deliberately serial after the body. Results
 changes invalidate the Abstract and trigger regeneration. A critical validity
@@ -159,7 +159,7 @@ and re-check pass.
 
 ## Humanizer boundary
 
-Before Humanizer, follow [final-editor-integration.md](final-editor-integration.md) when author-guided final editing is selected. The final editor and Humanizer are separate primary stages and may not rewrite the same canonical file concurrently. Scanner findings are candidates requiring dispositions; they are not automatic deletions or proof of DOCX completeness.
+Before Humanizer, follow [final-editor-integration.md](final-editor-integration.md) when final editing is selected. The final editor and Humanizer are separate primary stages and may not rewrite the same canonical file concurrently. Scanner findings are candidates requiring dispositions; they are not automatic deletions or proof of DOCX completeness.
 
 Run `<resolved-orchestrator-skill-root>/scripts/humanizer_preflight.py` with all required evidence paths and then follow [humanizer-adapter.md](humanizer-adapter.md). Preflight must validate the exact input/candidate hashes, a workspace-contained format-specific adapter/parser contract and self-test with required placeholders, immutable copy, structured integrity receipt bound to the manifest and claim-diff hashes, protected manifest (and mapping receipt when needed), and `claim_evidence_diff.json` with an independent verifier receipt, inventory/count, grounded excerpts, and protected-field inventory. Native humanizer file mode is prohibited for a canonical manuscript. Require protected-span hashes, modality/negation/scope checks, bounded embedded-mode chunks, and a post-edit integrity result. If any artifact is missing, the format is ambiguous, or the adapter cannot self-test without mutating a bound artifact, fail closed. At the gate, offer: accept all verified prose changes (recommended), accept only selected sections, or keep the original. After substantive revision, repeat this pass and the claim/evidence check.
 

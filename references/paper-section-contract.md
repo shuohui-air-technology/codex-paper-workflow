@@ -9,7 +9,7 @@ study type, but must not silently remove a required semantic function.
 | Component | Status | Writing time | Gate |
 |---|---|---|---|
 | Title | required | provisional at outline; final after results and conclusion | reject overclaiming titles |
-| Abstract | required | only after the body, results, interpretation, and conclusion are stable | author confirmation plus consistency audit |
+| Abstract | required | only after the body, results, interpretation, and conclusion are stable | user confirmation plus consistency audit |
 | Keywords | required when the venue requests them | after the abstract | terminology and searchability check |
 | 1 Introduction | required | after the evidence set and research question are locked | concise gap, innovation, and RQ check |
 | 2 Materials and Methods | required | after the design is locked | reproducibility and no-results-in-method check |

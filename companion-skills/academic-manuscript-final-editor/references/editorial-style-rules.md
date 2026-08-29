@@ -1,14 +1,14 @@
-# Author-guided final editing rules
+# Feedback-guided final editing rules
 
-Read this reference for whole-manuscript revision, author-comment generalization, or bilingual synchronization. These are editorial decision rules, not a list of words to delete.
+Read this reference for whole-manuscript revision, comment generalization, or bilingual synchronization. These are editorial decision rules, not a list of words to delete.
 
-## Learn narrowly from author feedback
+## Learn narrowly from supplied feedback
 
-- Treat an explicit replacement as authoritative for that passage unless it creates a factual contradiction.
-- Classify the inferred rule as passage-local, section-local, project-wide, or reusable across projects. Only the last class belongs in a durable cross-project author profile.
+- Treat an explicit replacement as canonical for that passage unless it creates a factual contradiction.
+- Classify the inferred rule as passage-local, section-local, project-wide, or reusable across projects. Only the last class belongs in a durable cross-project editorial profile.
 - Keep project facts local. A preferred parameter, data interpretation, deferred declaration, target journal, or model boundary does not become a universal writing rule.
 - Record deletion status as permanent, current-version only, deferred to submission, or moved to supplementary/audit material. Do not restore deleted prose during smoothing or translation unless its status requires later restoration.
-- A useful project ledger records: original wording, author revision, issue type, rule scope, analogous locations, bilingual action, restoration status, and completion state.
+- A useful project ledger records: original wording, revised wording, issue type, rule scope, analogous locations, bilingual action, restoration status, and completion state.
 
 ## Write from the finished scientific argument
 
@@ -42,7 +42,7 @@ Never use a word-counting rule to remove negation. Look for repeated defensive t
 ## Remove self-defense and editorial residue
 
 - Delete side remarks whose only purpose is to say that more complex methods exist or to defend why the paper did not use them. Keep a method-choice explanation when it is needed for identification, reproducibility, or interpretation.
-- Replace "the provider confirmed", "the author approved", or "the registered rule" with the actual data definition or analytical rule when the decision history is not itself evidence.
+- Replace statements that merely report an approval or registered rule with the actual data definition or analytical rule when the decision history is not itself evidence.
 - Omit redundant raw columns, internal file names, variable names, version IDs, hashes, and accounting checks from ordinary prose. Retain reproducibility information in the appropriate methods, data, code, or supplement section.
 - Replace implementation warnings such as "do not apply twice" with the mathematical definition and unit convention that make the operation unambiguous.
 - Do not delete ethics, conflicts, funding, data provenance, or required journal statements by default. Their inclusion and timing depend on the study and submission stage.
@@ -64,10 +64,10 @@ Never use a word-counting rule to remove negation. Look for repeated defensive t
 
 ## Synchronize languages semantically
 
-- The language most recently edited by the author, or explicitly designated by the project, controls that revision round. This is not always Chinese.
+- The language designated for the current revision round controls synchronization. If none is designated, use the project version most recently edited. This is not always Chinese.
 - Transfer each sentence's function: claim, qualification, transition, definition, or interpretation. Do not preserve an awkward source-language shape merely for word-level similarity.
 - Compare numbers, signs, units, equations, citations, figure/table numbers, uncertainty, causal strength, sample scope, and conclusion scope after synchronization.
-- Do not add an explanation to the translation that the author removed from the authoritative version.
+- Do not add an explanation to the translation that was removed from the canonical version.
 
 ## Protect document integrity
 
@@ -78,7 +78,7 @@ Never use a word-counting rule to remove negation. Look for repeated defensive t
 
 ## Final acceptance checklist
 
-- Every author comment is applied or explicitly unresolved.
+- Every supplied comment is applied or explicitly unresolved.
 - Analogous wording was searched across the full draft.
 - Rule scope and any deferred restoration status are recorded.
 - Scientific payload matches the frozen baseline.

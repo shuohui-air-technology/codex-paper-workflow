@@ -217,7 +217,7 @@ def validate(receipt:Path)->dict[str,Any]:
     ledger=bound(receipt,p,"author_style_ledger",errors); dispositions=bound(receipt,p,"finding_dispositions",errors); verifier=bound(receipt,p,"protected_verifier_receipt",errors)
     if ledger:
         q=load(ledger)
-        if q.get("rule_count")!=len(q.get("rules",[])) or q.get("rule_count",0)<1: errors.append("author style ledger is incomplete")
+        if q.get("rule_count")!=len(q.get("rules",[])) or q.get("rule_count",0)<1: errors.append("editorial style ledger is incomplete")
     if dispositions and scanner:
         q,s=load(dispositions),load(scanner)
         if q.get("status")!="pass" or q.get("scanner_report_sha256")!=digest(scanner) or q.get("finding_count")!=s.get("finding_count") or q.get("disposed_count")!=s.get("finding_count"): errors.append("finding dispositions are incomplete or unbound")
@@ -279,13 +279,13 @@ def validate(receipt:Path)->dict[str,Any]:
             if not any(isinstance(i,dict) and i.get("path")==str(canonical) and i.get("coverage_status")=="main-document-text-only" for i in items): errors.append("DOCX scanner coverage_status is invalid")
     if mode=="audit":
         humanizer=bound(receipt,p,"humanizer_receipt",errors); voice=bound(receipt,p,"author_voice_verifier",errors); drift=bound(receipt,p,"voice_drift_findings",errors); drift_dispositions=bound(receipt,p,"voice_drift_dispositions",errors)
-        if p.get("author_voice_audit_status")!="pass" or p.get("voice_drift_dispositions_complete") is not True: errors.append("author voice audit is incomplete")
+        if p.get("author_voice_audit_status")!="pass" or p.get("voice_drift_dispositions_complete") is not True: errors.append("manuscript voice audit is incomplete")
         if humanizer:
             q=load(humanizer)
             if q.get("status") not in {"pass","ready"} or q.get("candidate_sha256")!=canonical_sha: errors.append("Humanizer receipt is not bound to audited candidate")
         if voice:
             q=load(voice)
-            if q.get("status")!="pass" or q.get("audited_sha256")!=canonical_sha or q.get("humanizer_receipt_sha256")!=p.get("humanizer_receipt_sha256") or not q.get("verifier_id") or not q.get("evidence_refs"): errors.append("author voice verifier is invalid")
+            if q.get("status")!="pass" or q.get("audited_sha256")!=canonical_sha or q.get("humanizer_receipt_sha256")!=p.get("humanizer_receipt_sha256") or not q.get("verifier_id") or not q.get("evidence_refs"): errors.append("manuscript voice verifier is invalid")
         if drift and drift_dispositions:
             f,d=load(drift),load(drift_dispositions)
             findings=f.get("findings",[]); disposition_items=d.get("dispositions",[])

@@ -15,6 +15,9 @@ This is the first stable release of Paper Workflow Orchestrator.
 - Normalizes temporary-directory fixtures before installer tests, keeps
   user-controlled symlink parents blocked, and adds Linux, macOS, and Windows
   CI coverage for Python 3.10 and 3.13.
+- Uses neutral final-editing terminology across the main workflow and bundled
+  Final Editor while preserving existing v1.0 machine identifiers for receipt
+  and progress compatibility.
 
 The release version is recorded as `1.0.0`; the progress schema identifies the
 workflow as `paper-workflow-orchestrator-v1.0`.

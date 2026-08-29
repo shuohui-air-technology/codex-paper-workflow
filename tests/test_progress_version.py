@@ -1,3 +1,4 @@
+import re
 import types
 import unittest
 from pathlib import Path
@@ -80,6 +81,21 @@ class ProgressVersionTests(unittest.TestCase):
         self.assertNotIn("author-guided", english)
         self.assertNotIn("author feedback", english)
         self.assertNotIn("作者", chinese)
+
+    def test_final_editor_user_facing_docs_use_neutral_editorial_language(self):
+        skill_root = ROOT / "companion-skills" / "academic-manuscript-final-editor"
+        paths = (
+            skill_root / "README.md",
+            skill_root / "SKILL.md",
+            skill_root / "agents" / "openai.yaml",
+            skill_root / "references" / "editorial-style-rules.md",
+        )
+        for path in paths:
+            with self.subTest(path=path.relative_to(ROOT)):
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn("作者", text)
+                self.assertIsNone(re.search(r"\bauthors?\b", text, re.IGNORECASE))
+        self.assertFalse((skill_root / "references" / "author-style-rules.md").exists())
 
     def test_public_readmes_use_v10_release_subtitles(self):
         self.assertIn(

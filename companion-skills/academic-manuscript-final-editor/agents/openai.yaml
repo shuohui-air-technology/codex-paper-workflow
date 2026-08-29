@@ -1,7 +1,7 @@
 interface:
   display_name: "Academic Manuscript Final Editor"
-  short_description: "Author-guided final academic manuscript revision"
-  default_prompt: "Use $academic-manuscript-final-editor to apply my author feedback across this substantively complete manuscript while preserving its scientific content."
+  short_description: "Evidence-preserving final academic manuscript revision"
+  default_prompt: "Use $academic-manuscript-final-editor to apply the supplied editorial feedback across this substantively complete manuscript while preserving its scientific content."
 
 policy:
   allow_implicit_invocation: true

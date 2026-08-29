@@ -40,7 +40,7 @@ receipts, and blocker checks (human-facing headings may still be translated):
 
 ## Core Experience
 - E001: [validated practice] [evidence refs] [confidence]
-- E002: [accepted prose/style practice] [author feedback or verified Humanizer pass] [scope and confidence]
+- E002: [accepted prose/style practice] [editorial feedback or verified Humanizer pass] [scope and confidence]
 
 ## Error Avoidance Rules
 - R001:
@@ -63,13 +63,13 @@ receipts, and blocker checks (human-facing headings may still be translated):
   - status: active | superseded | resolved
 - R003:
   - error: final editing changed protected scientific content or generalized a local correction
-  - cause: author evidence was applied outside its defensible scope or the candidate lacked a bound protected comparison
-  - impact: scientific drift, author-voice drift, citation damage, or cross-project contamination
+  - cause: editorial feedback was applied outside its defensible scope or the candidate lacked a bound protected comparison
+  - impact: scientific drift, manuscript-voice drift, citation damage, or cross-project contamination
   - severity: critical | major | minor
   - blocking: true | false
-  - prevention_rule: keep author rules scoped; generate a candidate; preserve a rollback baseline; validate the final-edit receipt before apply
+  - prevention_rule: keep editorial rules scoped; generate a candidate; preserve a rollback baseline; validate the final-edit receipt before apply
   - required_check: final-edit receipt, protected comparison, finding dispositions, and bilingual parity pass
-  - applicable_stages: revision, author-guided final editing, prose naturalization, finalization
+  - applicable_stages: revision, final editing, prose naturalization, finalization
   - status: active | superseded | resolved
 
 ## Decisions
@@ -116,18 +116,18 @@ deltas, include the selected and rejected options and the decision owner. Reject
 a delta that has no evidence reference when it makes an externally verifiable
 claim. Only the main model may change `validity_status` or commit a delta.
 
-## Author-guided final-edit state
+## Final-edit state
 
 Create these only when the final-edit stage is selected:
 
 ```text
-.research/author_style_ledger.yml
+.research/editorial_style_ledger.yml
 .research/editorial_scan.json
 .research/final_edit_receipt.json
 .research/final_edit_audit_receipt.json
 ```
 
-The ledger keeps rule scope and evidence; it is not a global preference store. The scan report records candidates and their dispositions. The receipt binds the canonical input, candidate, rollback copy, authoritative language, citation-numbering policy, style evidence, protected checks, claim/evidence diff, bilingual parity, user confirmation, and stage receipt. A validator pass does not authorize applying the candidate. Record the user's apply decision separately.
+The ledger keeps rule scope and evidence; it is not a global preference store. The scan report records candidates and their dispositions. The receipt binds the canonical input, candidate, rollback copy, canonical language, citation-numbering policy, style evidence, protected checks, claim/evidence diff, bilingual parity, user confirmation, and stage receipt. A validator pass does not authorize applying the candidate. Record the user's apply decision separately.
 
 After the initial error entry, append a correction event containing the failed artifact, remediation, re-run result, and evidence references. An error rule is not marked `resolved` until its required check passes on the corrected artifact. Keep `Handoff Card.must_not_repeat` derived from active rules only and compact it to the most relevant active rules; the full history remains in this section and the event log.
 
@@ -168,7 +168,7 @@ Examples of useful checks include citation-source verification, claim–evidence
 Use `severity: critical` and `blocking: true` when a data, measurement,
 identification, leakage, model-assumption, baseline, or robustness problem could
 change the core conclusion. Such a rule requires `validity_status: blocked` and
-blocks the abstract, final Conclusion, peer review, author-guided final editing, humanizer, and finalization.
+blocks the abstract, final Conclusion, peer review, final editing, humanizer, and finalization.
 The main model must request additional evidence, standard methods/baselines,
 robustness work, or a user-approved design discussion. After correction, rerun
 the required check and append a recovery event; only then may the rule be marked
