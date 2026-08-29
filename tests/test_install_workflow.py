@@ -36,15 +36,10 @@ class InstallerContractTests(unittest.TestCase):
     def test_default_target_honors_codex_home(self):
         from scripts.install_workflow import default_target
 
-        previous = os.environ.get("CODEX_HOME")
-        try:
-            os.environ["CODEX_HOME"] = r"C:\codex-test-home"
-            self.assertEqual(default_target(), Path(r"C:\codex-test-home\skills"))
-        finally:
-            if previous is None:
-                os.environ.pop("CODEX_HOME", None)
-            else:
-                os.environ["CODEX_HOME"] = previous
+        with tempfile.TemporaryDirectory() as tmp:
+            configured = Path(tmp).resolve() / "codex-home"
+            with patch.dict(os.environ, {"CODEX_HOME": str(configured)}):
+                self.assertEqual(default_target(), configured / "skills")
 
     def test_manifest_rejects_unsafe_names_and_paths_before_materialization(self):
         from scripts.install_workflow import InstallError, load_manifest
@@ -59,7 +54,7 @@ class InstallerContractTests(unittest.TestCase):
             for profile, names in manifest["profiles"].items():
                 manifest["profiles"][profile] = [bad_name if name == "paper-workflow-orchestrator" else name for name in names]
             with tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp) / "manifest.json"
+                path = Path(tmp).resolve() / "manifest.json"
                 path.write_text(json.dumps(manifest), encoding="utf-8")
                 with self.assertRaises(InstallError):
                     load_manifest(path)
@@ -72,7 +67,7 @@ class InstallerContractTests(unittest.TestCase):
         with self.assertRaises(InstallError):
             __import__("scripts.install_workflow", fromlist=["_validate_skill_name"])._validate_skill_name("con")
         with tempfile.TemporaryDirectory() as tmp:
-            staging = Path(tmp)
+            staging = Path(tmp).resolve()
             commit = "3" * 40
             archive = io.BytesIO()
             with zipfile.ZipFile(archive, "w") as bundle:
@@ -141,7 +136,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import _download_github
 
         with tempfile.TemporaryDirectory() as tmp:
-            staging = Path(tmp)
+            staging = Path(tmp).resolve()
             commit = "1" * 40
             archive = io.BytesIO()
             with zipfile.ZipFile(archive, "w") as bundle:
@@ -162,7 +157,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import InstallError, _download_github
 
         with tempfile.TemporaryDirectory() as tmp:
-            staging = Path(tmp)
+            staging = Path(tmp).resolve()
             commit = "2" * 40
             archive = io.BytesIO()
             with zipfile.ZipFile(archive, "w") as bundle:
@@ -195,13 +190,13 @@ class InstallerContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("scripts.install_workflow.MAX_ARCHIVE_COMPRESSED", 10), patch("scripts.install_workflow.urllib.request.urlopen", return_value=OversizedResponse()):
                 with self.assertRaises(InstallError):
-                    _download_github({"repository": "owner/repo", "commit": "4" * 40, "path": "."}, Path(tmp))
+                    _download_github({"repository": "owner/repo", "commit": "4" * 40, "path": "."}, Path(tmp).resolve())
 
     def test_core_dry_run_does_not_write(self):
         from scripts.install_workflow import install, load_manifest
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             result = install(load_manifest(ROOT / "dependencies.lock.json"), "core", target, ROOT, dry_run=True)
             self.assertEqual(result["status"], "dry-run")
             self.assertFalse(target.exists())
@@ -210,17 +205,37 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import install, load_manifest
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "new-parent" / "skills"
+            target = Path(tmp).resolve() / "new-parent" / "skills"
             result = install(load_manifest(ROOT / "dependencies.lock.json"), "core", target, ROOT, dry_run=True)
             self.assertEqual(result["status"], "dry-run")
             self.assertFalse(target.exists())
             self.assertFalse(target.parent.exists())
 
+    @unittest.skipIf(os.name == "nt", "creating a test symlink may require elevated Windows privileges")
+    def test_install_rejects_user_controlled_symlink_parent(self):
+        from scripts.install_workflow import InstallError, install, load_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+            with self.assertRaisesRegex(InstallError, "symlink or reparse point"):
+                install(
+                    load_manifest(ROOT / "dependencies.lock.json"),
+                    "core",
+                    linked_parent / "skills",
+                    ROOT,
+                    dry_run=True,
+                )
+
     def test_core_install_and_verify(self):
         from scripts.install_workflow import install, load_manifest, verify
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             result = install(load_manifest(ROOT / "dependencies.lock.json"), "core", target, ROOT)
             self.assertEqual(result["status"], "pass")
             manifest = load_manifest(ROOT / "dependencies.lock.json")
@@ -238,7 +253,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import InstallError, _recover_transaction
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             target.mkdir()
             marker = target / ".paper-workflow-install.transaction.json"
             marker.write_text("{not-json", encoding="utf-8")
@@ -255,7 +270,7 @@ class InstallerContractTests(unittest.TestCase):
             "skills": {"demo-skill": {"source": "bundled", "path": "demo-source", "license": "MIT"}},
         }
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source = root / "demo-source"
             source.mkdir()
             skill_file = source / "SKILL.md"
@@ -294,7 +309,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import install, load_manifest, verify
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             manifest = load_manifest(ROOT / "dependencies.lock.json")
             install(manifest, "core", target, ROOT)
             result = verify(target, "standard", manifest)
@@ -305,7 +320,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import InstallError, install, load_manifest, verify
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             manifest = load_manifest(ROOT / "dependencies.lock.json")
             # Use a tiny local manifest to avoid network access while exercising profile transitions.
             mini = {
@@ -333,7 +348,7 @@ class InstallerContractTests(unittest.TestCase):
             "skills": {"research-skill-router": {"source": "bundled", "path": "companion-skills/research-skill-router", "license": "MIT"}},
         }
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             install(manifest, "core", target, ROOT)
             self.assertTrue((target / "research-skill-router" / "LICENSE").is_file())
 
@@ -349,7 +364,7 @@ class InstallerContractTests(unittest.TestCase):
             },
         }
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             original_rename = Path.rename
             calls = {"count": 0}
 
@@ -371,7 +386,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import install, load_manifest, verify
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "new-parent" / "skills"
+            target = Path(tmp).resolve() / "new-parent" / "skills"
             result = install(load_manifest(ROOT / "dependencies.lock.json"), "core", target, ROOT)
             self.assertEqual(result["status"], "pass")
             self.assertEqual(verify(target)["status"], "pass")
@@ -380,7 +395,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import InstallError, install, load_manifest
 
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             existing = target / "paper-workflow-orchestrator"
             existing.mkdir(parents=True)
             (existing / "SKILL.md").write_text("unmanaged", encoding="utf-8")
@@ -391,7 +406,7 @@ class InstallerContractTests(unittest.TestCase):
         from scripts.install_workflow import _download_github
 
         with tempfile.TemporaryDirectory() as tmp:
-            staging = Path(tmp)
+            staging = Path(tmp).resolve()
             commit = "0" * 40
             archive = io.BytesIO()
             with zipfile.ZipFile(archive, "w") as bundle:

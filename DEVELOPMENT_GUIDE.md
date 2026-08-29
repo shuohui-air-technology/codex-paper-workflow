@@ -147,7 +147,7 @@ python -B -m unittest discover -s tests -v
 - `tests/test_install_workflow.py`：安装 profile、路径安全、回滚、许可证和幂等更新。
 - `tests/test_progress_version.py`：v1.0 元数据、v0.2 至 v0.6 迁移、README 约束和安装收据。
 
-当前正式基线为 48 项测试。新增行为应增加对应测试，不要通过删除断言降低门槛。
+当前正式基线为 49 项测试。新增行为应增加对应测试，不要通过删除断言降低门槛。GitHub Actions 会在 Linux、macOS 和 Windows 上分别使用 Python 3.10 与 3.13 运行同一命令；本地通过不能替代跨平台矩阵通过。
 
 ## 8. 安装器与依赖边界
 

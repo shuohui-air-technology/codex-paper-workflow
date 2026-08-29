@@ -110,7 +110,7 @@ class ProgressVersionTests(unittest.TestCase):
         self.assertEqual(manifest.get("release_version"), "1.0.0")
         self.assertEqual(manifest.get("workflow_version"), "paper-workflow-orchestrator-v1.0")
         with TemporaryDirectory() as tmp:
-            target = Path(tmp) / "skills"
+            target = Path(tmp).resolve() / "skills"
             install(manifest, "core", target, ROOT)
             receipt = json.loads((target / ".paper-workflow-install.json").read_text(encoding="utf-8"))
             self.assertEqual(receipt.get("release_version"), "1.0.0")

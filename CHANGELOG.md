@@ -12,6 +12,9 @@ This is the first stable release of Paper Workflow Orchestrator.
 - Adds paper-section, humanizer, final-editor, and bounded-experiment checks.
 - Documents installation, runtime prerequisites, safety boundaries, and
   third-party license conditions in English and Simplified Chinese.
+- Normalizes temporary-directory fixtures before installer tests, keeps
+  user-controlled symlink parents blocked, and adds Linux, macOS, and Windows
+  CI coverage for Python 3.10 and 3.13.
 
 The release version is recorded as `1.0.0`; the progress schema identifies the
 workflow as `paper-workflow-orchestrator-v1.0`.
