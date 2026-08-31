@@ -43,6 +43,34 @@ class WorkflowSchemaTests(unittest.TestCase):
         document = parse_workflow(draft)
         self.assertIsNone(document.nodes[0].skill_ref)
 
+    def test_projection_id_accepts_locked_version_and_rejects_unsafe_forms(self):
+        """Catches general IDs blocking the locked projection or provenance accepting paths."""
+        derived = copy.deepcopy(self.value)
+        derived["derived_from"] = {
+            "projection_id": "official-v1.0",
+            "projection_sha256": "0" * 64,
+        }
+        self.assertEqual(
+            parse_workflow(derived).derived_from["projection_id"], "official-v1.0"
+        )
+
+        for unsafe in (
+            " official-v1.0",
+            "official-v1.0 ",
+            "../official-v1.0",
+            "official/v1.0",
+            "official\\v1.0",
+            "official..v1",
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(WorkflowError) as caught:
+                invalid = copy.deepcopy(derived)
+                invalid["derived_from"]["projection_id"] = unsafe
+                parse_workflow(invalid)
+            self.assertIn(
+                caught.exception.code,
+                {"schema.invalid_scalar", "schema.invalid_projection_id"},
+            )
+
     def test_control_node_cannot_bind_a_skill(self):
         """Catches a control node becoming an executable Skill capability."""
         invalid = copy.deepcopy(self.value)

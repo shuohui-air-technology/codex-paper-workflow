@@ -16,6 +16,7 @@ SCHEMA_VERSION = "paper-workflow-custom-v1"
 NODE_TYPES = frozenset({"task", "condition", "join", "validator"})
 
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*$")
+_PROJECTION_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _FAILURE_POLICIES = frozenset({"block", "skip_branch"})
 _JOIN_MODES = frozenset({"all_active", "any_success"})
@@ -187,6 +188,16 @@ def _optional_identifier(value: object, label: str, *, node_id: str = "") -> str
     return _identifier(value, label, node_id=node_id)
 
 
+def _projection_identifier(value: object, label: str) -> str:
+    item = _scalar(value, label)
+    if not _PROJECTION_IDENTIFIER_RE.fullmatch(item):
+        _fail(
+            "schema.invalid_projection_id",
+            f"{label} must be a normalized versioned projection identifier",
+        )
+    return item
+
+
 def _boolean(value: object, label: str, *, node_id: str = "") -> bool:
     if not isinstance(value, bool):
         _fail("schema.invalid_boolean", f"{label} must be true or false", node_id=node_id)
@@ -262,7 +273,7 @@ def _derived_from(value: object) -> Mapping[str, Any] | None:
         "derived_from",
         unknown_code="schema.unknown_derived_from_field",
     )
-    projection_id = _identifier(item["projection_id"], "derived_from.projection_id")
+    projection_id = _projection_identifier(item["projection_id"], "derived_from.projection_id")
     projection_sha256 = _scalar(item["projection_sha256"], "derived_from.projection_sha256")
     if not _SHA256_RE.fullmatch(projection_sha256):
         _fail("schema.invalid_projection_hash", "derived_from.projection_sha256 must be a lowercase SHA-256 hex digest")
