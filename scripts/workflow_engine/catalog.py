@@ -15,6 +15,7 @@ from .schema import WorkflowIssue
 
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*$")
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ADAPTERS = frozenset(
     {
@@ -116,7 +117,7 @@ def _frontmatter_name(skill_file: Path) -> str:
     except ValueError as exc:
         raise CatalogError("catalog.invalid_frontmatter", f"Skill frontmatter is not closed: {skill_file}") from exc
     names = [line[5:].strip() for line in lines[1:close] if line.startswith("name:")]
-    if len(names) != 1 or not _NAME_RE.fullmatch(names[0]):
+    if len(names) != 1 or not _SKILL_NAME_RE.fullmatch(names[0]):
         raise CatalogError("catalog.invalid_frontmatter", f"Skill frontmatter has no valid name: {skill_file}")
     return names[0]
 

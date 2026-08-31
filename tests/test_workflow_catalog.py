@@ -121,6 +121,29 @@ class WorkflowCatalogTests(unittest.TestCase):
             )
             self.assertFalse(result.warnings)
 
+    def test_digit_leading_installer_skill_is_discovered_and_locked(self):
+        """Catches rejecting a receipt-bound Skill ID the installer accepts."""
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            write_skill(root, "3d-skill", "digit")
+            expected = "sha256:135b095f366a600e5dc09289d898da4e823057f6ac3db874f3d0a6b46fac1678"
+            result = discover_skills(
+                (root,),
+                install_receipts={root.resolve(): {"skills": {"3d-skill": {"tree_hash": expected}}}},
+            )
+            self.assertTrue(result.skills["3d-skill"].locked)
+            self.assertFalse(result.errors)
+
+    def test_installer_invalid_underscore_and_overlength_ids_are_rejected(self):
+        """Catches catalog IDs drifting wider than the installer contract."""
+        for name in ("under_score", "a" * 129):
+            with self.subTest(name=name), TemporaryDirectory() as temporary:
+                root = Path(temporary) / "skills"
+                write_skill(root, name)
+                result = discover_skills((root,), install_receipts={})
+                self.assertNotIn(name, result.skills)
+                self.assertEqual(result.errors[0].code, "catalog.invalid_frontmatter")
+
     def test_unrecorded_skill_is_reported_unlocked(self):
         """Catches a mutable local Skill being silently treated as installer-locked."""
         with TemporaryDirectory() as temporary:
