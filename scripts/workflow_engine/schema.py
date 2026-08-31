@@ -244,6 +244,15 @@ def _json_value(value: object) -> object:
     return value
 
 
+def _json_object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            _fail("schema.duplicate_json_key", f"JSON object contains duplicate key: {key}")
+        value[key] = item
+    return value
+
+
 def _derived_from(value: object) -> Mapping[str, Any] | None:
     if value is None:
         return None
@@ -436,9 +445,11 @@ def _ui(value: object) -> Mapping[str, Any]:
         frozen_coordinate: dict[str, float | int] = {}
         for axis in ("x", "y"):
             number = coordinate[axis]
-            if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+            if isinstance(number, bool) or not isinstance(number, (int, float)):
                 _fail("schema.invalid_coordinate", f"ui.positions.{node_key}.{axis} must be finite")
-            if abs(number) > _MAX_COORDINATE:
+            if isinstance(number, int) and abs(number) > _MAX_COORDINATE:
+                _fail("schema.invalid_coordinate", f"ui.positions.{node_key}.{axis} exceeds the canvas limit")
+            if isinstance(number, float) and (not math.isfinite(number) or abs(number) > _MAX_COORDINATE):
                 _fail("schema.invalid_coordinate", f"ui.positions.{node_key}.{axis} exceeds the canvas limit")
             frozen_coordinate[axis] = number
         frozen_positions[node_key] = MappingProxyType(frozen_coordinate)
@@ -497,7 +508,10 @@ def load_workflow(path: Path | str) -> WorkflowDocument:
     """Load and structurally validate one UTF-8 workflow JSON document."""
     source = Path(path)
     try:
-        value = json.loads(source.read_text(encoding="utf-8"))
+        value = json.loads(
+            source.read_text(encoding="utf-8"),
+            object_pairs_hook=_json_object_without_duplicate_keys,
+        )
     except OSError as exc:
         raise WorkflowError("schema.read_error", f"could not read workflow document: {source}") from exc
     except json.JSONDecodeError as exc:
