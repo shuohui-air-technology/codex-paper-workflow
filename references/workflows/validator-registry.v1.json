@@ -1,0 +1,45 @@
+{
+  "schema_version": "paper-workflow-validator-registry-v1",
+  "validators": {
+    "experiment-contract": {
+      "script": "scripts/experiment_contract_validator.py",
+      "sha256": "79b42f20c2afc23fd87bc45530f1cb37fcf9be660711e7797d19a4547c58b47d",
+      "adapter": "experiment_contract_v1",
+      "input_schema": "experiment_contract_v1",
+      "control_tags": ["experiment_contract"],
+      "outcomes": ["pass", "fail", "blocked"]
+    },
+    "figure-contract": {
+      "script": "scripts/figure_contract_validator.py",
+      "sha256": "6a17032225360f38a379fa4edefd50826dcdb3c70959fbd02a01eed4b11e0a79",
+      "adapter": "figure_contract_v1",
+      "input_schema": "figure_contract_v1",
+      "control_tags": ["figure"],
+      "outcomes": ["pass", "fail", "blocked"]
+    },
+    "final-edit-receipt": {
+      "script": "scripts/final_edit_receipt_validator.py",
+      "sha256": "ea7db7b02f22625adc8e60aa5d689ae5977c94b85bbbbcac4ad6ac23c2ac9246",
+      "adapter": "final_edit_receipt_v1",
+      "input_schema": "final_edit_receipt_v1",
+      "control_tags": [],
+      "outcomes": ["pass", "fail", "blocked"]
+    },
+    "humanizer-preflight": {
+      "script": "scripts/humanizer_preflight.py",
+      "sha256": "7e4abf7d0f418bb300ef0cb3634e231ca0f8ee491d32126845eea150544b69c4",
+      "adapter": "humanizer_preflight_v1",
+      "input_schema": "humanizer_preflight_v1",
+      "control_tags": [],
+      "outcomes": ["pass", "fail", "blocked"]
+    },
+    "paper-section": {
+      "script": "scripts/paper_section_validator.py",
+      "sha256": "19a46a2927d3992b3870fda1223a87cbdf024c0828567a526f89d7afd16004f9",
+      "adapter": "paper_section_v1",
+      "input_schema": "paper_section_v1",
+      "control_tags": [],
+      "outcomes": ["pass", "fail", "blocked"]
+    }
+  }
+}

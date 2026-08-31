@@ -1,0 +1,299 @@
+{
+  "schema_version": "paper-workflow-studio-projection-v1",
+  "projection_id": "official-v1.0",
+  "source_commit": "e24c34255e3c72a329614e07c431bfa51a778c40",
+  "source_files": {
+    "SKILL.md": "d9d95b736f6450421294954e871179c209f2a5ac015f2f057e147a5bd22b4240",
+    "references/stage-contracts.md": "e6780f2f00a81a695ba7b6c8b44d3ee3adced6eef7ea795cdf391113b19deff9",
+    "references/progress-schema.md": "44c868ca0160906e74a8e61ee413f27bd4b23e151b7d486bc25b5516d45a3c7f"
+  },
+  "official_contract_sections": {
+    "SKILL.md#body": "4387f4201b8b3e5ff38c49dc555f30397d164b60ce393cdb66b8d223f9cf9786",
+    "references/stage-contracts.md#body": "e6780f2f00a81a695ba7b6c8b44d3ee3adced6eef7ea795cdf391113b19deff9",
+    "references/progress-schema.md#body": "44c868ca0160906e74a8e61ee413f27bd4b23e151b7d486bc25b5516d45a3c7f"
+  },
+  "nodes": [
+    {
+      "id": "intake",
+      "display_name": "Intake",
+      "projection_kind": "orchestrator",
+      "official_stage_ids": ["intake"],
+      "suggested_skill_ids": [],
+      "suggested_validator_ids": [],
+      "inputs": ["user_request"],
+      "outputs": ["project_manifest", "progress"],
+      "write_scopes": ["project_manifest", "progress"],
+      "control_tags": []
+    },
+    {
+      "id": "directions",
+      "display_name": "Explore Directions",
+      "projection_kind": "task",
+      "official_stage_ids": ["directions"],
+      "suggested_skill_ids": ["clarify-research-idea"],
+      "suggested_validator_ids": [],
+      "inputs": ["project_manifest", "progress"],
+      "outputs": ["direction_candidates", "research_idea_brief"],
+      "write_scopes": ["direction_candidates", "research_idea_brief", "progress"],
+      "control_tags": []
+    },
+    {
+      "id": "literature",
+      "display_name": "Discover Literature",
+      "projection_kind": "task",
+      "official_stage_ids": ["literature"],
+      "suggested_skill_ids": ["research-hub"],
+      "suggested_validator_ids": [],
+      "inputs": ["direction_candidates", "research_idea_brief"],
+      "outputs": ["sources", "literature_matrix"],
+      "write_scopes": ["sources", "literature_matrix", "progress"],
+      "control_tags": ["citation"]
+    },
+    {
+      "id": "topic",
+      "display_name": "Select Topic",
+      "projection_kind": "task",
+      "official_stage_ids": ["topic"],
+      "suggested_skill_ids": ["gap-to-topic"],
+      "suggested_validator_ids": [],
+      "inputs": ["direction_candidates", "sources", "literature_matrix"],
+      "outputs": ["topic_verdict", "research_question_brief"],
+      "write_scopes": ["topic_verdict", "research_question_brief", "progress"],
+      "control_tags": ["citation"]
+    },
+    {
+      "id": "design",
+      "display_name": "Design Study",
+      "projection_kind": "task",
+      "official_stage_ids": ["design"],
+      "suggested_skill_ids": ["research-design-helper"],
+      "suggested_validator_ids": [],
+      "inputs": ["research_question_brief", "sources"],
+      "outputs": ["design_brief", "experiment_matrix"],
+      "write_scopes": ["design_brief", "experiment_matrix", "progress"],
+      "control_tags": []
+    },
+    {
+      "id": "draft-audit",
+      "display_name": "Audit Existing Draft",
+      "projection_kind": "task",
+      "official_stage_ids": ["draft_audit"],
+      "suggested_skill_ids": ["paper-memory-builder"],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "sources"],
+      "outputs": ["paper_claims", "paper_figures", "integrity_report"],
+      "write_scopes": ["paper_claims", "paper_figures", "integrity_report", "progress"],
+      "control_tags": ["integrity", "citation"]
+    },
+    {
+      "id": "venue-outline",
+      "display_name": "Freeze Venue and Outline",
+      "projection_kind": "task",
+      "official_stage_ids": ["venue_outline", "outline"],
+      "suggested_skill_ids": ["ml-paper-writing", "academic-paper"],
+      "suggested_validator_ids": [],
+      "inputs": ["research_question_brief", "design_brief", "claim_evidence_matrix"],
+      "outputs": ["outline", "figure_plan", "section_profile_receipt"],
+      "write_scopes": ["outline", "figure_plan", "section_profile_receipt", "progress"],
+      "control_tags": []
+    },
+    {
+      "id": "drafting",
+      "display_name": "Draft Manuscript",
+      "projection_kind": "task",
+      "official_stage_ids": ["drafting"],
+      "suggested_skill_ids": ["ml-paper-writing", "academic-paper"],
+      "suggested_validator_ids": [],
+      "inputs": ["outline", "figure_plan", "sources", "claim_evidence_matrix"],
+      "outputs": ["canonical_manuscript", "agent_reports"],
+      "write_scopes": ["canonical_manuscript", "agent_reports", "progress"],
+      "control_tags": ["citation"]
+    },
+    {
+      "id": "scientific-figures",
+      "display_name": "Produce Scientific Figures",
+      "projection_kind": "task",
+      "official_stage_ids": ["scientific_figures"],
+      "suggested_skill_ids": ["scientific-visualization"],
+      "suggested_validator_ids": [],
+      "inputs": ["figure_plan", "claim_evidence_matrix"],
+      "outputs": ["figure_outputs", "figure_receipt"],
+      "write_scopes": ["figure_outputs", "figure_receipt", "progress"],
+      "control_tags": ["figure"]
+    },
+    {
+      "id": "abstract-title-keywords",
+      "display_name": "Abstract, Title, and Keywords",
+      "projection_kind": "orchestrator",
+      "official_stage_ids": ["abstract_title_keywords"],
+      "suggested_skill_ids": [],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "figure_receipt"],
+      "outputs": ["abstract_candidates", "terminology_record"],
+      "write_scopes": ["abstract_candidates", "terminology_record", "progress"],
+      "control_tags": ["citation"]
+    },
+    {
+      "id": "integrity",
+      "display_name": "Integrity Audit",
+      "projection_kind": "gate",
+      "official_stage_ids": ["integrity"],
+      "suggested_skill_ids": [],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "sources", "figure_receipt", "claim_evidence_matrix"],
+      "outputs": ["integrity_report"],
+      "write_scopes": ["integrity_report", "progress"],
+      "control_tags": ["integrity", "citation", "figure"]
+    },
+    {
+      "id": "review",
+      "display_name": "Review Manuscript",
+      "projection_kind": "task",
+      "official_stage_ids": ["review"],
+      "suggested_skill_ids": ["academic-paper-reviewer"],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "integrity_report"],
+      "outputs": ["reviews", "revision_matrix"],
+      "write_scopes": ["reviews", "revision_matrix", "progress"],
+      "control_tags": ["integrity"]
+    },
+    {
+      "id": "revision",
+      "display_name": "Revise Manuscript",
+      "projection_kind": "task",
+      "official_stage_ids": ["revision"],
+      "suggested_skill_ids": ["ml-paper-writing", "academic-paper"],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "reviews", "revision_matrix"],
+      "outputs": ["canonical_manuscript", "response_letter"],
+      "write_scopes": ["canonical_manuscript", "response_letter", "progress"],
+      "control_tags": ["citation"]
+    },
+    {
+      "id": "final-editing",
+      "display_name": "Final Editing",
+      "projection_kind": "task",
+      "official_stage_ids": ["author_guided_final_editing"],
+      "suggested_skill_ids": ["academic-manuscript-final-editor"],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "integrity_report"],
+      "outputs": ["editorial_style_ledger", "editorial_scan", "final_edit_receipt"],
+      "write_scopes": ["canonical_manuscript", "editorial_style_ledger", "editorial_scan", "final_edit_receipt", "progress"],
+      "control_tags": ["final_edit"]
+    },
+    {
+      "id": "prose-naturalization",
+      "display_name": "Naturalize Prose",
+      "projection_kind": "task",
+      "official_stage_ids": ["prose_naturalization"],
+      "suggested_skill_ids": ["humanizer"],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "final_edit_receipt", "integrity_report"],
+      "outputs": ["canonical_manuscript", "protected_manifest", "claim_evidence_diff"],
+      "write_scopes": ["canonical_manuscript", "protected_manifest", "claim_evidence_diff", "progress"],
+      "control_tags": ["integrity"]
+    },
+    {
+      "id": "final-editorial-audit",
+      "display_name": "Final Editorial Audit",
+      "projection_kind": "gate",
+      "official_stage_ids": ["final_editorial_audit"],
+      "suggested_skill_ids": ["academic-manuscript-final-editor"],
+      "suggested_validator_ids": ["final-edit-receipt"],
+      "inputs": ["canonical_manuscript", "final_edit_receipt", "claim_evidence_diff"],
+      "outputs": ["final_edit_audit_receipt"],
+      "write_scopes": ["final_edit_audit_receipt", "progress"],
+      "control_tags": ["final_audit"]
+    },
+    {
+      "id": "experiments",
+      "display_name": "Run Bounded Experiments",
+      "projection_kind": "task",
+      "official_stage_ids": ["experiments"],
+      "suggested_skill_ids": ["autoresearch"],
+      "suggested_validator_ids": [],
+      "inputs": ["experiment_contract", "experiment_matrix", "design_brief"],
+      "outputs": ["experiment_logs", "experiment_results"],
+      "write_scopes": ["experiment_logs", "experiment_results", "progress"],
+      "control_tags": ["experiment_contract"]
+    },
+    {
+      "id": "finalize",
+      "display_name": "Finalize Delivery",
+      "projection_kind": "delivery",
+      "official_stage_ids": ["finalize"],
+      "suggested_skill_ids": [],
+      "suggested_validator_ids": [],
+      "inputs": ["canonical_manuscript", "integrity_report", "final_edit_audit_receipt"],
+      "outputs": ["final_delivery"],
+      "write_scopes": ["final_delivery", "progress"],
+      "control_tags": ["final_audit", "integrity"]
+    }
+  ],
+  "edges": [
+    {"id": "intake-to-directions", "source": "intake", "target": "directions", "projection_note": "Guided-idea route."},
+    {"id": "directions-to-literature", "source": "directions", "target": "literature", "projection_note": "Evidence discovery follows a selected direction."},
+    {"id": "literature-to-topic", "source": "literature", "target": "topic", "projection_note": "Topic gate evaluates the verified evidence set."},
+    {"id": "topic-to-design", "source": "topic", "target": "design", "projection_note": "A locked question precedes study design."},
+    {"id": "design-to-venue-outline", "source": "design", "target": "venue-outline", "projection_note": "The approved design informs the frozen paper architecture."},
+    {"id": "draft-audit-to-venue-outline", "source": "draft-audit", "target": "venue-outline", "projection_note": "Existing-draft audit may enter the writing route after read-only preparation."},
+    {"id": "venue-outline-to-drafting", "source": "venue-outline", "target": "drafting", "projection_note": "Drafting begins only after the architecture is frozen."},
+    {"id": "drafting-to-scientific-figures", "source": "drafting", "target": "scientific-figures", "projection_note": "Figure work uses frozen claim and plan inputs."},
+    {"id": "scientific-figures-to-abstract-title-keywords", "source": "scientific-figures", "target": "abstract-title-keywords", "projection_note": "Abstract, title, and keywords follow the accepted body and figure evidence."},
+    {"id": "abstract-title-keywords-to-integrity", "source": "abstract-title-keywords", "target": "integrity", "projection_note": "Audit follows the complete manuscript package."},
+    {"id": "integrity-to-review", "source": "integrity", "target": "review", "projection_note": "Review starts from an integrity-audited manuscript."},
+    {"id": "review-to-revision", "source": "review", "target": "revision", "projection_note": "The revision matrix is the revision input."},
+    {"id": "revision-to-final-editing", "source": "revision", "target": "final-editing", "projection_note": "Final editing follows accepted substantive revision and integrity evidence."},
+    {"id": "final-editing-to-prose-naturalization", "source": "final-editing", "target": "prose-naturalization", "projection_note": "Naturalization is optional and follows a protected final-edit candidate."},
+    {"id": "prose-naturalization-to-final-editorial-audit", "source": "prose-naturalization", "target": "final-editorial-audit", "projection_note": "The final audit is read-only and checks manuscript-voice fidelity."},
+    {"id": "final-editorial-audit-to-finalize", "source": "final-editorial-audit", "target": "finalize", "projection_note": "Delivery requires the accepted audit evidence."},
+    {"id": "design-to-experiments", "source": "design", "target": "experiments", "projection_note": "Explicit bounded experiments may start only from a complete approved contract."},
+    {"id": "experiments-to-venue-outline", "source": "experiments", "target": "venue-outline", "projection_note": "Verified experiment results can enter the paper architecture path."}
+  ],
+  "stage_map": {
+    "intake": "intake",
+    "directions": "directions",
+    "literature": "literature",
+    "topic": "topic",
+    "design": "design",
+    "draft_audit": "draft-audit",
+    "venue_outline": "venue-outline",
+    "outline": "venue-outline",
+    "drafting": "drafting",
+    "scientific_figures": "scientific-figures",
+    "abstract_title_keywords": "abstract-title-keywords",
+    "integrity": "integrity",
+    "review": "review",
+    "revision": "revision",
+    "author_guided_final_editing": "final-editing",
+    "prose_naturalization": "prose-naturalization",
+    "final_editorial_audit": "final-editorial-audit",
+    "experiments": "experiments",
+    "finalize": "finalize"
+  },
+  "control_tags": ["citation", "experiment_contract", "figure", "final_edit", "final_audit", "integrity"],
+  "projection_notes": [
+    {
+      "kind": "feedback_as_new_revision",
+      "official_from": "review",
+      "official_to": "design",
+      "studio_behavior": "Create a new semantic revision; do not create a cycle."
+    },
+    {
+      "kind": "failed_audit_as_new_revision",
+      "official_from": "integrity",
+      "official_to": "revision",
+      "studio_behavior": "Create a new semantic revision after remediation; do not create a cycle."
+    },
+    {
+      "kind": "experiment_rerun_as_new_revision",
+      "official_from": "experiments",
+      "official_to": "design",
+      "studio_behavior": "Create a new semantic revision after a user-confirmed bounded rerun; do not create a cycle."
+    },
+    {
+      "kind": "clone_skill_binding",
+      "studio_behavior": "When a projected task has multiple or unavailable suggestions, require the user to choose one currently installed Skill. Do not invent a binding for intake, abstract-title-keywords, integrity, or finalize."
+    }
+  ]
+}
