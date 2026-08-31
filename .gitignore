@@ -12,6 +12,7 @@ env/
 .paper/
 .codex/
 .trae/
+.worktrees/
 
 # Local experiment and editor files
 *.log
