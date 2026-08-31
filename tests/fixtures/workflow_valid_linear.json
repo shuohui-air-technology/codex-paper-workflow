@@ -1,0 +1,60 @@
+{
+  "schema_version": "paper-workflow-custom-v1",
+  "workflow_id": "linear-paper-flow",
+  "document_revision": 1,
+  "semantic_revision": 1,
+  "derived_from": null,
+  "max_parallelism": 1,
+  "external_inputs": ["user_request"],
+  "nodes": [
+    {
+      "id": "directions",
+      "type": "task",
+      "display_name": "Explore directions",
+      "entry": true,
+      "enabled": true,
+      "skill_ref": "clarify-research-idea",
+      "validator_ref": null,
+      "origin_projection_node_id": null,
+      "inputs": ["user_request"],
+      "outputs": ["research_idea_brief"],
+      "outcomes": ["succeeded"],
+      "write_scopes": ["research_idea_brief"],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active"
+    },
+    {
+      "id": "design",
+      "type": "task",
+      "display_name": "Design study",
+      "entry": false,
+      "enabled": true,
+      "skill_ref": "research-design-helper",
+      "validator_ref": null,
+      "origin_projection_node_id": null,
+      "inputs": ["research_idea_brief"],
+      "outputs": ["canonical_manuscript"],
+      "outcomes": ["succeeded"],
+      "write_scopes": ["canonical_manuscript"],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active"
+    }
+  ],
+  "edges": [
+    {
+      "id": "directions-to-design",
+      "source": "directions",
+      "target": "design",
+      "trigger": "succeeded",
+      "output_map": {"research_idea_brief": "research_idea_brief"}
+    }
+  ],
+  "ui": {
+    "positions": {
+      "directions": {"x": 120, "y": 80},
+      "design": {"x": 420, "y": 80}
+    }
+  }
+}

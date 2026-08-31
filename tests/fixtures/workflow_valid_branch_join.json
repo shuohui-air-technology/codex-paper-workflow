@@ -1,0 +1,122 @@
+{
+  "schema_version": "paper-workflow-custom-v1",
+  "workflow_id": "branch-and-join-paper-flow",
+  "document_revision": 1,
+  "semantic_revision": 1,
+  "derived_from": null,
+  "max_parallelism": 2,
+  "external_inputs": ["user_request"],
+  "nodes": [
+    {
+      "id": "condition",
+      "type": "condition",
+      "display_name": "Choose evidence route",
+      "entry": true,
+      "enabled": true,
+      "skill_ref": null,
+      "validator_ref": null,
+      "origin_projection_node_id": null,
+      "inputs": ["user_request"],
+      "outputs": [],
+      "outcomes": [],
+      "write_scopes": [],
+      "failure_policy": "block",
+      "condition_cases": [
+        {
+          "outcome": "has_sources",
+          "when": {"op": "artifact_state_is", "artifact": "sources", "value": "verified"}
+        }
+      ],
+      "join_mode": "all_active"
+    },
+    {
+      "id": "literature",
+      "type": "task",
+      "display_name": "Discover literature",
+      "entry": false,
+      "enabled": true,
+      "skill_ref": "research-hub",
+      "validator_ref": null,
+      "origin_projection_node_id": null,
+      "inputs": ["user_request"],
+      "outputs": ["sources"],
+      "outcomes": ["succeeded"],
+      "write_scopes": ["sources"],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active"
+    },
+    {
+      "id": "draft-audit",
+      "type": "task",
+      "display_name": "Audit existing draft",
+      "entry": false,
+      "enabled": true,
+      "skill_ref": "paper-memory-builder",
+      "validator_ref": null,
+      "origin_projection_node_id": null,
+      "inputs": ["user_request"],
+      "outputs": ["paper_claims"],
+      "outcomes": ["succeeded"],
+      "write_scopes": ["canonical_manuscript"],
+      "failure_policy": "skip_branch",
+      "condition_cases": [],
+      "join_mode": "all_active"
+    },
+    {
+      "id": "join",
+      "type": "join",
+      "display_name": "Join active evidence route",
+      "entry": false,
+      "enabled": true,
+      "skill_ref": null,
+      "validator_ref": null,
+      "origin_projection_node_id": null,
+      "inputs": [],
+      "outputs": ["evidence_bundle"],
+      "outcomes": [],
+      "write_scopes": [],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active"
+    }
+  ],
+  "edges": [
+    {
+      "id": "condition-to-literature",
+      "source": "condition",
+      "target": "literature",
+      "trigger": "has_sources",
+      "output_map": {}
+    },
+    {
+      "id": "condition-to-draft-audit",
+      "source": "condition",
+      "target": "draft-audit",
+      "trigger": "default",
+      "output_map": {}
+    },
+    {
+      "id": "literature-to-join",
+      "source": "literature",
+      "target": "join",
+      "trigger": "succeeded",
+      "output_map": {"sources": "evidence_bundle"}
+    },
+    {
+      "id": "draft-audit-to-join",
+      "source": "draft-audit",
+      "target": "join",
+      "trigger": "succeeded",
+      "output_map": {"paper_claims": "evidence_bundle"}
+    }
+  ],
+  "ui": {
+    "positions": {
+      "condition": {"x": 80, "y": 180},
+      "literature": {"x": 320, "y": 80},
+      "draft-audit": {"x": 320, "y": 280},
+      "join": {"x": 580, "y": 180}
+    }
+  }
+}
