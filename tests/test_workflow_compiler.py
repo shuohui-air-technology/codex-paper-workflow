@@ -408,6 +408,29 @@ class WorkflowCompilerTests(unittest.TestCase):
         result = self.compile(value)
         self.assertIn("artifact.input_unbound", self.issue_codes(result))
 
+    def test_compiled_plan_exposes_declared_external_inputs_deterministically(self):
+        """Catches runtime artifact gating losing or reordering external declarations."""
+        value = copy.deepcopy(self.value)
+        value["external_inputs"] = ["zeta_input", "user_request", "alpha_input"]
+        result = self.compile(value)
+        self.assertEqual(
+            result.plan.external_inputs,
+            ("alpha_input", "user_request", "zeta_input"),
+        )
+
+    def test_external_entry_can_feed_a_same_id_produced_artifact_downstream(self):
+        """Catches global external membership overriding one exact incoming producer."""
+        value = json.loads(
+            (ROOT / "tests/fixtures/workflow_valid_linear.json").read_text()
+        )
+        value["external_inputs"].append("research_idea_brief")
+        skills = {node["skill_ref"]: identity(node["skill_ref"]) for node in value["nodes"]}
+        result = compile_workflow(
+            parse_workflow(value), CatalogResult(skills, (), ()),
+            self.validators, self.projection,
+        )
+        self.assertIsNotNone(result.plan)
+
     def test_input_rejects_producers_from_two_incoming_edges(self):
         """Catches first-match selection hiding cross-edge artifact ambiguity."""
         value = copy.deepcopy(self.value)
@@ -444,9 +467,13 @@ class WorkflowCompilerTests(unittest.TestCase):
             {"id": "b-to-sink", "source": "source-b", "target": "sink",
              "trigger": "succeeded", "output_map": {}},
         ]
-        result = self.compile(value)
-        self.assertIsNone(result.plan)
-        self.assertIn("artifact.input_ambiguous", self.issue_codes(result))
+        for external_inputs in ([], ["shared"]):
+            with self.subTest(external_inputs=external_inputs):
+                changed = copy.deepcopy(value)
+                changed["external_inputs"] = external_inputs
+                result = self.compile(changed)
+                self.assertIsNone(result.plan)
+                self.assertIn("artifact.input_ambiguous", self.issue_codes(result))
 
     def test_input_rejects_implicit_and_explicit_aliases_on_one_edge(self):
         """Catches two source outputs colliding on one target input after mapping."""
@@ -659,8 +686,8 @@ class WorkflowCompilerTests(unittest.TestCase):
         self.assertNotIn("risk.control_removed.citation", {i.code for i in result.warnings})
         self.assertNotIn("risk.control_replaced.citation", {i.code for i in result.warnings})
 
-    def test_duplicate_projected_edge_is_material_rewiring(self):
-        """Catches duplicate same-endpoint edges masquerading as projected adjacency."""
+    def test_duplicate_projected_edge_is_artifact_producer_ambiguity(self):
+        """Catches duplicate same-endpoint edges supplying two runtime producers."""
         value, catalog = self.projected_literature_chain()
         value["edges"].append({
             "id": "directions-to-literature-again", "source": "directions",
@@ -669,8 +696,8 @@ class WorkflowCompilerTests(unittest.TestCase):
         result = compile_workflow(
             parse_workflow(value), catalog, self.validators, self.projection
         )
-        self.assertIsNotNone(result.plan)
-        self.assertIn("risk.control_replaced.citation", {i.code for i in result.warnings})
+        self.assertIsNone(result.plan)
+        self.assertIn("artifact.input_ambiguous", self.issue_codes(result))
 
     def test_projected_validator_fail_edge_replaces_control_coverage(self):
         """Catches delivery following a failed gate while retaining final-audit coverage."""

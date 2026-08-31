@@ -58,6 +58,7 @@ class CompiledPlan:
     semantic_revision: int
     document_sha256: str
     semantic_sha256: str
+    external_inputs: tuple[str, ...]
     nodes: Mapping[str, CompiledNode]
     edges: Mapping[str, CompiledEdge]
     incoming: Mapping[str, tuple[str, ...]]
@@ -488,8 +489,6 @@ def compile_workflow(
                 )
 
         for artifact in node.inputs:
-            if artifact in document.external_inputs:
-                continue
             producers: list[tuple[str, str]] = []
             for edge_id in incoming[node_id]:
                 edge = edge_by_id[edge_id]
@@ -497,7 +496,7 @@ def compile_workflow(
                 for output in source.outputs:
                     if edge.output_map.get(output, output) == artifact:
                         producers.append((edge_id, output))
-            if not producers:
+            if not producers and artifact not in document.external_inputs:
                 errors.append(
                     _issue(
                         "artifact.input_unbound",
@@ -505,7 +504,7 @@ def compile_workflow(
                         node_id=node_id,
                     )
                 )
-            elif len(producers) != 1:
+            elif len(producers) > 1:
                 errors.append(
                     _issue(
                         "artifact.input_ambiguous",
@@ -576,6 +575,7 @@ def compile_workflow(
         semantic_revision=document.semantic_revision,
         document_sha256=document_sha256(document),
         semantic_sha256=semantic_hash,
+        external_inputs=tuple(sorted(document.external_inputs)),
         nodes=MappingProxyType(compiled_nodes),
         edges=MappingProxyType(compiled_edges),
         incoming=MappingProxyType(incoming),
