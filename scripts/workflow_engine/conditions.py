@@ -12,6 +12,7 @@ from .schema import WorkflowError
 _NODE_STATUSES = frozenset(
     {"pending", "ready", "running", "succeeded", "failed", "blocked", "skipped", "stale"}
 )
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,25 @@ def _decision_value(value: object) -> object:
     if isinstance(value, float) and math.isfinite(value):
         return value
     _invalid("decision value must be a finite JSON scalar")
+
+
+def _json_scalar_equal(left: object, right: object) -> bool:
+    if left is _MISSING:
+        return False
+
+    def kind(value: object) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, (int, float)):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        return "invalid"
+
+    left_kind = kind(left)
+    return left_kind != "invalid" and left_kind == kind(right) and left == right
 
 
 def validate_predicate(
@@ -129,7 +149,9 @@ def evaluate_predicate(expression: object, facts: ConditionFacts) -> bool:
     if operation == "outcome_is":
         return facts.node_outcomes.get(expression["node"]) == expression["value"]
     if operation == "decision_is":
-        return facts.decisions.get(expression["name"]) == expression["value"]
+        return _json_scalar_equal(
+            facts.decisions.get(expression["name"], _MISSING), expression["value"]
+        )
     if operation == "artifact_state_is":
         return facts.artifact_states.get(expression["artifact"]) == expression["value"]
     if operation == "fact_is":

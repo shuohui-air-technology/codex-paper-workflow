@@ -49,27 +49,102 @@ def _shape_compatible(node: NodeSpec, projected: Mapping[str, object]) -> bool:
     )
 
 
+def _projected_node_type(projected: Mapping[str, object]) -> str | None:
+    kind = projected.get("projection_kind")
+    if kind == "gate":
+        return "validator"
+    if kind in {"task", "orchestrator", "delivery"}:
+        return "task"
+    return None
+
+
+def _safe_trigger(projected: Mapping[str, object]) -> str | None:
+    return "pass" if projected.get("projection_kind") == "gate" else (
+        "succeeded" if _projected_node_type(projected) == "task" else None
+    )
+
+
+def _mapping_semantics(
+    outputs: Sequence[object],
+    inputs: Sequence[object],
+    output_map: Mapping[str, str],
+) -> tuple[tuple[str, str], ...]:
+    target_inputs = {item for item in inputs if isinstance(item, str)}
+    transfers = []
+    for source_output in outputs:
+        if not isinstance(source_output, str):
+            continue
+        target_input = output_map.get(source_output, source_output)
+        if target_input in target_inputs:
+            transfers.append((source_output, target_input))
+    return tuple(sorted(transfers))
+
+
 def _adjacency_compatible(
     node: NodeSpec,
     origins: Mapping[str, NodeSpec],
     edges: Sequence[EdgeSpec],
-    projected_edges: frozenset[tuple[str, str]],
+    projected_nodes: Mapping[str, Mapping[str, object]],
+    projected_edges: Sequence[Mapping[str, object]],
 ) -> bool:
     actual = [edge for edge in edges if edge.source == node.id or edge.target == node.id]
     reverse_origins = {custom.id: origin for origin, custom in origins.items()}
-    actual_pairs: list[tuple[str, str]] = []
+    actual_signatures: list[tuple[object, ...]] = []
     for edge in actual:
         source_origin = reverse_origins.get(edge.source)
         target_origin = reverse_origins.get(edge.target)
-        if source_origin is None or target_origin is None:
+        projected_source = projected_nodes.get(source_origin or "")
+        projected_target = projected_nodes.get(target_origin or "")
+        source = origins.get(source_origin or "")
+        target = origins.get(target_origin or "")
+        if (
+            source_origin is None
+            or target_origin is None
+            or projected_source is None
+            or projected_target is None
+            or source is None
+            or target is None
+            or source.type != _projected_node_type(projected_source)
+            or target.type != _projected_node_type(projected_target)
+            or not _shape_compatible(source, projected_source)
+            or not _shape_compatible(target, projected_target)
+        ):
             return False
-        actual_pairs.append((source_origin, target_origin))
-    expected_pairs = [
-        pair
-        for pair in projected_edges
-        if node.origin_projection_node_id in pair
-    ]
-    return Counter(actual_pairs) == Counter(expected_pairs)
+        actual_signatures.append(
+            (
+                source_origin,
+                target_origin,
+                edge.trigger,
+                _mapping_semantics(source.outputs, target.inputs, edge.output_map),
+            )
+        )
+
+    expected_signatures: list[tuple[object, ...]] = []
+    for projected_edge in projected_edges:
+        source_origin = projected_edge.get("source")
+        target_origin = projected_edge.get("target")
+        if node.origin_projection_node_id not in {source_origin, target_origin}:
+            continue
+        projected_source = projected_nodes.get(str(source_origin))
+        projected_target = projected_nodes.get(str(target_origin))
+        if projected_source is None or projected_target is None:
+            return False
+        trigger = _safe_trigger(projected_source)
+        if trigger is None:
+            return False
+        expected_signatures.append(
+            (
+                source_origin,
+                target_origin,
+                trigger,
+                _mapping_semantics(
+                    projected_source.get("outputs", ()),
+                    projected_target.get("inputs", ()),
+                    {},
+                ),
+            )
+        )
+    return Counter(actual_signatures) == Counter(expected_signatures)
 
 
 def control_risk_warnings(
@@ -89,8 +164,8 @@ def control_risk_warnings(
         for item in projected_nodes_value
         if isinstance(item, Mapping) and isinstance(item.get("id"), str)
     }
-    projected_edges = frozenset(
-        (item["source"], item["target"])
+    projected_edges = tuple(
+        item
         for item in projected_edges_value or ()
         if isinstance(item, Mapping)
         and isinstance(item.get("source"), str)
@@ -113,7 +188,9 @@ def control_risk_warnings(
         if origin in projected_nodes
         and _binding_compatible(node, projected_nodes[origin])
         and _shape_compatible(node, projected_nodes[origin])
-        and _adjacency_compatible(node, origins, edges, projected_edges)
+        and _adjacency_compatible(
+            node, origins, edges, projected_nodes, projected_edges
+        )
     }
     warnings: list[WorkflowIssue] = []
     for tag in sorted(item for item in tags_value if isinstance(item, str)):

@@ -490,21 +490,26 @@ def compile_workflow(
         for artifact in node.inputs:
             if artifact in document.external_inputs:
                 continue
-            produced = False
+            producers: list[tuple[str, str]] = []
             for edge_id in incoming[node_id]:
                 edge = edge_by_id[edge_id]
                 source = enabled[edge.source]
                 for output in source.outputs:
                     if edge.output_map.get(output, output) == artifact:
-                        produced = True
-                        break
-                if produced:
-                    break
-            if not produced:
+                        producers.append((edge_id, output))
+            if not producers:
                 errors.append(
                     _issue(
                         "artifact.input_unbound",
                         f"node input has no incoming or external producer: {artifact}",
+                        node_id=node_id,
+                    )
+                )
+            elif len(producers) != 1:
+                errors.append(
+                    _issue(
+                        "artifact.input_ambiguous",
+                        f"node input has multiple incoming producers: {artifact}",
                         node_id=node_id,
                     )
                 )

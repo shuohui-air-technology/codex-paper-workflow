@@ -106,6 +106,70 @@ class WorkflowCompilerTests(unittest.TestCase):
         )
         return value, catalog
 
+    def projected_final_audit_chain(self):
+        value = copy.deepcopy(self.value)
+        self.derive_from_projection(value)
+        projected = {
+            node["id"]: node
+            for node in self.projection["nodes"]
+            if node["id"] in {
+                "prose-naturalization", "final-editorial-audit", "finalize"
+            }
+        }
+        value["external_inputs"] = sorted(
+            {artifact for node in projected.values() for artifact in node["inputs"]}
+        )
+        value["nodes"] = []
+        for node_id in (
+            "prose-naturalization", "final-editorial-audit", "finalize"
+        ):
+            is_validator = node_id == "final-editorial-audit"
+            outputs = list(projected[node_id]["outputs"])
+            value["nodes"].append({
+                "id": node_id,
+                "type": "validator" if is_validator else "task",
+                "display_name": node_id,
+                "entry": node_id == "prose-naturalization",
+                "enabled": True,
+                "skill_ref": None if is_validator else (
+                    "humanizer" if node_id == "prose-naturalization"
+                    else "paper-memory-builder"
+                ),
+                "validator_ref": "final-edit-receipt" if is_validator else None,
+                "origin_projection_node_id": node_id,
+                "inputs": list(projected[node_id]["inputs"]),
+                "outputs": outputs,
+                "outcomes": ["pass", "fail", "blocked"] if is_validator else ["succeeded"],
+                "write_scopes": outputs + [
+                    scope for scope in projected[node_id]["write_scopes"]
+                    if scope == "canonical_manuscript" and scope not in outputs
+                ],
+                "failure_policy": "block",
+                "condition_cases": [],
+                "join_mode": "all_active",
+            })
+        value["edges"] = [
+            {
+                "id": "prose-naturalization-to-final-editorial-audit",
+                "source": "prose-naturalization", "target": "final-editorial-audit",
+                "trigger": "succeeded", "output_map": {},
+            },
+            {
+                "id": "final-editorial-audit-to-finalize",
+                "source": "final-editorial-audit", "target": "finalize",
+                "trigger": "pass", "output_map": {},
+            },
+        ]
+        catalog = CatalogResult(
+            {
+                "humanizer": identity("humanizer"),
+                "paper-memory-builder": identity("paper-memory-builder"),
+            },
+            (),
+            (),
+        )
+        return value, catalog
+
     def test_cycle_is_activation_blocking(self):
         """Catches Kahn compilation returning a partial plan after a back edge is added."""
         value = copy.deepcopy(self.value)
@@ -186,6 +250,37 @@ class WorkflowCompilerTests(unittest.TestCase):
             },
         },)
         self.assertEqual(evaluate_condition(cases, facts), "revise")
+
+    def test_decision_equality_separates_json_booleans_from_numbers(self):
+        """Catches Python equality selecting boolean branches for numeric decisions and vice versa."""
+        for recorded, branch_value in (
+            (1, True),
+            (True, 1),
+            (0, False),
+            (False, 0),
+        ):
+            with self.subTest(recorded=recorded, branch_value=branch_value):
+                facts = ConditionFacts({}, {}, {"choice": recorded}, {}, {})
+                cases = ({
+                    "outcome": "matched",
+                    "when": {
+                        "op": "decision_is", "name": "choice", "value": branch_value,
+                    },
+                },)
+                self.assertEqual(evaluate_condition(cases, facts), "default")
+
+        null_case = ({
+            "outcome": "matched",
+            "when": {"op": "decision_is", "name": "choice", "value": None},
+        },)
+        self.assertEqual(
+            evaluate_condition(null_case, ConditionFacts({}, {}, {}, {}, {})),
+            "default",
+        )
+        self.assertEqual(
+            evaluate_condition(null_case, ConditionFacts({}, {}, {"choice": None}, {}, {})),
+            "matched",
+        )
 
     def test_condition_evaluator_rejects_unknown_keys_and_wrong_types(self):
         """Catches executable-looking or truthy malformed predicates escaping the AST boundary."""
@@ -312,6 +407,76 @@ class WorkflowCompilerTests(unittest.TestCase):
         next(node for node in value["nodes"] if node["id"] == "draft-audit")["inputs"] = ["sources"]
         result = self.compile(value)
         self.assertIn("artifact.input_unbound", self.issue_codes(result))
+
+    def test_input_rejects_producers_from_two_incoming_edges(self):
+        """Catches first-match selection hiding cross-edge artifact ambiguity."""
+        value = copy.deepcopy(self.value)
+        value["external_inputs"] = []
+        value["nodes"] = [
+            {
+                "id": "source-a", "type": "task", "display_name": "Source A",
+                "entry": True, "enabled": True, "skill_ref": "research-hub",
+                "validator_ref": None, "origin_projection_node_id": None,
+                "inputs": [], "outputs": ["shared"], "outcomes": ["succeeded"],
+                "write_scopes": [], "failure_policy": "block", "condition_cases": [],
+                "join_mode": "all_active",
+            },
+            {
+                "id": "source-b", "type": "task", "display_name": "Source B",
+                "entry": True, "enabled": True, "skill_ref": "paper-memory-builder",
+                "validator_ref": None, "origin_projection_node_id": None,
+                "inputs": [], "outputs": ["shared"], "outcomes": ["succeeded"],
+                "write_scopes": [], "failure_policy": "block", "condition_cases": [],
+                "join_mode": "all_active",
+            },
+            {
+                "id": "sink", "type": "task", "display_name": "Sink",
+                "entry": False, "enabled": True, "skill_ref": "research-hub",
+                "validator_ref": None, "origin_projection_node_id": None,
+                "inputs": ["shared"], "outputs": [], "outcomes": ["succeeded"],
+                "write_scopes": [], "failure_policy": "block", "condition_cases": [],
+                "join_mode": "all_active",
+            },
+        ]
+        value["edges"] = [
+            {"id": "a-to-sink", "source": "source-a", "target": "sink",
+             "trigger": "succeeded", "output_map": {}},
+            {"id": "b-to-sink", "source": "source-b", "target": "sink",
+             "trigger": "succeeded", "output_map": {}},
+        ]
+        result = self.compile(value)
+        self.assertIsNone(result.plan)
+        self.assertIn("artifact.input_ambiguous", self.issue_codes(result))
+
+    def test_input_rejects_implicit_and_explicit_aliases_on_one_edge(self):
+        """Catches two source outputs colliding on one target input after mapping."""
+        value = copy.deepcopy(self.value)
+        value["external_inputs"] = []
+        value["nodes"] = [
+            {
+                "id": "source", "type": "task", "display_name": "Source",
+                "entry": True, "enabled": True, "skill_ref": "research-hub",
+                "validator_ref": None, "origin_projection_node_id": None,
+                "inputs": [], "outputs": ["left", "right"], "outcomes": ["succeeded"],
+                "write_scopes": [], "failure_policy": "block", "condition_cases": [],
+                "join_mode": "all_active",
+            },
+            {
+                "id": "sink", "type": "task", "display_name": "Sink",
+                "entry": False, "enabled": True, "skill_ref": "paper-memory-builder",
+                "validator_ref": None, "origin_projection_node_id": None,
+                "inputs": ["right"], "outputs": [], "outcomes": ["succeeded"],
+                "write_scopes": [], "failure_policy": "block", "condition_cases": [],
+                "join_mode": "all_active",
+            },
+        ]
+        value["edges"] = [{
+            "id": "source-to-sink", "source": "source", "target": "sink",
+            "trigger": "succeeded", "output_map": {"left": "right"},
+        }]
+        result = self.compile(value)
+        self.assertIsNone(result.plan)
+        self.assertIn("artifact.input_ambiguous", self.issue_codes(result))
 
     def test_any_success_join_requires_declared_winner_output_maps(self):
         """Catches a race join whose winning branch cannot expose deterministic output."""
@@ -506,6 +671,44 @@ class WorkflowCompilerTests(unittest.TestCase):
         )
         self.assertIsNotNone(result.plan)
         self.assertIn("risk.control_replaced.citation", {i.code for i in result.warnings})
+
+    def test_projected_validator_fail_edge_replaces_control_coverage(self):
+        """Catches delivery following a failed gate while retaining final-audit coverage."""
+        value, catalog = self.projected_final_audit_chain()
+        safe = compile_workflow(
+            parse_workflow(value), catalog, self.validators, self.projection
+        )
+        self.assertIsNotNone(safe.plan)
+        self.assertNotIn(
+            "risk.control_replaced.final_audit", {i.code for i in safe.warnings}
+        )
+
+        next(
+            edge for edge in value["edges"]
+            if edge["id"] == "final-editorial-audit-to-finalize"
+        )["trigger"] = "fail"
+        unsafe = compile_workflow(
+            parse_workflow(value), catalog, self.validators, self.projection
+        )
+        self.assertIsNotNone(unsafe.plan)
+        self.assertIn(
+            "risk.control_replaced.final_audit", {i.code for i in unsafe.warnings}
+        )
+
+    def test_projected_edge_mapping_mismatch_replaces_control_coverage(self):
+        """Catches changed adjacent artifact routing retaining final-audit coverage."""
+        value, catalog = self.projected_final_audit_chain()
+        next(
+            edge for edge in value["edges"]
+            if edge["id"] == "prose-naturalization-to-final-editorial-audit"
+        )["output_map"] = {"protected_manifest": "final_edit_receipt"}
+        result = compile_workflow(
+            parse_workflow(value), catalog, self.validators, self.projection
+        )
+        self.assertIsNotNone(result.plan)
+        self.assertIn(
+            "risk.control_replaced.final_audit", {i.code for i in result.warnings}
+        )
 
     def test_missing_projected_adjacent_edges_replaces_control_coverage(self):
         """Catches isolated provenance suppressing risk after projected neighbors are removed."""
