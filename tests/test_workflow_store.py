@@ -4,6 +4,8 @@ import errno
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -26,6 +28,7 @@ from scripts.workflow_engine.fs import (
 )
 from scripts.workflow_engine.scheduler import (
     ArtifactRuntime,
+    ControlTransition,
     EdgeRuntime,
     EdgeStatus,
     NodeStatus,
@@ -34,6 +37,7 @@ from scripts.workflow_engine.scheduler import (
 )
 from scripts.workflow_engine.schema import document_sha256, parse_workflow
 from scripts.workflow_engine.store import (
+    Selection,
     StoreError,
     WorkflowEvent,
     WorkflowStore,
@@ -209,6 +213,64 @@ def artifact_condition_plan():
             {"choose": ("choose-fallback", "choose-use"), "fallback": (), "use-source": ()}
         ),
         topological_order=("choose", "fallback", "use-source"),
+        max_parallelism=1,
+    )
+
+
+def independent_condition_plan(large_outcome):
+    first = compiled_node(
+        "first-condition",
+        node_type="condition",
+        entry=True,
+        outcomes=("short",),
+    )
+    second = compiled_node(
+        "second-condition",
+        node_type="condition",
+        entry=True,
+        outcomes=(large_outcome,),
+    )
+    nodes = MappingProxyType(
+        {"first-condition": first, "second-condition": second}
+    )
+    return CompiledPlan(
+        workflow_id="control-preflight-flow",
+        semantic_revision=1,
+        document_sha256=sha256_bytes(b"control-preflight-document"),
+        semantic_sha256=sha256_bytes(b"control-preflight-plan"),
+        external_inputs=(),
+        nodes=nodes,
+        edges=MappingProxyType({}),
+        incoming=MappingProxyType(
+            {"first-condition": (), "second-condition": ()}
+        ),
+        outgoing=MappingProxyType(
+            {"first-condition": (), "second-condition": ()}
+        ),
+        topological_order=("first-condition", "second-condition"),
+        max_parallelism=1,
+    )
+
+
+def oversized_initial_event_plan(node_count=16_000):
+    nodes = {
+        f"n{index:05d}": compiled_node(
+            f"n{index:05d}", node_type="condition", entry=True, outcomes=("default",)
+        )
+        for index in range(node_count)
+    }
+    empty_adjacency = {node_id: () for node_id in nodes}
+    return CompiledPlan(
+        workflow_id="oversized-initial-event-flow",
+        semantic_revision=1,
+        document_sha256=sha256_bytes(b"oversized-initial-event-document"),
+        semantic_sha256=sha256_bytes(b"oversized-initial-event-plan"),
+        external_inputs=(),
+        nodes=MappingProxyType(nodes),
+        edges=MappingProxyType({}),
+        incoming=MappingProxyType(dict(empty_adjacency)),
+        outgoing=MappingProxyType(dict(empty_adjacency)),
+        topological_order=tuple(nodes),
         max_parallelism=1,
     )
 
@@ -1542,6 +1604,507 @@ class WorkflowStoreTests(unittest.TestCase):
                     transaction.commit_transition("too_deep", state, {"nested": nested})
             self.assertEqual(caught.exception.code, "events.invalid_event")
             self.assertEqual(store.paths.events.read_bytes(), before)
+
+    def test_named_lock_replacement_invalidates_old_lease_before_another_write(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = WorkflowStore(root)
+            store.start_run(task_plan(), "run-lock-name")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                events_before = store.paths.events.read_bytes()
+                state_before = store.paths.state.read_bytes()
+                displaced = store.paths.lock.with_name(".lock-displaced")
+                os.replace(store.paths.lock, displaced)
+                store.paths.lock.write_bytes(b"0")
+                repository = Path(__file__).resolve().parents[1]
+                environment = dict(os.environ)
+                environment["PYTHONPATH"] = os.pathsep.join(
+                    filter(
+                        None,
+                        (str(repository), environment.get("PYTHONPATH", "")),
+                    )
+                )
+                child = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib,sys; "
+                            "from scripts.workflow_engine.store import WorkflowStore; "
+                            "store=WorkflowStore(pathlib.Path(sys.argv[1])); "
+                            "context=store.locked_run(); transaction=context.__enter__(); "
+                            "transaction.load_active_run(); print('replacement-lock-acquired'); "
+                            "context.__exit__(None,None,None)"
+                        ),
+                        str(root),
+                    ],
+                    cwd=repository,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertIn("replacement-lock-acquired", child.stdout)
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("must-not-append", state)
+                self.assertEqual(caught.exception.code, "store.lock_invalidated")
+                self.assertEqual(store.paths.events.read_bytes(), events_before)
+                self.assertEqual(store.paths.state.read_bytes(), state_before)
+
+        with TemporaryDirectory() as temporary:
+            store = WorkflowStore(Path(temporary))
+            store.start_run(task_plan(), "run-post-append-lock")
+            original_append = workflow_store.append_event
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                events_before = store.paths.events.read_bytes()
+                state_before = store.paths.state.read_bytes()
+
+                def append_then_replace_lock(path, event):
+                    original_append(path, event)
+                    os.replace(
+                        store.paths.lock,
+                        store.paths.lock.with_name(".lock-after-append"),
+                    )
+                    store.paths.lock.write_bytes(b"0")
+
+                with mock.patch.object(
+                    workflow_store, "append_event", side_effect=append_then_replace_lock
+                ):
+                    with self.assertRaises(StoreError) as caught:
+                        transaction.commit_transition("durable-suffix-only", state)
+                self.assertEqual(caught.exception.code, "store.lock_invalidated")
+                self.assertNotEqual(store.paths.events.read_bytes(), events_before)
+                self.assertEqual(store.paths.state.read_bytes(), state_before)
+
+    def test_control_batch_preflights_every_event_before_first_append(self):
+        with TemporaryDirectory() as temporary:
+            store = WorkflowStore(Path(temporary))
+            large_outcome = "x" * workflow_fs.MAX_EVENT_BYTES
+            plan = independent_condition_plan(large_outcome)
+            store.start_run(plan, "run-whole-control-preflight")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                transitions = (
+                    ControlTransition(
+                        "first-condition",
+                        "condition_selected",
+                        "short",
+                        MappingProxyType({}),
+                    ),
+                    ControlTransition(
+                        "second-condition",
+                        "condition_selected",
+                        large_outcome,
+                        MappingProxyType({}),
+                    ),
+                )
+                intermediate = WorkflowTransaction._apply_control(
+                    plan, state, transitions[0]
+                )
+                final_state = WorkflowTransaction._apply_control(
+                    plan, intermediate, transitions[1]
+                )
+                events_before = store.paths.events.read_bytes()
+                state_before = store.paths.state.read_bytes()
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_control_transitions(transitions, final_state)
+                self.assertEqual(caught.exception.code, "events.input_too_large")
+                self.assertEqual(store.paths.events.read_bytes(), events_before)
+                self.assertEqual(store.paths.state.read_bytes(), state_before)
+
+    def test_start_run_preflights_oversized_initial_event_before_run_material(self):
+        with TemporaryDirectory() as temporary:
+            store = WorkflowStore(Path(temporary))
+            with self.assertRaises(StoreError) as caught:
+                store.start_run(oversized_initial_event_plan(), "run-too-large-to-start")
+            self.assertEqual(caught.exception.code, "events.input_too_large")
+            self.assertFalse(store.paths.run_dir.exists())
+            retried = store.start_run(task_plan(), "run-valid-retry")
+            self.assertEqual(retried.run_id, "run-valid-retry")
+
+    def test_event_type_is_validated_before_append(self):
+        with TemporaryDirectory() as temporary:
+            store = WorkflowStore(Path(temporary))
+            store.start_run(task_plan(), "run-event-type-codec")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                events_before = store.paths.events.read_bytes()
+                state_before = store.paths.state.read_bytes()
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("bad\nevent", state)
+                self.assertEqual(caught.exception.code, "events.invalid_event")
+                self.assertEqual(store.paths.events.read_bytes(), events_before)
+                self.assertEqual(store.paths.state.read_bytes(), state_before)
+            with WorkflowStore(Path(temporary)).locked_run() as transaction:
+                transaction.load_active_run()
+
+    def test_complete_event_envelope_limit_is_checked_before_append(self):
+        with TemporaryDirectory() as temporary:
+            store = WorkflowStore(Path(temporary))
+            store.start_run(task_plan(), "run-complete-event-bound")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                state_data = workflow_store._state_data(state)
+                base_payload = {
+                    "note": "",
+                    "state": state_data,
+                    "run_status": "active",
+                }
+                base_size = len(
+                    json.dumps(
+                        base_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                padding = "x" * (workflow_fs.MAX_EVENT_BYTES - base_size - 1)
+                complete_payload = dict(base_payload, note=padding)
+                event = WorkflowEvent.create(
+                    event_seq=2,
+                    run_id=state.run_id,
+                    semantic_sha256=plan.semantic_sha256,
+                    event_type="envelope_bound",
+                    payload=complete_payload,
+                    previous_event_hash=transaction.events()[-1].event_hash,
+                )
+                encoded_payload = json.dumps(
+                    complete_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                encoded_line = (
+                    json.dumps(
+                        event.to_payload(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                self.assertLessEqual(len(encoded_payload), workflow_fs.MAX_EVENT_BYTES)
+                self.assertGreater(len(encoded_line), workflow_fs.MAX_EVENT_BYTES)
+                events_before = store.paths.events.read_bytes()
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition(
+                        "envelope_bound", state, {"note": padding}
+                    )
+                self.assertEqual(caught.exception.code, "events.input_too_large")
+                self.assertEqual(store.paths.events.read_bytes(), events_before)
+
+    def test_claim_hash_codec_rejects_malformed_values_before_write_and_on_restart(self):
+        malformed_hashes = ("A" * 64, "a" * 63, "a" * 65, "g" * 64)
+        for malformed_hash in malformed_hashes:
+            with self.subTest(commit=malformed_hash[:8]), TemporaryDirectory() as temporary:
+                store = WorkflowStore(Path(temporary))
+                store.start_run(task_plan(), "run-claim-hash-commit")
+                with store.locked_run() as transaction:
+                    _, state = transaction.load_active_run()
+                    malformed = replace(
+                        state,
+                        nodes=MappingProxyType(
+                            {
+                                "produce": replace(
+                                    state.nodes["produce"],
+                                    status=NodeStatus.RUNNING,
+                                    attempt=1,
+                                    claim_token_hash=malformed_hash,
+                                )
+                            }
+                        ),
+                    )
+                    events_before = store.paths.events.read_bytes()
+                    with self.assertRaises(StoreError) as caught:
+                        transaction.commit_transition("node_claimed", malformed)
+                    self.assertEqual(caught.exception.code, "snapshot.invalid")
+                    self.assertEqual(store.paths.events.read_bytes(), events_before)
+
+        for malformed_hash in malformed_hashes:
+            with self.subTest(restart=malformed_hash[:8]), TemporaryDirectory() as temporary:
+                store = WorkflowStore(Path(temporary))
+                store.start_run(task_plan(), "run-claim-hash-restart")
+                first = json.loads(store.paths.events.read_text(encoding="utf-8"))
+                forged_state = copy.deepcopy(first["payload"]["state"])
+                forged_state["nodes"]["produce"].update(
+                    {
+                        "status": "running",
+                        "attempt": 1,
+                        "claim_token_hash": malformed_hash,
+                    }
+                )
+                forged = WorkflowEvent.create(
+                    event_seq=2,
+                    run_id=first["run_id"],
+                    semantic_sha256=first["semantic_sha256"],
+                    event_type="node_claimed",
+                    payload={"state": forged_state, "run_status": "active"},
+                    previous_event_hash=first["event_hash"],
+                )
+                with store.paths.events.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            forged.to_payload(),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+                events_before = store.paths.events.read_bytes()
+                state_before = store.paths.state.read_bytes()
+                recovered = WorkflowStore(Path(temporary)).recover()
+                self.assertEqual(
+                    (recovered.status, recovered.code),
+                    ("blocked", "events.unreplayable"),
+                )
+                self.assertEqual(store.paths.events.read_bytes(), events_before)
+                self.assertEqual(store.paths.state.read_bytes(), state_before)
+
+    def test_warning_code_codec_is_identical_for_activation_and_persisted_selection(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = WorkflowStore(root)
+            saved = store.save_draft(self.document, expected_document_revision=0)
+            plan = plan_for_document(saved)
+            valid_code = "risk.compiler.missing-integrity"
+            selected = store.activate_custom(
+                plan,
+                high_risk_warning_codes=(valid_code,),
+                acknowledged_warning_codes=(valid_code,),
+            )
+            self.assertEqual(
+                Selection.from_payload(selected.to_payload()).acknowledged_warning_codes,
+                (valid_code,),
+            )
+            invalid_code_sets = (
+                ["risk\ncode"],
+                ["risk\tcode"],
+                [" risk.code "],
+                ["x" * 257],
+                [f"risk.{index:03d}" for index in range(257)],
+            )
+            for codes in invalid_code_sets:
+                with self.subTest(codes=codes[:2]):
+                    payload = selected.to_payload()
+                    payload["acknowledged_warning_codes"] = codes
+                    with self.assertRaises(StoreError) as decoded:
+                        Selection.from_payload(payload)
+                    self.assertEqual(decoded.exception.code, "selection.invalid")
+                    journal_before = store.paths.audit_events.read_bytes()
+                    selection_before = store.paths.selection.read_bytes()
+                    with self.assertRaises(StoreError) as activated:
+                        store.activate_custom(
+                            plan,
+                            high_risk_warning_codes=tuple(codes),
+                            acknowledged_warning_codes=tuple(codes),
+                        )
+                    self.assertEqual(
+                        activated.exception.code,
+                        "activation.acknowledgement_mismatch",
+                    )
+                    self.assertEqual(store.paths.audit_events.read_bytes(), journal_before)
+                    self.assertEqual(store.paths.selection.read_bytes(), selection_before)
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = WorkflowStore(root)
+            saved = store.save_draft(self.document, expected_document_revision=0)
+            plan = plan_for_document(saved)
+            store.activate_custom(
+                plan,
+                high_risk_warning_codes=("risk.valid",),
+                acknowledged_warning_codes=("risk.valid",),
+            )
+            journal = json.loads(store.paths.audit_events.read_text(encoding="utf-8"))
+            journal["payload"]["selection"]["acknowledged_warning_codes"] = [
+                "risk\nforged"
+            ]
+            unsigned = dict(journal)
+            unsigned.pop("event_hash")
+            journal["event_hash"] = sha256_bytes(
+                json.dumps(
+                    unsigned,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            store.paths.audit_events.write_text(
+                json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            store.paths.selection.unlink()
+            evidence = store.paths.audit_events.read_bytes()
+            with self.assertRaises(StoreError) as caught:
+                WorkflowStore(root).read_selection()
+            self.assertEqual(caught.exception.code, "selection.journal_invalid")
+            self.assertEqual(store.paths.audit_events.read_bytes(), evidence)
+            self.assertFalse(store.paths.selection.exists())
+
+    def test_run_status_lifecycle_is_validated_for_full_chain_boundary_and_suffix(self):
+        with TemporaryDirectory() as temporary:
+            store = WorkflowStore(Path(temporary))
+            store.start_run(task_plan(), "run-illegal-resume")
+            first = json.loads(store.paths.events.read_text(encoding="utf-8"))
+            stopped = WorkflowEvent.create(
+                event_seq=2,
+                run_id=first["run_id"],
+                semantic_sha256=first["semantic_sha256"],
+                event_type="run_stopped",
+                payload={"state": first["payload"]["state"], "run_status": "stopped"},
+                previous_event_hash=first["event_hash"],
+            )
+            resumed = WorkflowEvent.create(
+                event_seq=3,
+                run_id=first["run_id"],
+                semantic_sha256=first["semantic_sha256"],
+                event_type="fact_recorded",
+                payload={"state": first["payload"]["state"], "run_status": "active"},
+                previous_event_hash=stopped.event_hash,
+            )
+            with store.paths.events.open("a", encoding="utf-8") as handle:
+                for event in (stopped, resumed):
+                    handle.write(
+                        json.dumps(
+                            event.to_payload(), sort_keys=True, separators=(",", ":")
+                        )
+                        + "\n"
+                    )
+            with store.paths.events.open("ab") as handle:
+                handle.write(b'{"event_seq":4,"partial"')
+            events_before = store.paths.events.read_bytes()
+            state_before = store.paths.state.read_bytes()
+            recovered = store.recover()
+            self.assertEqual(
+                (recovered.status, recovered.code),
+                ("blocked", "events.lifecycle_invalid"),
+            )
+            self.assertEqual(store.paths.events.read_bytes(), events_before)
+            self.assertEqual(store.paths.state.read_bytes(), state_before)
+            self.assertFalse(store.paths.recovery.exists())
+
+        with TemporaryDirectory() as temporary:
+            store = WorkflowStore(Path(temporary))
+            plan = task_plan()
+            store.start_run(plan, "run-illegal-boundary")
+            started = json.loads(store.paths.events.read_text(encoding="utf-8"))
+            started["payload"]["run_status"] = "archived"
+            unsigned = dict(started)
+            unsigned.pop("event_hash")
+            started["event_hash"] = sha256_bytes(
+                json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+            store.paths.events.write_text(
+                json.dumps(started, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+            snapshot["run_status"] = "archived"
+            snapshot["last_applied_event_hash"] = started["event_hash"]
+            store.paths.state.write_text(
+                json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            events_before = store.paths.events.read_bytes()
+            state_before = store.paths.state.read_bytes()
+            recovered = store.recover()
+            self.assertEqual(
+                (recovered.status, recovered.code),
+                ("blocked", "events.lifecycle_invalid"),
+            )
+            with self.assertRaises(StoreError) as caught:
+                store.start_run(plan, "run-must-not-replace-illegal-boundary")
+            self.assertEqual(caught.exception.code, "events.lifecycle_invalid")
+            self.assertEqual(store.paths.events.read_bytes(), events_before)
+            self.assertEqual(store.paths.state.read_bytes(), state_before)
+
+    def test_artifact_receipts_are_bound_to_compiled_producer_authority(self):
+        cases = {
+            "unknown_producer": ArtifactRuntime(
+                "draft", "artifact.txt", sha256_bytes(b"artifact"), "verified", "unknown", 1
+            ),
+            "external_swap": ArtifactRuntime(
+                "draft", "artifact.txt", sha256_bytes(b"artifact"), "verified", "external", 0
+            ),
+            "undeclared_output": ArtifactRuntime(
+                "ghost", "artifact.txt", sha256_bytes(b"artifact"), "verified", "produce", 1
+            ),
+            "impossible_attempt": ArtifactRuntime(
+                "draft", "artifact.txt", sha256_bytes(b"artifact"), "verified", "produce", 2
+            ),
+        }
+        for name, artifact in cases.items():
+            with self.subTest(name=name), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                root.joinpath("artifact.txt").write_bytes(b"artifact")
+                store = WorkflowStore(root)
+                store.start_run(task_plan(), "run-artifact-authority")
+                with store.locked_run() as transaction:
+                    _, state = transaction.load_active_run()
+                    nodes = MappingProxyType(
+                        {"produce": replace(state.nodes["produce"], attempt=1)}
+                    )
+                    invalid = replace(
+                        state,
+                        nodes=nodes,
+                        artifacts=MappingProxyType({artifact.artifact_id: artifact}),
+                    )
+                    events_before = store.paths.events.read_bytes()
+                    state_before = store.paths.state.read_bytes()
+                    with self.assertRaises(StoreError) as caught:
+                        transaction.commit_transition("artifact_forged", invalid)
+                    self.assertEqual(
+                        caught.exception.code, "artifact.authority_invalid"
+                    )
+                    self.assertEqual(store.paths.events.read_bytes(), events_before)
+                    self.assertEqual(store.paths.state.read_bytes(), state_before)
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("artifact.txt").write_bytes(b"artifact")
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, "run-artifact-authority-suffix")
+            first = json.loads(store.paths.events.read_text(encoding="utf-8"))
+            forged_state = copy.deepcopy(first["payload"]["state"])
+            forged_state["artifacts"]["draft"] = {
+                "artifact_id": "draft",
+                "path": "artifact.txt",
+                "sha256": sha256_bytes(b"artifact"),
+                "state": "verified",
+                "producer_node_id": "external",
+                "producer_attempt": 0,
+            }
+            forged = WorkflowEvent.create(
+                event_seq=2,
+                run_id=first["run_id"],
+                semantic_sha256=first["semantic_sha256"],
+                event_type="artifact_registered",
+                payload={"state": forged_state, "run_status": "active"},
+                previous_event_hash=first["event_hash"],
+            )
+            with store.paths.events.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        forged.to_payload(), sort_keys=True, separators=(",", ":")
+                    )
+                    + "\n"
+                )
+            events_before = store.paths.events.read_bytes()
+            state_before = store.paths.state.read_bytes()
+            recovered = store.recover()
+            self.assertEqual(
+                (recovered.status, recovered.code),
+                ("blocked", "artifact.authority_invalid"),
+            )
+            self.assertEqual(store.paths.events.read_bytes(), events_before)
+            self.assertEqual(store.paths.state.read_bytes(), state_before)
 
     def test_recovery_blocks_uncertain_running_work(self):
         with TemporaryDirectory() as temporary:
