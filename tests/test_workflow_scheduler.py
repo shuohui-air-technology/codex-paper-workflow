@@ -1,0 +1,492 @@
+import hashlib
+import json
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from types import MappingProxyType
+
+from scripts.workflow_engine.catalog import CatalogResult, SkillIdentity, ValidatorIdentity
+from scripts.workflow_engine.compiler import compile_workflow
+from scripts.workflow_engine.schema import WorkflowError, parse_workflow
+from scripts.workflow_engine.scheduler import (
+    ArtifactRuntime,
+    EdgeStatus,
+    NodeStatus,
+    claim_transition,
+    condition_facts,
+    initial_run,
+    mark_descendants_stale,
+    ready_node_ids,
+    refresh_ready,
+    result_transition,
+    retry_transition,
+    stabilize_control_nodes,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def task(node_id, *, entry=False, inputs=(), outputs=(), failure_policy="block"):
+    return {
+        "id": node_id,
+        "type": "task",
+        "display_name": node_id,
+        "entry": entry,
+        "enabled": True,
+        "skill_ref": f"skill-{node_id}",
+        "validator_ref": None,
+        "origin_projection_node_id": None,
+        "inputs": list(inputs),
+        "outputs": list(outputs),
+        "outcomes": ["succeeded"],
+        "write_scopes": [],
+        "failure_policy": failure_policy,
+        "condition_cases": [],
+        "join_mode": "all_active",
+    }
+
+
+def condition(node_id, *, entry=False, cases=()):
+    return {
+        "id": node_id,
+        "type": "condition",
+        "display_name": node_id,
+        "entry": entry,
+        "enabled": True,
+        "skill_ref": None,
+        "validator_ref": None,
+        "origin_projection_node_id": None,
+        "inputs": [],
+        "outputs": [],
+        "outcomes": [],
+        "write_scopes": [],
+        "failure_policy": "block",
+        "condition_cases": list(cases),
+        "join_mode": "all_active",
+    }
+
+
+def join(node_id, *, outputs=(), mode="all_active"):
+    return {
+        "id": node_id,
+        "type": "join",
+        "display_name": node_id,
+        "entry": False,
+        "enabled": True,
+        "skill_ref": None,
+        "validator_ref": None,
+        "origin_projection_node_id": None,
+        "inputs": [],
+        "outputs": list(outputs),
+        "outcomes": [],
+        "write_scopes": [],
+        "failure_policy": "block",
+        "condition_cases": [],
+        "join_mode": mode,
+    }
+
+
+def validator(node_id, *, entry=False):
+    return {
+        "id": node_id,
+        "type": "validator",
+        "display_name": node_id,
+        "entry": entry,
+        "enabled": True,
+        "skill_ref": None,
+        "validator_ref": "paper-section",
+        "origin_projection_node_id": None,
+        "inputs": [],
+        "outputs": [],
+        "outcomes": ["pass", "fail", "blocked"],
+        "write_scopes": [],
+        "failure_policy": "block",
+        "condition_cases": [],
+        "join_mode": "all_active",
+    }
+
+
+def edge(edge_id, source, target, *, trigger="succeeded", output_map=None):
+    return {
+        "id": edge_id,
+        "source": source,
+        "target": target,
+        "trigger": trigger,
+        "output_map": {} if output_map is None else dict(output_map),
+    }
+
+
+class WorkflowSchedulerTests(unittest.TestCase):
+    def compile(self, nodes, edges, *, external_inputs=(), max_parallelism=4):
+        value = {
+            "schema_version": "paper-workflow-custom-v1",
+            "workflow_id": "scheduler-test-flow",
+            "document_revision": 1,
+            "semantic_revision": 1,
+            "derived_from": None,
+            "max_parallelism": max_parallelism,
+            "external_inputs": list(external_inputs),
+            "nodes": nodes,
+            "edges": edges,
+            "ui": {"positions": {node["id"]: {"x": 0, "y": 0} for node in nodes}},
+        }
+        skills = {}
+        for node in nodes:
+            skill_id = node["skill_ref"]
+            if skill_id is not None:
+                skills[skill_id] = SkillIdentity(
+                    catalog_id=skill_id,
+                    root=ROOT / "test-skills",
+                    relative_path=skill_id,
+                    skill_sha256=hashlib.sha256((skill_id + "/SKILL.md").encode()).hexdigest(),
+                    tree_sha256="sha256:" + hashlib.sha256(skill_id.encode()).hexdigest(),
+                    locked=True,
+                )
+        validators = {
+            "paper-section": ValidatorIdentity(
+                validator_id="paper-section",
+                script=ROOT / "scripts/validate_paper_sections.py",
+                sha256="0" * 64,
+                adapter="paper_section_v1",
+                input_schema="paper_section_v1",
+                control_tags=(),
+                outcomes=("pass", "fail", "blocked"),
+            )
+        }
+        compiled = compile_workflow(
+            parse_workflow(value),
+            CatalogResult(skills, (), ()),
+            validators,
+            json.loads(
+                (ROOT / "references/workflows/official-v1.0-studio-projection.json").read_text()
+            ),
+        )
+        self.assertEqual(compiled.errors, ())
+        self.assertIsNotNone(compiled.plan)
+        return compiled.plan
+
+    def artifact(self, artifact_id, path=None, *, state="verified", node="external", attempt=0):
+        return ArtifactRuntime(
+            artifact_id=artifact_id,
+            path=path or f"{artifact_id}.md",
+            sha256=hashlib.sha256(artifact_id.encode()).hexdigest(),
+            state=state,
+            producer_node_id=node,
+            producer_attempt=attempt,
+        )
+
+    def register(self, state, *artifacts):
+        updated = dict(state.artifacts)
+        updated.update({artifact.artifact_id: artifact for artifact in artifacts})
+        return replace(state, artifacts=MappingProxyType(updated))
+
+    def complete(self, plan, state, node_id, *, outputs=None, artifacts=()):
+        claimed = claim_transition(plan, refresh_ready(plan, state), node_id, f"token-{node_id}")
+        return result_transition(
+            plan,
+            claimed,
+            {
+                "node_id": node_id,
+                "attempt": claimed.nodes[node_id].attempt,
+                "status": "succeeded",
+                "outcome": "succeeded",
+                "outputs": {} if outputs is None else outputs,
+                "artifacts": tuple(artifacts),
+            },
+        )
+
+    def test_external_inputs_stay_pending_until_verified_registration(self):
+        plan = self.compile(
+            [task("source", entry=True, inputs=("request",))], [],
+            external_inputs=("request",),
+        )
+        initial = initial_run(plan, "run-external")
+        self.assertEqual(initial.nodes["source"].status, NodeStatus.PENDING)
+        stale = self.register(initial, self.artifact("request", state="stale"))
+        self.assertEqual(refresh_ready(plan, stale).nodes["source"].status, NodeStatus.PENDING)
+        verified = self.register(initial, self.artifact("request"))
+        refreshed = refresh_ready(plan, verified)
+        self.assertEqual(refreshed.nodes["source"].status, NodeStatus.READY)
+        self.assertEqual(refreshed.nodes["source"].selected_inputs["request"], "request.md")
+
+    def test_incoming_producer_takes_node_local_authority_over_external_membership(self):
+        plan = self.compile(
+            [
+                task("source", entry=True, inputs=("draft",), outputs=("draft",)),
+                task("sink", inputs=("draft",)),
+            ],
+            [edge("source-to-sink", "source", "sink", output_map={"draft": "draft"})],
+            external_inputs=("draft",),
+        )
+        state = self.register(initial_run(plan, "run-lineage"), self.artifact("draft", "old.md"))
+        state = self.complete(plan, state, "source", outputs={"draft": "new.md"})
+        self.assertEqual(state.nodes["sink"].status, NodeStatus.READY)
+        self.assertEqual(state.nodes["sink"].selected_inputs["draft"], "new.md")
+
+    def test_condition_and_all_active_join_advance_in_topological_order(self):
+        plan = self.compile(
+            [
+                condition("choose", entry=True, cases=({"outcome": "left", "when": {"op": "fact_is", "name": "take_left", "value": True}},)),
+                task("left", outputs=("draft",)),
+                task("right", outputs=("draft",)),
+                join("merge", outputs=("draft",)),
+            ],
+            [
+                edge("choose-left", "choose", "left", trigger="left"),
+                edge("choose-right", "choose", "right", trigger="default"),
+                edge("left-merge", "left", "merge", output_map={"draft": "draft"}),
+                edge("right-merge", "right", "merge", output_map={"draft": "draft"}),
+            ],
+        )
+        state = initial_run(plan, "run-branch")
+        state = replace(state, project_booleans=MappingProxyType({"take_left": True}))
+        state, controls = stabilize_control_nodes(plan, refresh_ready(plan, state))
+        self.assertEqual(tuple(item.node_id for item in controls), ("choose",))
+        self.assertEqual(state.edges["choose-right"].status, EdgeStatus.INACTIVE)
+        self.assertEqual(state.nodes["right"].status, NodeStatus.SKIPPED)
+        state = self.complete(plan, state, "left", outputs={"draft": "left.md"})
+        state, controls = stabilize_control_nodes(plan, state)
+        self.assertEqual(tuple(item.node_id for item in controls), ("merge",))
+        self.assertEqual(state.nodes["merge"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(state.nodes["merge"].selected_inputs["draft"], "left.md")
+
+    def test_all_inactive_path_skips_recursively_instead_of_becoming_ready(self):
+        plan = self.compile(
+            [
+                condition("choose", entry=True, cases=({"outcome": "selected", "when": {"op": "fact_is", "name": "selected", "value": True}},)),
+                task("selected-terminal"),
+                task("excluded", outputs=("draft",)),
+                join("excluded-join", outputs=("draft",)),
+            ],
+            [
+                edge("choose-selected", "choose", "selected-terminal", trigger="selected"),
+                edge("choose-excluded", "choose", "excluded", trigger="default"),
+                edge("excluded-join-edge", "excluded", "excluded-join", output_map={"draft": "draft"}),
+            ],
+        )
+        state = initial_run(plan, "run-inactive")
+        state = replace(state, project_booleans=MappingProxyType({"selected": True}))
+        state, _ = stabilize_control_nodes(plan, state)
+        self.assertEqual(state.nodes["excluded"].status, NodeStatus.SKIPPED)
+        self.assertEqual(state.nodes["excluded-join"].status, NodeStatus.SKIPPED)
+        self.assertEqual(state.edges["excluded-join-edge"].status, EdgeStatus.INACTIVE)
+
+    def test_any_success_freezes_winner_and_records_late_auxiliary_output(self):
+        plan = self.compile(
+            [task("branch-a", entry=True, outputs=("draft",)), task("branch-b", entry=True, outputs=("draft",)), join("join", outputs=("draft",), mode="any_success")],
+            [edge("z-first-arrival", "branch-a", "join", output_map={"draft": "draft"}), edge("a-late-arrival", "branch-b", "join", output_map={"draft": "draft"})],
+            max_parallelism=2,
+        )
+        state = initial_run(plan, "run-any")
+        state = self.complete(plan, state, "branch-a", outputs={"draft": "a.md"})
+        self.assertEqual(state.nodes["join"].selected_inputs["draft"], "a.md")
+        state = self.complete(plan, state, "branch-b", outputs={"draft": "b.md"})
+        self.assertEqual(state.nodes["join"].selected_inputs["draft"], "a.md")
+        state, _ = stabilize_control_nodes(plan, state)
+        self.assertEqual(state.nodes["join"].selected_inputs["draft"], "a.md")
+        self.assertEqual(state.nodes["join"].auxiliary_outputs["draft"], ("b.md",))
+
+    def test_any_success_blocks_only_after_every_active_edge_is_terminal(self):
+        plan = self.compile(
+            [task("a", entry=True, outputs=("draft",)), task("b", entry=True, outputs=("draft",)), join("join", outputs=("draft",), mode="any_success")],
+            [edge("a-join", "a", "join", output_map={"draft": "draft"}), edge("b-join", "b", "join", output_map={"draft": "draft"})],
+            max_parallelism=2,
+        )
+        state = initial_run(plan, "run-any-fail")
+        first = claim_transition(plan, state, "a", "a-token")
+        first = result_transition(plan, first, {"node_id": "a", "attempt": 1, "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+        self.assertEqual(first.nodes["join"].status, NodeStatus.PENDING)
+        second = claim_transition(plan, first, "b", "b-token")
+        second = result_transition(plan, second, {"node_id": "b", "attempt": 1, "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+        self.assertEqual(second.nodes["join"].status, NodeStatus.BLOCKED)
+
+    def test_condition_facts_use_only_the_immutable_recorded_snapshot(self):
+        plan = self.compile([task("entry", entry=True)], [])
+        state = initial_run(plan, "run-facts")
+        state = replace(
+            self.register(state, self.artifact("sources")),
+            decisions=MappingProxyType({"route": "review"}),
+            project_booleans=MappingProxyType({"has_manifest": True}),
+        )
+        facts = condition_facts(state)
+        changed = self.register(state, self.artifact("sources", state="stale"))
+        self.assertEqual(facts.artifact_states["sources"], "verified")
+        self.assertEqual(condition_facts(changed).artifact_states["sources"], "stale")
+        self.assertEqual(facts.decisions["route"], "review")
+        self.assertIs(facts.project_booleans["has_manifest"], True)
+
+    def test_verified_artifact_fact_selects_condition_branch_without_filesystem_access(self):
+        plan = self.compile(
+            [
+                condition("has-sources", entry=True, cases=({"outcome": "verified", "when": {"op": "artifact_state_is", "artifact": "sources", "value": "verified"}},)),
+                task("use-sources"),
+                task("no-sources"),
+            ],
+            [
+                edge("has-sources-verified", "has-sources", "use-sources", trigger="verified"),
+                edge("has-sources-default", "has-sources", "no-sources", trigger="default"),
+            ],
+        )
+        state = self.register(initial_run(plan, "run-artifact-condition"), self.artifact("sources", path="does-not-need-to-exist.md"))
+        stabilized, transitions = stabilize_control_nodes(plan, state)
+        self.assertEqual(stabilized.nodes["has-sources"].outcome, "verified")
+        self.assertEqual(tuple(item.node_id for item in transitions), ("has-sources",))
+        self.assertEqual(stabilized.edges["has-sources-default"].status, EdgeStatus.INACTIVE)
+
+    def test_stabilization_orders_multiple_ready_controls_by_compiled_topology(self):
+        nodes = []
+        edges = []
+        for prefix in ("b", "a"):
+            nodes.extend([
+                condition(prefix, entry=True, cases=({"outcome": "yes", "when": {"op": "fact_is", "name": prefix, "value": True}},)),
+                task(f"{prefix}-yes"),
+                task(f"{prefix}-default"),
+            ])
+            edges.extend([
+                edge(f"{prefix}-yes-edge", prefix, f"{prefix}-yes", trigger="yes"),
+                edge(f"{prefix}-default-edge", prefix, f"{prefix}-default", trigger="default"),
+            ])
+        plan = self.compile(nodes, edges)
+        state = initial_run(plan, "run-controls")
+        state = replace(state, project_booleans=MappingProxyType({"a": True, "b": True}))
+        _, controls = stabilize_control_nodes(plan, state)
+        self.assertEqual(tuple(item.node_id for item in controls), ("a", "b"))
+
+    def test_claim_is_task_only_attempt_bound_hashed_and_parallel_capped(self):
+        plan = self.compile(
+            [task("a", entry=True), task("b", entry=True), validator("check", entry=True)],
+            [],
+            max_parallelism=1,
+        )
+        state = initial_run(plan, "run-claim")
+        self.assertEqual(ready_node_ids(plan, state), ("a", "b", "check"))
+        claimed = claim_transition(plan, state, "a", "secret-token")
+        self.assertEqual(claimed.nodes["a"].status, NodeStatus.RUNNING)
+        self.assertEqual(claimed.nodes["a"].attempt, 1)
+        self.assertEqual(claimed.nodes["a"].claim_token_hash, hashlib.sha256(b"secret-token").hexdigest())
+        with self.assertRaises(WorkflowError) as capped:
+            claim_transition(plan, claimed, "b", "other-token")
+        self.assertEqual(capped.exception.code, "runtime.parallelism_exceeded")
+        with self.assertRaises(WorkflowError) as wrong_type:
+            claim_transition(plan, state, "check", "validator-token")
+        self.assertEqual(wrong_type.exception.code, "runtime.node_type")
+
+    def test_result_verifies_attempt_outcome_outputs_and_records_artifacts(self):
+        plan = self.compile([task("produce", entry=True, outputs=("draft",))], [])
+        state = claim_transition(plan, initial_run(plan, "run-result"), "produce", "token")
+        artifact = self.artifact("draft", "draft.md", node="produce", attempt=1)
+        completed = result_transition(
+            plan,
+            state,
+            {"node_id": "produce", "attempt": 1, "status": "succeeded", "outcome": "succeeded", "outputs": {"draft": "draft.md"}, "artifacts": (artifact,)},
+        )
+        self.assertEqual(completed.nodes["produce"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(completed.artifacts["draft"], artifact)
+        with self.assertRaises(WorkflowError) as stale_attempt:
+            result_transition(plan, state, {"node_id": "produce", "attempt": 2, "status": "succeeded", "outcome": "succeeded", "outputs": {}, "artifacts": ()})
+        self.assertEqual(stale_attempt.exception.code, "runtime.stale_attempt")
+        with self.assertRaises(WorkflowError) as bad_outcome:
+            result_transition(plan, state, {"node_id": "produce", "attempt": 1, "status": "succeeded", "outcome": "invented", "outputs": {}, "artifacts": ()})
+        self.assertEqual(bad_outcome.exception.code, "runtime.invalid_outcome")
+
+    def test_result_fails_closed_for_invalid_state_status_and_output_contract(self):
+        plan = self.compile([task("produce", entry=True, outputs=("draft",))], [])
+        ready = initial_run(plan, "run-invalid-result")
+        with self.assertRaises(WorkflowError) as not_running:
+            result_transition(plan, ready, {"node_id": "produce", "attempt": 0, "status": "succeeded", "outcome": "succeeded", "outputs": {"draft": "draft.md"}, "artifacts": ()})
+        self.assertEqual(not_running.exception.code, "runtime.node_not_running")
+        running = claim_transition(plan, ready, "produce", "token")
+        with self.assertRaises(WorkflowError) as invalid_status:
+            result_transition(plan, running, {"node_id": "produce", "attempt": 1, "status": "skipped", "outcome": "succeeded", "outputs": {"draft": "draft.md"}, "artifacts": ()})
+        self.assertEqual(invalid_status.exception.code, "runtime.invalid_result_status")
+        with self.assertRaises(WorkflowError) as undeclared_output:
+            result_transition(plan, running, {"node_id": "produce", "attempt": 1, "status": "succeeded", "outcome": "succeeded", "outputs": {"other": "other.md"}, "artifacts": ()})
+        self.assertEqual(undeclared_output.exception.code, "runtime.invalid_outputs")
+
+    def test_result_rejects_wrong_artifact_receipts_and_copies_mutable_payloads(self):
+        plan = self.compile([task("produce", entry=True, outputs=("draft",))], [])
+        running = claim_transition(plan, initial_run(plan, "run-artifact-receipt"), "produce", "token")
+        wrong = self.artifact("draft", "draft.md", node="other", attempt=1)
+        with self.assertRaises(WorkflowError) as wrong_producer:
+            result_transition(plan, running, {"node_id": "produce", "attempt": 1, "status": "succeeded", "outcome": "succeeded", "outputs": {"draft": "draft.md"}, "artifacts": (wrong,)})
+        self.assertEqual(wrong_producer.exception.code, "runtime.invalid_artifact")
+        outputs = {"draft": "draft.md"}
+        artifact = self.artifact("draft", "draft.md", node="produce", attempt=1)
+        completed = result_transition(plan, running, {"node_id": "produce", "attempt": 1, "status": "succeeded", "outcome": "succeeded", "outputs": outputs, "artifacts": (artifact,)})
+        outputs["draft"] = "mutated.md"
+        self.assertEqual(completed.nodes["produce"].outputs["draft"], "draft.md")
+
+    def test_later_artifact_hash_mismatch_marks_artifact_and_consumers_stale(self):
+        plan = self.compile(
+            [task("source", entry=True, outputs=("draft",)), task("sink", inputs=("draft",))],
+            [edge("source-sink", "source", "sink", output_map={"draft": "draft"})],
+        )
+        state = initial_run(plan, "run-hash-mismatch")
+        state = self.complete(plan, state, "source", outputs={"draft": "draft.md"}, artifacts=(self.artifact("draft", "draft.md", node="source", attempt=1),))
+        state = self.complete(plan, state, "sink")
+        changed = replace(self.artifact("draft", "draft.md", node="source", attempt=1), sha256="f" * 64)
+        rerunning = replace(state, nodes=MappingProxyType({**state.nodes, "source": replace(state.nodes["source"], status=NodeStatus.RUNNING)}))
+        mismatched = result_transition(plan, rerunning, {"node_id": "source", "attempt": 1, "status": "succeeded", "outcome": "succeeded", "outputs": {"draft": "draft.md"}, "artifacts": (changed,)})
+        self.assertEqual(mismatched.artifacts["draft"].state, "stale")
+        self.assertEqual(mismatched.nodes["sink"].status, NodeStatus.STALE)
+
+    def test_block_failure_propagates_and_retry_rechecks_dependencies(self):
+        plan = self.compile(
+            [task("source", entry=True), task("sink")],
+            [edge("source-sink", "source", "sink")],
+        )
+        running = claim_transition(plan, initial_run(plan, "run-retry"), "source", "token")
+        failed = result_transition(plan, running, {"node_id": "source", "attempt": 1, "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+        self.assertEqual(failed.nodes["source"].status, NodeStatus.FAILED)
+        self.assertEqual(failed.edges["source-sink"].status, EdgeStatus.FAILED)
+        self.assertEqual(failed.nodes["sink"].status, NodeStatus.BLOCKED)
+        retried = retry_transition(plan, failed, "source")
+        self.assertEqual(retried.nodes["source"].status, NodeStatus.READY)
+        self.assertEqual(retried.nodes["source"].attempt, 1)
+        self.assertEqual(retried.nodes["sink"].status, NodeStatus.PENDING)
+
+        with self.assertRaises(WorkflowError) as invalid_retry:
+            retry_transition(plan, retried, "source")
+        self.assertEqual(invalid_retry.exception.code, "runtime.invalid_retry")
+
+    def test_skip_branch_failure_deactivates_and_recursively_skips(self):
+        plan = self.compile(
+            [task("source", entry=True, failure_policy="skip_branch"), task("sink")],
+            [edge("source-sink", "source", "sink")],
+        )
+        running = claim_transition(plan, initial_run(plan, "run-skip"), "source", "token")
+        skipped = result_transition(plan, running, {"node_id": "source", "attempt": 1, "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+        self.assertEqual(skipped.nodes["source"].status, NodeStatus.SKIPPED)
+        self.assertEqual(skipped.edges["source-sink"].status, EdgeStatus.INACTIVE)
+        self.assertEqual(skipped.nodes["sink"].status, NodeStatus.SKIPPED)
+
+    def test_mark_descendants_stale_uses_compiled_adjacency_without_mutating_old_state(self):
+        plan = self.compile(
+            [task("a", entry=True), task("b"), task("c")],
+            [edge("a-b", "a", "b"), edge("b-c", "b", "c")],
+        )
+        state = initial_run(plan, "run-stale")
+        state = self.complete(plan, state, "a")
+        state = self.complete(plan, state, "b")
+        state = self.complete(plan, state, "c")
+        stale = mark_descendants_stale(plan, state, ("a",))
+        self.assertEqual(state.nodes["b"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(stale.nodes["a"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(stale.nodes["b"].status, NodeStatus.STALE)
+        self.assertEqual(stale.nodes["c"].status, NodeStatus.STALE)
+
+    def test_runtime_snapshots_and_nested_maps_are_immutable(self):
+        plan = self.compile([task("entry", entry=True)], [])
+        initial = initial_run(plan, "run-immutable")
+        with self.assertRaises(TypeError):
+            initial.nodes["entry"] = replace(initial.nodes["entry"], status=NodeStatus.FAILED)
+        with self.assertRaises(TypeError):
+            initial.nodes["entry"].outputs["draft"] = "changed.md"
+        claimed = claim_transition(plan, initial, "entry", "token")
+        self.assertEqual(initial.nodes["entry"].status, NodeStatus.READY)
+        self.assertEqual(claimed.nodes["entry"].status, NodeStatus.RUNNING)
+
+
+if __name__ == "__main__":
+    unittest.main()
