@@ -477,16 +477,31 @@ def compile_workflow(
                     )
 
         if node.type == "join" and node.join_mode == "any_success":
-            if incoming[node_id] and any(
-                not edge_by_id[edge_id].output_map for edge_id in incoming[node_id]
-            ):
-                errors.append(
-                    _issue(
-                        "join.output_map_required",
-                        "any_success join requires an output map on every incoming edge",
-                        node_id=node_id,
+            for edge_id in incoming[node_id]:
+                output_map = edge_by_id[edge_id].output_map
+                if not output_map:
+                    errors.append(
+                        _issue(
+                            "join.output_map_required",
+                            "any_success join requires an output map on every incoming edge",
+                            node_id=node_id,
+                            edge_id=edge_id,
+                        )
                     )
-                )
+                    continue
+                target_counts = {
+                    output: tuple(output_map.values()).count(output)
+                    for output in node.outputs
+                }
+                if any(count != 1 for count in target_counts.values()):
+                    errors.append(
+                        _issue(
+                            "join.output_map_contract",
+                            "each any_success winner must map every join output exactly once",
+                            node_id=node_id,
+                            edge_id=edge_id,
+                        )
+                    )
 
         for artifact in node.inputs:
             producers: list[tuple[str, str]] = []

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -7,6 +8,7 @@ from types import MappingProxyType
 
 from scripts.workflow_engine.catalog import CatalogResult, SkillIdentity, ValidatorIdentity
 from scripts.workflow_engine.compiler import compile_workflow
+from scripts.workflow_engine.conditions import evaluate_predicate
 from scripts.workflow_engine.schema import WorkflowError, parse_workflow
 from scripts.workflow_engine.scheduler import (
     ArtifactRuntime,
@@ -118,7 +120,7 @@ def edge(edge_id, source, target, *, trigger="succeeded", output_map=None):
 
 
 class WorkflowSchedulerTests(unittest.TestCase):
-    def compile(self, nodes, edges, *, external_inputs=(), max_parallelism=4):
+    def compile_result(self, nodes, edges, *, external_inputs=(), max_parallelism=4):
         value = {
             "schema_version": "paper-workflow-custom-v1",
             "workflow_id": "scheduler-test-flow",
@@ -154,13 +156,21 @@ class WorkflowSchedulerTests(unittest.TestCase):
                 outcomes=("pass", "fail", "blocked"),
             )
         }
-        compiled = compile_workflow(
+        return compile_workflow(
             parse_workflow(value),
             CatalogResult(skills, (), ()),
             validators,
             json.loads(
                 (ROOT / "references/workflows/official-v1.0-studio-projection.json").read_text()
             ),
+        )
+
+    def compile(self, nodes, edges, *, external_inputs=(), max_parallelism=4):
+        compiled = self.compile_result(
+            nodes,
+            edges,
+            external_inputs=external_inputs,
+            max_parallelism=max_parallelism,
         )
         self.assertEqual(compiled.errors, ())
         self.assertIsNotNone(compiled.plan)
@@ -219,8 +229,21 @@ class WorkflowSchedulerTests(unittest.TestCase):
             [edge("source-to-sink", "source", "sink", output_map={"draft": "draft"})],
             external_inputs=("draft",),
         )
-        state = self.register(initial_run(plan, "run-lineage"), self.artifact("draft", "old.md"))
-        state = self.complete(plan, state, "source", outputs={"draft": "new.md"})
+        old = self.artifact("draft", "old.md")
+        refined = replace(
+            self.artifact("draft", "new.md", node="source", attempt=1),
+            sha256=hashlib.sha256(b"refined-draft").hexdigest(),
+        )
+        state = self.register(initial_run(plan, "run-lineage"), old)
+        state = self.complete(
+            plan,
+            state,
+            "source",
+            outputs={"draft": "new.md"},
+            artifacts=(refined,),
+        )
+        self.assertEqual(state.artifacts["draft"], refined)
+        self.assertEqual(condition_facts(state).artifact_states["draft"], "verified")
         self.assertEqual(state.nodes["sink"].status, NodeStatus.READY)
         self.assertEqual(state.nodes["sink"].selected_inputs["draft"], "new.md")
 
@@ -300,6 +323,27 @@ class WorkflowSchedulerTests(unittest.TestCase):
         second = claim_transition(plan, first, "b", "b-token")
         second = result_transition(plan, second, {"node_id": "b", "attempt": 1, "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
         self.assertEqual(second.nodes["join"].status, NodeStatus.BLOCKED)
+
+    def test_partial_any_success_winner_is_rejected_before_runtime(self):
+        compiled = self.compile_result(
+            [
+                task("partial", entry=True, outputs=("draft",)),
+                task("complete", entry=True, outputs=("draft", "notes")),
+                join("join", outputs=("draft", "notes"), mode="any_success"),
+            ],
+            [
+                edge("partial-join", "partial", "join", output_map={"draft": "draft"}),
+                edge(
+                    "complete-join",
+                    "complete",
+                    "join",
+                    output_map={"draft": "draft", "notes": "notes"},
+                ),
+            ],
+            max_parallelism=2,
+        )
+        self.assertIsNone(compiled.plan)
+        self.assertIn("join.output_map_contract", {issue.code for issue in compiled.errors})
 
     def test_condition_facts_use_only_the_immutable_recorded_snapshot(self):
         plan = self.compile([task("entry", entry=True)], [])
@@ -417,19 +461,44 @@ class WorkflowSchedulerTests(unittest.TestCase):
         outputs["draft"] = "mutated.md"
         self.assertEqual(completed.nodes["produce"].outputs["draft"], "draft.md")
 
-    def test_later_artifact_hash_mismatch_marks_artifact_and_consumers_stale(self):
-        plan = self.compile(
-            [task("source", entry=True, outputs=("draft",)), task("sink", inputs=("draft",))],
-            [edge("source-sink", "source", "sink", output_map={"draft": "draft"})],
+    def test_failed_result_rejects_falsey_values_with_wrong_types(self):
+        plan = self.compile([task("source", entry=True)], [])
+        running = claim_transition(plan, initial_run(plan, "run-invalid-failure"), "source", "token")
+        invalid_fields = (
+            {"outcome": None, "outputs": {}, "artifacts": ()},
+            {"outcome": "", "outputs": None, "artifacts": ()},
+            {"outcome": "", "outputs": [], "artifacts": ()},
+            {"outcome": "", "outputs": {}, "artifacts": None},
+            {"outcome": "", "outputs": {}, "artifacts": {}},
         )
-        state = initial_run(plan, "run-hash-mismatch")
-        state = self.complete(plan, state, "source", outputs={"draft": "draft.md"}, artifacts=(self.artifact("draft", "draft.md", node="source", attempt=1),))
-        state = self.complete(plan, state, "sink")
-        changed = replace(self.artifact("draft", "draft.md", node="source", attempt=1), sha256="f" * 64)
-        rerunning = replace(state, nodes=MappingProxyType({**state.nodes, "source": replace(state.nodes["source"], status=NodeStatus.RUNNING)}))
-        mismatched = result_transition(plan, rerunning, {"node_id": "source", "attempt": 1, "status": "succeeded", "outcome": "succeeded", "outputs": {"draft": "draft.md"}, "artifacts": (changed,)})
-        self.assertEqual(mismatched.artifacts["draft"].state, "stale")
-        self.assertEqual(mismatched.nodes["sink"].status, NodeStatus.STALE)
+        for fields in invalid_fields:
+            with self.subTest(fields=fields):
+                with self.assertRaises(WorkflowError) as invalid:
+                    result_transition(
+                        plan,
+                        running,
+                        {
+                            "node_id": "source",
+                            "attempt": 1,
+                            "status": "failed",
+                            **fields,
+                        },
+                    )
+                self.assertEqual(invalid.exception.code, "runtime.invalid_failure")
+        self.assertEqual(running.nodes["source"].status, NodeStatus.RUNNING)
+        accepted = result_transition(
+            plan,
+            running,
+            {
+                "node_id": "source",
+                "attempt": 1,
+                "status": "failed",
+                "outcome": "",
+                "outputs": {},
+                "artifacts": [],
+            },
+        )
+        self.assertEqual(accepted.nodes["source"].status, NodeStatus.FAILED)
 
     def test_block_failure_propagates_and_retry_rechecks_dependencies(self):
         plan = self.compile(
@@ -486,6 +555,37 @@ class WorkflowSchedulerTests(unittest.TestCase):
         claimed = claim_transition(plan, initial, "entry", "token")
         self.assertEqual(initial.nodes["entry"].status, NodeStatus.READY)
         self.assertEqual(claimed.nodes["entry"].status, NodeStatus.RUNNING)
+
+    def test_decisions_and_project_facts_are_validated_scalar_snapshots(self):
+        plan = self.compile([task("entry", entry=True)], [])
+        initial = initial_run(plan, "run-fact-values")
+        invalid_decisions = (
+            {"nested": {"owned": []}},
+            {"nested": ["owned"]},
+            {"not-finite": math.inf},
+            {"not-a-number": math.nan},
+        )
+        for decisions in invalid_decisions:
+            with self.subTest(decisions=decisions):
+                with self.assertRaises(WorkflowError) as invalid:
+                    replace(initial, decisions=decisions)
+                self.assertEqual(invalid.exception.code, "runtime.invalid_decision")
+        with self.assertRaises(WorkflowError) as invalid_fact:
+            replace(initial, project_booleans={"has_manifest": 1})
+        self.assertEqual(invalid_fact.exception.code, "runtime.invalid_project_fact")
+
+        decisions = {"boolean": True, "number": 1, "label": "review", "empty": None}
+        project_facts = {"has_manifest": True}
+        state = replace(initial, decisions=decisions, project_booleans=project_facts)
+        decisions["boolean"] = False
+        project_facts["has_manifest"] = False
+        facts = condition_facts(state)
+        self.assertIs(facts.decisions["boolean"], True)
+        self.assertEqual(type(facts.decisions["number"]), int)
+        self.assertIs(facts.project_booleans["has_manifest"], True)
+        self.assertTrue(evaluate_predicate({"op": "decision_is", "name": "boolean", "value": True}, facts))
+        self.assertFalse(evaluate_predicate({"op": "decision_is", "name": "boolean", "value": 1}, facts))
+        self.assertTrue(evaluate_predicate({"op": "decision_is", "name": "number", "value": 1}, facts))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -15,6 +16,9 @@ from .schema import WorkflowError
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MAX_FACT_ITEMS = 1_000
+_MAX_FACT_STRING = 4_000
+_MAX_DECISION_INTEGER = 2**63 - 1
 
 
 class NodeStatus(str, Enum):
@@ -45,6 +49,52 @@ def _aux_map(
     return MappingProxyType(
         {} if value is None else {key: tuple(items) for key, items in value.items()}
     )
+
+
+def _fact_name(value: object, code: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > _MAX_FACT_STRING
+        or any(ord(char) < 32 for char in value)
+    ):
+        _fail(code, "runtime fact name must be a bounded normalized string")
+    return value
+
+
+def _decision_map(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or len(value) > _MAX_FACT_ITEMS:
+        _fail("runtime.invalid_decision", "decisions must be a bounded mapping")
+    normalized: dict[str, object] = {}
+    for key, item in value.items():
+        name = _fact_name(key, "runtime.invalid_decision")
+        if item is None or isinstance(item, bool):
+            normalized[name] = item
+        elif isinstance(item, str) and len(item) <= _MAX_FACT_STRING:
+            normalized[name] = item
+        elif isinstance(item, int) and not isinstance(item, bool) and abs(item) <= _MAX_DECISION_INTEGER:
+            normalized[name] = item
+        elif isinstance(item, float) and math.isfinite(item):
+            normalized[name] = item
+        else:
+            _fail(
+                "runtime.invalid_decision",
+                "decision values must be bounded finite JSON scalars",
+            )
+    return MappingProxyType(normalized)
+
+
+def _project_boolean_map(value: object) -> Mapping[str, bool]:
+    if not isinstance(value, Mapping) or len(value) > _MAX_FACT_ITEMS:
+        _fail("runtime.invalid_project_fact", "project facts must be a bounded mapping")
+    normalized: dict[str, bool] = {}
+    for key, item in value.items():
+        name = _fact_name(key, "runtime.invalid_project_fact")
+        if type(item) is not bool:
+            _fail("runtime.invalid_project_fact", "project fact values must be booleans")
+        normalized[name] = item
+    return MappingProxyType(normalized)
 
 
 @dataclass(frozen=True)
@@ -99,10 +149,8 @@ class RunState:
         object.__setattr__(self, "nodes", MappingProxyType(dict(self.nodes)))
         object.__setattr__(self, "edges", MappingProxyType(dict(self.edges)))
         object.__setattr__(self, "artifacts", MappingProxyType(dict(self.artifacts)))
-        object.__setattr__(self, "decisions", MappingProxyType(dict(self.decisions)))
-        object.__setattr__(
-            self, "project_booleans", MappingProxyType(dict(self.project_booleans))
-        )
+        object.__setattr__(self, "decisions", _decision_map(self.decisions))
+        object.__setattr__(self, "project_booleans", _project_boolean_map(self.project_booleans))
 
 
 @dataclass(frozen=True)
@@ -558,16 +606,12 @@ def result_transition(
     if status not in {"succeeded", "failed"}:
         _fail("runtime.invalid_result_status", "result status must be succeeded or failed")
     outcome = result["outcome"]
-    if not isinstance(outcome, str):
-        _fail("runtime.invalid_outcome", "result outcome must be a string", node_id=node_id)
 
     nodes = dict(state.nodes)
     edges = dict(state.edges)
     artifacts = dict(state.artifacts)
-    mismatch_producers: set[str] = set()
-
     if status == "succeeded":
-        if outcome not in node.outcomes:
+        if not isinstance(outcome, str) or outcome not in node.outcomes:
             _fail("runtime.invalid_outcome", "result outcome is not declared", node_id=node_id)
         outputs = _validate_outputs(node, result["outputs"])
         receipts = _validate_artifacts(node, node_id, attempt, result["artifacts"])
@@ -586,15 +630,22 @@ def result_transition(
             selected = _edge_outputs(plan, edge, outputs) if edge_status is EdgeStatus.SATISFIED else _string_map()
             edges[edge_id] = EdgeRuntime(edge_status, selected)
         for artifact in receipts:
-            previous = artifacts.get(artifact.artifact_id)
-            if previous is not None and previous.sha256 != artifact.sha256:
-                artifacts[artifact.artifact_id] = replace(previous, state="stale")
-                mismatch_producers.add(previous.producer_node_id)
-            else:
-                artifacts[artifact.artifact_id] = artifact
+            artifacts[artifact.artifact_id] = artifact
     else:
-        if outcome or result["outputs"] or result["artifacts"]:
-            _fail("runtime.invalid_failure", "failed result cannot declare outcome or outputs")
+        failure_outputs = result["outputs"]
+        failure_artifacts = result["artifacts"]
+        if (
+            type(outcome) is not str
+            or outcome != ""
+            or not isinstance(failure_outputs, Mapping)
+            or bool(failure_outputs)
+            or not isinstance(failure_artifacts, (tuple, list))
+            or bool(failure_artifacts)
+        ):
+            _fail(
+                "runtime.invalid_failure",
+                "failed result requires an empty outcome, output map, and artifact sequence",
+            )
         if node.failure_policy == "skip_branch":
             nodes[node_id] = replace(runtime, status=NodeStatus.SKIPPED, outcome="")
             _set_outgoing_status(plan, edges, node_id, EdgeStatus.INACTIVE)
@@ -603,11 +654,7 @@ def result_transition(
             _set_outgoing_status(plan, edges, node_id, EdgeStatus.FAILED)
 
     _record_late_join_outputs(plan, nodes, edges)
-    updated = refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges, artifacts=artifacts))
-    known_mismatches = tuple(node for node in sorted(mismatch_producers) if node in plan.nodes)
-    if known_mismatches:
-        updated = mark_descendants_stale(plan, updated, known_mismatches)
-    return updated
+    return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges, artifacts=artifacts))
 
 
 def retry_transition(plan: CompiledPlan, state: RunState, node_id: str) -> RunState:

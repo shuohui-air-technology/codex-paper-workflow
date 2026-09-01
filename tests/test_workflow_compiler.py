@@ -515,6 +515,55 @@ class WorkflowCompilerTests(unittest.TestCase):
         result = self.compile(value)
         self.assertIn("join.output_map_required", self.issue_codes(result))
 
+    def test_any_success_each_winner_map_covers_every_join_output_exactly_once(self):
+        """Catches partial or ambiguous first-winner output contracts."""
+        value = copy.deepcopy(self.value)
+        join_node = next(node for node in value["nodes"] if node["id"] == "join")
+        join_node["join_mode"] = "any_success"
+        join_node["outputs"] = ["evidence_bundle", "supporting_bundle"]
+        literature = next(node for node in value["nodes"] if node["id"] == "literature")
+        audit = next(node for node in value["nodes"] if node["id"] == "draft-audit")
+        literature["outputs"] = ["sources", "literature_notes"]
+        audit["outputs"] = ["paper_claims", "audit_notes"]
+        literature_edge = next(
+            edge for edge in value["edges"] if edge["source"] == "literature"
+        )
+        audit_edge = next(
+            edge for edge in value["edges"] if edge["source"] == "draft-audit"
+        )
+        literature_edge["output_map"] = {
+            "sources": "evidence_bundle",
+            "literature_notes": "supporting_bundle",
+        }
+        audit_edge["output_map"] = {
+            "paper_claims": "evidence_bundle",
+            "audit_notes": "supporting_bundle",
+        }
+        self.assertIsNotNone(self.compile(value).plan)
+
+        incomplete = copy.deepcopy(value)
+        next(
+            edge for edge in incomplete["edges"] if edge["source"] == "literature"
+        )["output_map"] = {"sources": "evidence_bundle"}
+
+        ambiguous = copy.deepcopy(value)
+        next(
+            node for node in ambiguous["nodes"] if node["id"] == "literature"
+        )["outputs"].append("sources_copy")
+        next(
+            edge for edge in ambiguous["edges"] if edge["source"] == "literature"
+        )["output_map"] = {
+            "sources": "evidence_bundle",
+            "sources_copy": "evidence_bundle",
+            "literature_notes": "supporting_bundle",
+        }
+
+        for label, changed in (("incomplete", incomplete), ("ambiguous", ambiguous)):
+            with self.subTest(label=label):
+                result = self.compile(changed)
+                self.assertIsNone(result.plan)
+                self.assertIn("join.output_map_contract", self.issue_codes(result))
+
     def test_output_maps_must_use_declared_artifacts(self):
         """Catches misspelled producer outputs and target inputs entering the compiled plan."""
         bad_source = copy.deepcopy(self.value)
