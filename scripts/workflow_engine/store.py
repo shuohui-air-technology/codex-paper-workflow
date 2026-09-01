@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -24,6 +25,9 @@ from .catalog import SkillIdentity, ValidatorIdentity
 from .compiler import CompiledEdge, CompiledNode, CompiledPlan
 from .fs import (
     PathSafetyError,
+    MAX_EVENT_BYTES,
+    MAX_JSON_BYTES,
+    _fsync_directory,
     append_event,
     atomic_write_json,
     ensure_project_directory,
@@ -51,6 +55,10 @@ from .schema import (
 
 
 ZERO_HASH = "0" * 64
+_MAX_EVENT_LOG_BYTES = 16 * 1024 * 1024
+_MAX_REVISION = 2**31 - 1
+_LOCK_REGISTRY_GUARD = threading.Lock()
+_LOCK_REGISTRY: set[tuple[str, int, int]] = set()
 _EVENT_FIELDS = frozenset(
     {
         "event_seq",
@@ -80,6 +88,7 @@ _SNAPSHOT_FIELDS = frozenset(
         "run_status",
         "last_applied_event_seq",
         "last_applied_event_hash",
+        "plan_sha256",
         "state",
     }
 )
@@ -120,11 +129,21 @@ def _reject_constant(value: str) -> object:
 
 
 def _strict_json_loads(value: str | bytes) -> object:
-    return json.loads(
+    parsed = json.loads(
         value,
         object_pairs_hook=_reject_duplicate_pairs,
         parse_constant=_reject_constant,
     )
+    stack: list[tuple[object, int]] = [(parsed, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > 128:
+            raise ValueError("JSON nesting exceeds the supported depth")
+        if isinstance(item, Mapping):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+    return parsed
 
 
 def _json_value(value: object) -> object:
@@ -183,8 +202,19 @@ def _run_id(value: object, code: str) -> str:
     return item
 
 
-def _integer(value: object, code: str, *, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+def _integer(
+    value: object,
+    code: str,
+    *,
+    minimum: int = 0,
+    maximum: int = _MAX_REVISION,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
         raise StoreError(code, "persisted integer field is invalid")
     return value
 
@@ -238,10 +268,11 @@ class Selection:
         )
         acknowledged_at = _plain_string(item["acknowledged_at"], "selection.invalid", allow_empty=True)
         codes = item["acknowledged_warning_codes"]
+        normalized_codes = tuple(codes) if isinstance(codes, (list, tuple)) else ()
         if (
-            not isinstance(codes, list)
-            or not all(isinstance(code, str) and code for code in codes)
-            or codes != sorted(set(codes))
+            not isinstance(codes, (list, tuple))
+            or not all(isinstance(code, str) and code for code in normalized_codes)
+            or normalized_codes != tuple(sorted(set(normalized_codes)))
         ):
             raise StoreError("selection.invalid", "selection warning acknowledgement is invalid")
         if mode == "custom":
@@ -259,7 +290,7 @@ class Selection:
                 raise StoreError("selection.invalid", "selection acknowledgement time is invalid") from exc
             if not acknowledged_at.endswith("Z") or parsed_time.tzinfo is None:
                 raise StoreError("selection.invalid", "selection acknowledgement time is not UTC")
-        elif any((workflow_id, semantic_revision, semantic_sha256, codes, acknowledged_hash, acknowledged_at)):
+        elif any((workflow_id, semantic_revision, semantic_sha256, normalized_codes, acknowledged_hash, acknowledged_at)):
             raise StoreError("selection.invalid", "official selection must not retain a custom binding")
         return cls(
             mode,
@@ -267,7 +298,7 @@ class Selection:
             workflow_id,
             semantic_revision,
             semantic_sha256,
-            tuple(codes),
+            normalized_codes,
             acknowledged_hash,
             acknowledged_at,
         )
@@ -330,8 +361,8 @@ class WorkflowEvent:
         run_id = _run_id(item["run_id"], "events.invalid_event")
         semantic_sha256 = _lower_sha256(item["semantic_sha256"], "events.invalid_event")
         event_type = _plain_string(item["event_type"], "events.invalid_event")
-        previous = _plain_string(item["previous_event_hash"], "events.invalid_event")
-        event_hash = _plain_string(item["event_hash"], "events.invalid_event")
+        previous = _lower_sha256(item["previous_event_hash"], "events.invalid_event")
+        event_hash = _lower_sha256(item["event_hash"], "events.invalid_event")
         payload = item["payload"]
         if not isinstance(payload, Mapping):
             raise StoreError("events.invalid_event", "event payload must be an object")
@@ -398,7 +429,7 @@ def _document_data(document: WorkflowDocument) -> dict[str, object]:
                 "origin_projection_node_id": node.origin_projection_node_id,
                 "inputs": list(node.inputs),
                 "outputs": list(node.outputs),
-                "outcomes": list(node.outcomes),
+                "outcomes": [] if node.type in {"condition", "join"} else list(node.outcomes),
                 "write_scopes": list(node.write_scopes),
                 "failure_policy": node.failure_policy,
                 "condition_cases": _json_value(node.condition_cases),
@@ -490,9 +521,9 @@ def _plan_data(plan: CompiledPlan) -> dict[str, object]:
 
 
 def _string_list(value: object, code: str) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+    if not isinstance(value, (list, tuple)):
         raise StoreError(code, "persisted string list is invalid")
-    return tuple(value)
+    return tuple(_plain_string(item, code) for item in value)
 
 
 def _skill_from_data(value: object) -> SkillIdentity | None:
@@ -637,6 +668,22 @@ def _plan_from_data(value: object) -> CompiledPlan:
     return plan
 
 
+def _validated_plan_data(plan: CompiledPlan) -> tuple[dict[str, object], CompiledPlan, str]:
+    try:
+        raw = _plan_data(plan)
+        encoded = _canonical_bytes(raw)
+        if len(encoded) > MAX_JSON_BYTES:
+            raise StoreError("plan.invalid", "compiled plan exceeds the bounded material size")
+        restored = _plan_from_data(raw)
+    except (RecursionError, TypeError, ValueError, StoreError) as exc:
+        if isinstance(exc, StoreError):
+            raise
+        raise StoreError("plan.invalid", "compiled plan exceeds the supported nesting depth") from exc
+    if encoded != _canonical_bytes(_plan_data(restored)):
+        raise StoreError("plan.invalid", "compiled plan does not round-trip canonically")
+    return raw, restored, _sha256(raw)
+
+
 def _state_data(state: RunState) -> dict[str, object]:
     return {
         "run_id": state.run_id,
@@ -680,11 +727,14 @@ def _state_data(state: RunState) -> dict[str, object]:
 
 
 def _string_map(value: object, code: str) -> Mapping[str, str]:
-    if not isinstance(value, Mapping) or not all(
-        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
-    ):
+    if not isinstance(value, Mapping):
         raise StoreError(code, "persisted string mapping is invalid")
-    return MappingProxyType(dict(value))
+    return MappingProxyType(
+        {
+            _plain_string(key, code): _plain_string(item, code)
+            for key, item in value.items()
+        }
+    )
 
 
 def _state_from_data(value: object) -> RunState:
@@ -736,13 +786,14 @@ def _state_from_data(value: object) -> RunState:
     artifacts: dict[str, ArtifactRuntime] = {}
     for artifact_id, raw in raw_artifacts.items():
         artifact = _exact_mapping(raw, artifact_fields, "snapshot.invalid")
-        if artifact_id != artifact["artifact_id"]:
+        parsed_artifact_id = _plain_string(artifact_id, "snapshot.invalid")
+        if parsed_artifact_id != artifact["artifact_id"]:
             raise StoreError("snapshot.invalid", "runtime artifact identity is invalid")
         artifact_state = _plain_string(artifact["state"], "snapshot.invalid")
         if artifact_state not in {"verified", "stale"}:
             raise StoreError("snapshot.invalid", "runtime artifact state is invalid")
-        artifacts[str(artifact_id)] = ArtifactRuntime(
-            str(artifact["artifact_id"]),
+        artifacts[parsed_artifact_id] = ArtifactRuntime(
+            _plain_string(artifact["artifact_id"], "snapshot.invalid"),
             _plain_string(artifact["path"], "snapshot.invalid"),
             _lower_sha256(artifact["sha256"], "snapshot.invalid"),
             artifact_state,
@@ -764,8 +815,19 @@ def _state_from_data(value: object) -> RunState:
             MappingProxyType(dict(decisions)),
             MappingProxyType(dict(project_booleans)),
         )
-    except WorkflowError as exc:
+    except (TypeError, ValueError, WorkflowError) as exc:
         raise StoreError("snapshot.invalid", str(exc)) from exc
+
+
+def _validated_state_data(state: RunState) -> tuple[dict[str, object], RunState]:
+    raw = _state_data(state)
+    try:
+        restored = _state_from_data(raw)
+    except RecursionError as exc:
+        raise StoreError("snapshot.invalid", "runtime state exceeds the supported nesting depth") from exc
+    if _canonical_bytes(raw) != _canonical_bytes(_state_data(restored)):
+        raise StoreError("snapshot.invalid", "runtime state does not round-trip canonically")
+    return raw, restored
 
 
 def _snapshot_data(
@@ -774,17 +836,19 @@ def _snapshot_data(
     event_hash: str,
     *,
     run_status: str,
+    plan_sha256: str,
 ) -> dict[str, object]:
     return {
         "schema_version": "run-snapshot-v1",
         "run_status": run_status,
         "last_applied_event_seq": event_seq,
         "last_applied_event_hash": event_hash,
+        "plan_sha256": plan_sha256,
         "state": _state_data(state),
     }
 
 
-def _parse_snapshot(value: object) -> tuple[RunState, int, str, str]:
+def _parse_snapshot(value: object) -> tuple[RunState, int, str, str, str]:
     item = _exact_mapping(value, _SNAPSHOT_FIELDS, "snapshot.invalid")
     if item["schema_version"] != "run-snapshot-v1":
         raise StoreError("snapshot.invalid", "runtime snapshot version is invalid")
@@ -793,7 +857,10 @@ def _parse_snapshot(value: object) -> tuple[RunState, int, str, str]:
         raise StoreError("snapshot.invalid", "runtime snapshot status is invalid")
     sequence = _integer(item["last_applied_event_seq"], "snapshot.invalid", minimum=1)
     event_hash = _lower_sha256(item["last_applied_event_hash"], "snapshot.invalid")
-    return _state_from_data(item["state"]), sequence, event_hash, run_status
+    plan_sha256 = _lower_sha256(item["plan_sha256"], "snapshot.invalid")
+    state = _state_from_data(item["state"])
+    _validated_state_data(state)
+    return state, sequence, event_hash, run_status, plan_sha256
 
 
 class WorkflowStore:
@@ -808,6 +875,8 @@ class WorkflowStore:
         if not root.is_dir():
             raise StoreError("path.unsafe", "project root must be a directory")
         self.project_root = root
+        self._active_lease_token: object | None = None
+        self._active_lease_owner: tuple[int, int] | None = None
         base = root / ".research/custom-workflow"
         run_dir = base / "active-run"
         self.paths = StorePaths(
@@ -849,9 +918,19 @@ class WorkflowStore:
         self._ensure_directory(self.paths.base)
 
     @contextmanager
-    def _lock(self, *, timeout: float = 20.0) -> Iterator[None]:
+    def _lock(self, *, timeout: float = 20.0) -> Iterator[object]:
+        owner = (os.getpid(), threading.get_ident())
+        registry_key = (str(self.project_root), owner[0], owner[1])
+        with _LOCK_REGISTRY_GUARD:
+            if registry_key in _LOCK_REGISTRY:
+                raise StoreError("store.lock_reentrant", "workflow lock is already held by this thread")
         self._ensure_base()
         lock_path = self._checked(self.paths.lock)
+        lock_existed = lock_path.exists() or lock_path.is_symlink()
+        if lock_existed:
+            existing_lock = lock_path.lstat()
+            if not stat.S_ISREG(existing_lock.st_mode) or existing_lock.st_nlink != 1:
+                raise StoreError("path.unsafe", "project lock is not a single-name regular file")
         flags = os.O_RDWR | os.O_CREAT
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -860,11 +939,15 @@ class WorkflowStore:
             raise StoreError("path.unsafe", "could not open project lock safely") from exc
         handle = os.fdopen(descriptor, "r+b", closefd=True)
         lock_acquired = False
+        registered = False
         try:
             opened_lock = os.fstat(handle.fileno())
             named_lock = lock_path.lstat()
             if (
                 not stat.S_ISREG(named_lock.st_mode)
+                or not stat.S_ISREG(opened_lock.st_mode)
+                or named_lock.st_nlink != 1
+                or opened_lock.st_nlink != 1
                 or (opened_lock.st_dev, opened_lock.st_ino)
                 != (named_lock.st_dev, named_lock.st_ino)
             ):
@@ -873,6 +956,8 @@ class WorkflowStore:
                 handle.write(b"0")
                 handle.flush()
                 os.fsync(handle.fileno())
+            if not lock_existed:
+                _fsync_directory(lock_path.parent)
             started = time.monotonic()
             while True:
                 try:
@@ -893,10 +978,26 @@ class WorkflowStore:
                     time.sleep(0.05)
             self._checked(self.paths.lock)
             named_lock = lock_path.lstat()
-            if (opened_lock.st_dev, opened_lock.st_ino) != (named_lock.st_dev, named_lock.st_ino):
+            if (
+                named_lock.st_nlink != 1
+                or (opened_lock.st_dev, opened_lock.st_ino) != (named_lock.st_dev, named_lock.st_ino)
+            ):
                 raise StoreError("path.unsafe", "project lock path changed while acquiring")
-            yield
+            token = object()
+            with _LOCK_REGISTRY_GUARD:
+                if registry_key in _LOCK_REGISTRY:
+                    raise StoreError("store.lock_reentrant", "workflow lock lease was duplicated")
+                _LOCK_REGISTRY.add(registry_key)
+                registered = True
+            self._active_lease_token = token
+            self._active_lease_owner = owner
+            yield token
         finally:
+            self._active_lease_token = None
+            self._active_lease_owner = None
+            if registered:
+                with _LOCK_REGISTRY_GUARD:
+                    _LOCK_REGISTRY.discard(registry_key)
             try:
                 if lock_acquired:
                     handle.seek(0)
@@ -911,16 +1012,31 @@ class WorkflowStore:
             finally:
                 handle.close()
 
+    def _lease_is_valid(self, token: object, owner: tuple[int, int]) -> bool:
+        return (
+            token is self._active_lease_token
+            and owner == self._active_lease_owner
+            and owner == (os.getpid(), threading.get_ident())
+        )
+
+    def _transaction(self, lease: object) -> "WorkflowTransaction":
+        return WorkflowTransaction(self, _lease_token=lease)
+
     def _read_json(self, path: Path, code: str) -> object:
         checked = self._checked(path)
         try:
             value = checked.lstat()
-            if not stat.S_ISREG(value.st_mode):
+            if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
                 raise StoreError(code, f"persisted material is not a regular file: {path}")
-            return _strict_json_loads(checked.read_text(encoding="utf-8"))
+            if value.st_size > MAX_JSON_BYTES:
+                raise StoreError("store.input_too_large", f"persisted JSON exceeds size limit: {path}")
+            raw = checked.read_bytes()
+            if len(raw) > MAX_JSON_BYTES:
+                raise StoreError("store.input_too_large", f"persisted JSON exceeds size limit: {path}")
+            return _strict_json_loads(raw.decode("utf-8"))
         except StoreError:
             raise
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as exc:
             raise StoreError(code, f"persisted JSON is unreadable: {path}") from exc
 
     def _atomic_json(self, path: Path, value: object) -> None:
@@ -992,20 +1108,101 @@ class WorkflowStore:
     def _atomic_text(self, path: Path, value: str) -> None:
         self._atomic_bytes(path, value.encode("utf-8"))
 
+    @staticmethod
+    def _selection_identity(selection: Selection) -> bytes:
+        return _canonical_bytes(selection.to_payload())
+
+    def _journal_history_unlocked(self) -> tuple[Selection, ...] | None:
+        journal_exists = self.paths.audit_events.exists() or self.paths.audit_events.is_symlink()
+        if not journal_exists:
+            return None
+        events, _tail, _prefix = self._read_event_log(
+            self.paths.audit_events, allow_truncated=False
+        )
+        if not events:
+            raise StoreError("selection.journal_invalid", "activation journal is empty")
+        history: list[Selection] = []
+        for expected_revision, event in enumerate(events, start=1):
+            if set(event.payload) != {"selection"}:
+                raise StoreError("selection.journal_invalid", "activation journal payload is invalid")
+            try:
+                candidate = Selection.from_payload(event.payload["selection"])
+            except StoreError as exc:
+                raise StoreError("selection.journal_invalid", str(exc)) from exc
+            expected_type = (
+                "selection_activated" if candidate.mode == "custom" else "selection_deactivated"
+            )
+            expected_semantic = (
+                candidate.semantic_sha256
+                if candidate.mode == "custom"
+                else (history[-1].semantic_sha256 if history else ZERO_HASH)
+            )
+            if (
+                event.event_seq != expected_revision
+                or event.run_id != f"selection-{expected_revision}"
+                or candidate.selection_revision != expected_revision
+                or event.event_type != expected_type
+                or event.semantic_sha256 != (expected_semantic or ZERO_HASH)
+            ):
+                raise StoreError("selection.journal_invalid", "activation journal revision is discontinuous")
+            history.append(candidate)
+        return tuple(history)
+
     def _selection_unlocked(self) -> Selection:
         self._checked(self.paths.selection)
-        if not self.paths.selection.exists() and not self.paths.selection.is_symlink():
+        selection_exists = self.paths.selection.exists() or self.paths.selection.is_symlink()
+        journal_exists = self.paths.audit_events.exists() or self.paths.audit_events.is_symlink()
+        if not selection_exists and not journal_exists:
             return Selection("official")
-        try:
-            return Selection.from_payload(self._read_json(self.paths.selection, "selection.invalid"))
-        except StoreError as exc:
-            if exc.code == "path.unsafe":
-                raise
-            raise StoreError("selection.invalid", str(exc)) from exc
+        projected: Selection | None = None
+        if selection_exists:
+            try:
+                projected = Selection.from_payload(
+                    self._read_json(self.paths.selection, "selection.invalid")
+                )
+            except StoreError as exc:
+                if exc.code in {"path.unsafe", "store.input_too_large"}:
+                    raise
+                raise StoreError("selection.invalid", str(exc)) from exc
+        history = self._journal_history_unlocked()
+        if history is None:
+            raise StoreError(
+                "selection.journal_conflict",
+                "selection exists without its authoritative activation journal",
+            )
+        tip = history[-1]
+        if projected is not None and projected.selection_revision < tip.selection_revision:
+            boundary = (
+                Selection("official")
+                if projected.selection_revision == 0
+                else history[projected.selection_revision - 1]
+            )
+            if self._selection_identity(projected) != self._selection_identity(boundary):
+                raise StoreError(
+                    "selection.journal_conflict",
+                    "selection projection conflicts with its journal boundary",
+                )
+        if projected is None or projected.selection_revision < tip.selection_revision:
+            self._atomic_json(self.paths.selection, tip.to_payload())
+            return tip
+        if (
+            projected.selection_revision > tip.selection_revision
+            or self._selection_identity(projected) != self._selection_identity(tip)
+        ):
+            raise StoreError(
+                "selection.journal_conflict",
+                "selection projection conflicts with the activation journal tip",
+            )
+        return projected
 
     def read_selection(self) -> Selection:
         self._checked(self.paths.selection)
-        if not self.paths.selection.exists() and not self.paths.selection.is_symlink():
+        if (
+            not self.paths.selection.exists()
+            and not self.paths.selection.is_symlink()
+            and not self.paths.audit_events.exists()
+            and not self.paths.audit_events.is_symlink()
+        ):
             return Selection("official")
         with self._lock():
             return self._selection_unlocked()
@@ -1048,6 +1245,11 @@ class WorkflowStore:
         *,
         expected_document_revision: int,
     ) -> WorkflowDocument:
+        _integer(
+            expected_document_revision,
+            "store.invalid_revision",
+            maximum=_MAX_REVISION - 1,
+        )
         with self._lock():
             self._ensure_directory(self.paths.revisions)
             self._validate_revision_snapshots()
@@ -1060,7 +1262,9 @@ class WorkflowStore:
             current_revision = 0 if previous is None else previous.document_revision
             if expected_document_revision != current_revision:
                 raise StoreError("store.revision_conflict", "draft document revision is stale")
-            behavior_changed = previous is None or behavior_payload(previous) != behavior_payload(document)
+            behavior_changed = previous is None or _canonical_bytes(
+                behavior_payload(previous)
+            ) != _canonical_bytes(behavior_payload(document))
             semantic_revision = (
                 (0 if previous is None else previous.semantic_revision) + 1
                 if behavior_changed
@@ -1091,30 +1295,32 @@ class WorkflowStore:
             self._atomic_json(self.paths.workflow, _document_data(normalized))
             return normalized
 
-    def _active_snapshot_unlocked(self) -> tuple[RunState, int, str, str] | None:
+    def _active_snapshot_unlocked(self) -> tuple[RunState, int, str, str, str] | None:
         if not self.paths.state.exists() and not self.paths.state.is_symlink():
             return None
         return _parse_snapshot(self._read_json(self.paths.state, "snapshot.invalid"))
 
-    @staticmethod
-    def _terminal(state: RunState) -> bool:
-        terminal = {NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.BLOCKED, NodeStatus.SKIPPED, NodeStatus.STALE}
-        return bool(state.nodes) and all(runtime.status in terminal for runtime in state.nodes.values())
-
     def _reject_active_run(self) -> None:
-        if not self.paths.state.exists() and not self.paths.state.is_symlink():
+        if not self.paths.run_dir.exists() and not self.paths.run_dir.is_symlink():
             return
+        if not self.paths.state.exists() and not self.paths.state.is_symlink():
+            raise StoreError("run.recovery_required", "partial active-run material requires recovery")
         material = self._validated_run_material(
             allow_truncated=False,
             require_no_suffix=True,
         )
-        _plan, state, _seq, _hash, run_status, _events, _tail, _prefix = material
-        if run_status == "active" and not self._terminal(state):
+        _plan, _state, _seq, _hash, run_status, _events, _tail, _prefix = material
+        if run_status == "active":
             raise StoreError("run.already_active", "a custom workflow run is already active")
 
     def _audit_append(self, event_type: str, semantic_sha256: str, payload: Mapping[str, object]) -> WorkflowEvent:
         events, _tail, _prefix = self._read_event_log(self.paths.audit_events, allow_truncated=False)
         sequence = events[-1].event_seq + 1 if events else 1
+        if set(payload) != {"selection"}:
+            raise StoreError("selection.journal_invalid", "activation journal payload is invalid")
+        selected = Selection.from_payload(payload["selection"])
+        if selected.selection_revision != sequence:
+            raise StoreError("selection.journal_conflict", "selection revision does not follow journal tip")
         previous = events[-1].event_hash if events else ZERO_HASH
         event = WorkflowEvent.create(
             event_seq=sequence,
@@ -1138,15 +1344,59 @@ class WorkflowStore:
         high_risk_warning_codes: Sequence[str],
         acknowledged_warning_codes: Sequence[str],
     ) -> Selection:
-        required = tuple(sorted(set(high_risk_warning_codes)))
-        acknowledged = tuple(sorted(set(acknowledged_warning_codes)))
-        if required != acknowledged or len(acknowledged) != len(tuple(acknowledged_warning_codes)):
+        if isinstance(high_risk_warning_codes, (str, bytes)) or isinstance(
+            acknowledged_warning_codes, (str, bytes)
+        ):
+            raise StoreError(
+                "activation.acknowledgement_mismatch",
+                "warning codes must be explicit sequences",
+            )
+        try:
+            raw_required = tuple(
+                _plain_string(code, "activation.acknowledgement_mismatch")
+                for code in high_risk_warning_codes
+            )
+            raw_acknowledged = tuple(
+                _plain_string(code, "activation.acknowledgement_mismatch")
+                for code in acknowledged_warning_codes
+            )
+            required = tuple(sorted(set(raw_required)))
+            acknowledged = tuple(sorted(set(raw_acknowledged)))
+        except (TypeError, StoreError) as exc:
+            raise StoreError(
+                "activation.acknowledgement_mismatch",
+                "warning acknowledgement codes are invalid",
+            ) from exc
+        if required != acknowledged or len(acknowledged) != len(raw_acknowledged):
             raise StoreError(
                 "activation.acknowledgement_mismatch",
                 "activation requires the exact current high-risk warning-code set",
             )
         with self._lock():
             self._reject_active_run()
+            _raw_plan, plan, _plan_sha256 = _validated_plan_data(plan)
+            self._validate_revision_snapshots()
+            if not self.paths.workflow.exists() and not self.paths.workflow.is_symlink():
+                raise StoreError("activation.draft_mismatch", "activation requires a saved workflow draft")
+            try:
+                latest = parse_workflow(
+                    self._read_json(self.paths.workflow, "store.draft_invalid")
+                )
+            except WorkflowError as exc:
+                raise StoreError("store.draft_invalid", str(exc)) from exc
+            latest_hash = document_sha256(latest)
+            revision_path = self.paths.revisions / f"{latest.semantic_revision}-{latest_hash}.json"
+            if (
+                plan.workflow_id != latest.workflow_id
+                or plan.semantic_revision != latest.semantic_revision
+                or plan.document_sha256 != latest_hash
+                or not revision_path.exists()
+                or revision_path.is_symlink()
+            ):
+                raise StoreError(
+                    "activation.draft_mismatch",
+                    "compiled plan does not name the latest saved behavior revision",
+                )
             previous = self._selection_unlocked()
             selected = Selection(
                 "custom",
@@ -1163,7 +1413,7 @@ class WorkflowStore:
             return selected
 
     def deactivate_custom(self) -> Selection:
-        with self._lock():
+        with self._lock() as lease:
             previous = self._selection_unlocked()
             if self.paths.state.exists() or self.paths.state.is_symlink():
                 material = self._validated_run_material(
@@ -1172,7 +1422,7 @@ class WorkflowStore:
                 )
                 plan, state, sequence, event_hash, run_status, _events, _tail, _prefix = material
                 if run_status == "active":
-                    transaction = WorkflowTransaction(self)
+                    transaction = self._transaction(lease)
                     transaction._set_loaded(
                         plan,
                         state,
@@ -1211,43 +1461,75 @@ class WorkflowStore:
             os.replace(self.paths.run_dir, target)
         except OSError as exc:
             raise StoreError("run.archive_failed", "could not preserve the previous run") from exc
+        first_error: OSError | None = None
+        for parent in dict.fromkeys((self.paths.run_dir.parent, target.parent)):
+            try:
+                _fsync_directory(parent)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise StoreError("run.archive_failed", "could not sync preserved run parents") from first_error
 
     def start_run(self, plan: CompiledPlan, run_id: str) -> RunState:
         normalized_run_id = _run_id(run_id, "run.invalid_id")
+        raw_plan, plan, plan_sha256 = _validated_plan_data(plan)
         with self._lock():
+            run_material_exists = self.paths.run_dir.exists() or self.paths.run_dir.is_symlink()
+            if run_material_exists and not (
+                self.paths.state.exists() or self.paths.state.is_symlink()
+            ):
+                raise StoreError("run.recovery_required", "partial active-run material requires recovery")
             if self.paths.state.exists() or self.paths.state.is_symlink():
                 material = self._validated_run_material(
                     allow_truncated=False,
                     require_no_suffix=True,
                 )
                 _old_plan, old_state, _seq, _hash, run_status, _events, _tail, _prefix = material
-                if run_status == "active" and not self._terminal(old_state):
+                if run_status == "active":
                     raise StoreError("run.already_active", "a custom workflow run is already active")
                 self._archive_old_run(old_state)
             self._ensure_directory(self.paths.run_dir)
             state = initial_run(plan, normalized_run_id)
-            self._atomic_json(self.paths.plan, _plan_data(plan))
+            state_data, state = _validated_state_data(state)
+            self._atomic_json(self.paths.plan, raw_plan)
             event = WorkflowEvent.create(
                 event_seq=1,
                 run_id=normalized_run_id,
                 semantic_sha256=plan.semantic_sha256,
                 event_type="run_started",
-                payload={"state": _state_data(state), "run_status": "active"},
+                payload={
+                    "state": state_data,
+                    "run_status": "active",
+                    "plan_sha256": plan_sha256,
+                },
                 previous_event_hash=ZERO_HASH,
             )
             try:
                 append_event(self.paths.events, event)
             except PathSafetyError as exc:
                 raise StoreError("path.unsafe", str(exc)) from exc
-            self._atomic_json(self.paths.state, _snapshot_data(state, 1, event.event_hash, run_status="active"))
+            self._atomic_json(
+                self.paths.state,
+                _snapshot_data(
+                    state,
+                    1,
+                    event.event_hash,
+                    run_status="active",
+                    plan_sha256=plan_sha256,
+                ),
+            )
             self._write_projections(state, "active")
             return state
 
     @contextmanager
     def locked_run(self) -> Iterator["WorkflowTransaction"]:
-        with self._lock():
-            transaction = WorkflowTransaction(self)
-            yield transaction
+        with self._lock() as lease:
+            transaction = self._transaction(lease)
+            try:
+                yield transaction
+            finally:
+                transaction._deactivate()
 
     def _read_event_log(
         self, path: Path, *, allow_truncated: bool
@@ -1256,7 +1538,14 @@ class WorkflowStore:
             return [], None, b""
         checked = self._checked(path)
         try:
+            inspected = checked.lstat()
+            if not stat.S_ISREG(inspected.st_mode) or inspected.st_nlink != 1:
+                raise StoreError("path.unsafe", "event log is not a single-name regular file")
+            if inspected.st_size > _MAX_EVENT_LOG_BYTES:
+                raise StoreError("events.input_too_large", "event log exceeds the bounded input size")
             raw = checked.read_bytes()
+            if len(raw) > _MAX_EVENT_LOG_BYTES:
+                raise StoreError("events.input_too_large", "event log exceeds the bounded input size")
         except OSError as exc:
             raise StoreError("events.read_error", "could not read event log") from exc
         tail: bytes | None = None
@@ -1265,6 +1554,8 @@ class WorkflowStore:
             split = raw.rfind(b"\n")
             tail = raw[split + 1 :]
             prefix = raw[: split + 1]
+            if len(tail) > MAX_EVENT_BYTES:
+                raise StoreError("events.input_too_large", "event tail exceeds the bounded input size")
             if not allow_truncated:
                 raise StoreError("events.truncated_tail", "event log has an unframed final line")
         events: list[WorkflowEvent] = []
@@ -1272,11 +1563,13 @@ class WorkflowStore:
         expected = 1
         last_hash = ZERO_HASH
         for line in prefix.splitlines():
+            if len(line) + 1 > MAX_EVENT_BYTES:
+                raise StoreError("events.input_too_large", "event line exceeds the bounded input size")
             try:
                 value = _strict_json_loads(line.decode("utf-8"))
             except StoreError:
                 raise
-            except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as exc:
                 raise StoreError("events.invalid_json", "event log contains invalid terminated JSON") from exc
             if not isinstance(value, Mapping):
                 raise StoreError("events.invalid_event", "event line must be an object")
@@ -1295,13 +1588,13 @@ class WorkflowStore:
                         "event sequence has conflicting canonical content",
                     ) from exc
                 raise
-            prior = by_sequence.get(event.event_seq)
-            if prior is not None:
-                if event.to_payload() == prior.to_payload():
-                    continue
-                raise StoreError("events.duplicate_conflict", "event sequence has conflicting canonical content")
             if not event.hash_is_valid():
                 raise StoreError("events.hash_mismatch", "event content does not match its hash")
+            prior = by_sequence.get(event.event_seq)
+            if prior is not None:
+                if _canonical_bytes(event.to_payload()) == _canonical_bytes(prior.to_payload()):
+                    continue
+                raise StoreError("events.duplicate_conflict", "event sequence has conflicting canonical content")
             if event.previous_event_hash != last_hash:
                 raise StoreError("events.hash_mismatch", "event previous hash does not match the chain")
             events.append(event)
@@ -1318,11 +1611,23 @@ class WorkflowStore:
     ) -> tuple[CompiledPlan, RunState, int, str, str, list[WorkflowEvent], bytes | None, bytes]:
         if not self.paths.state.exists() and not self.paths.state.is_symlink():
             raise StoreError("run.not_found", "there is no active custom workflow run")
-        plan = _plan_from_data(self._read_json(self.paths.plan, "plan.invalid"))
-        state, sequence, event_hash, run_status = _parse_snapshot(
+        raw_plan = self._read_json(self.paths.plan, "plan.invalid")
+        plan = _plan_from_data(raw_plan)
+        if _canonical_bytes(raw_plan) != _canonical_bytes(_plan_data(plan)):
+            raise StoreError("plan.invalid", "persisted plan is not canonical codec output")
+        plan_sha256 = _sha256(raw_plan)
+        state, sequence, event_hash, run_status, snapshot_plan_sha256 = _parse_snapshot(
             self._read_json(self.paths.state, "snapshot.invalid")
         )
+        if snapshot_plan_sha256 != plan_sha256:
+            raise StoreError("plan.digest_mismatch", "compiled plan differs from snapshot binding")
         events, tail, prefix = self._read_event_log(self.paths.events, allow_truncated=allow_truncated)
+        if (
+            not events
+            or events[0].event_type != "run_started"
+            or events[0].payload.get("plan_sha256") != plan_sha256
+        ):
+            raise StoreError("plan.digest_mismatch", "compiled plan differs from first-event binding")
         for event in events:
             if event.run_id != state.run_id:
                 raise StoreError("events.run_mismatch", "event belongs to another run")
@@ -1356,6 +1661,40 @@ class WorkflowStore:
         if require_no_suffix and self._artifact_drift_ids(state):
             raise StoreError("recovery.required", "artifact bytes must be recovered before mutation")
         return plan, state, sequence, event_hash, run_status, events, tail, prefix
+
+    def _replay_candidate(
+        self,
+        plan: CompiledPlan,
+        event: WorkflowEvent,
+        expected_run_id: str | None,
+    ) -> tuple[RunState, str]:
+        raw_state = event.payload.get("state")
+        run_status = event.payload.get("run_status")
+        if not isinstance(raw_state, Mapping) or run_status not in {"active", "stopped", "archived"}:
+            raise StoreError("events.unreplayable", "event does not contain a replayable state")
+        try:
+            state = _state_from_data(raw_state)
+            encoded, state = _validated_state_data(state)
+        except StoreError as exc:
+            raise StoreError("events.unreplayable", str(exc)) from exc
+        if _canonical_bytes(encoded) != _canonical_bytes(raw_state):
+            raise StoreError("events.unreplayable", "event state is not canonical codec output")
+        if (
+            state.run_id != event.run_id
+            or (expected_run_id is not None and state.run_id != expected_run_id)
+            or state.workflow_id != plan.workflow_id
+            or state.semantic_sha256 != plan.semantic_sha256
+            or event.semantic_sha256 != plan.semantic_sha256
+            or set(state.nodes) != set(plan.nodes)
+            or set(state.edges) != set(plan.edges)
+        ):
+            raise StoreError("events.unreplayable", "event state does not match the compiled run")
+        for artifact in state.artifacts.values():
+            try:
+                resolve_project_path(self.project_root, artifact.path)
+            except PathSafetyError as exc:
+                raise StoreError("events.unreplayable", "event artifact path is unsafe") from exc
+        return state, str(run_status)
 
     def _write_projections(self, state: RunState, run_status: str) -> None:
         artifacts = {
@@ -1441,6 +1780,15 @@ class WorkflowStore:
                 f"verified artifact bytes do not match recorded hashes: {drifted[0]}",
             )
 
+    def _require_artifact_paths_contained(self, state: RunState) -> None:
+        for artifact in state.artifacts.values():
+            try:
+                resolve_project_path(self.project_root, artifact.path)
+            except PathSafetyError as exc:
+                raise StoreError(
+                    "path.unsafe", "runtime artifact path is not project-contained"
+                ) from exc
+
     @staticmethod
     def _predicate_mentions_artifact(value: object, artifact_id: str) -> bool:
         if isinstance(value, Mapping):
@@ -1457,9 +1805,18 @@ class WorkflowStore:
         producers: set[str] = set()
         for artifact_id in drifted:
             artifact = artifacts[artifact_id]
-            artifacts[artifact_id] = replace(artifact, state="stale")
             if artifact.producer_node_id in plan.nodes:
                 producers.add(artifact.producer_node_id)
+                producer_key = (artifact.producer_node_id, artifact.producer_attempt)
+                for sibling_id, sibling in tuple(artifacts.items()):
+                    if (sibling.producer_node_id, sibling.producer_attempt) == producer_key:
+                        artifacts[sibling_id] = replace(sibling, state="stale")
+            else:
+                artifacts[artifact_id] = replace(artifact, state="stale")
+        stale_artifact_ids = {
+            artifact_id for artifact_id, artifact in artifacts.items() if artifact.state == "stale"
+        }
+        for artifact_id in stale_artifact_ids:
             for node_id, node in plan.nodes.items():
                 if artifact_id in node.inputs or any(
                     self._predicate_mentions_artifact(case, artifact_id)
@@ -1468,6 +1825,10 @@ class WorkflowStore:
                     direct.add(node_id)
         updated = replace(state, artifacts=MappingProxyType(artifacts))
         if producers:
+            nodes = dict(updated.nodes)
+            for node_id in producers:
+                nodes[node_id] = replace(nodes[node_id], status=NodeStatus.STALE)
+            updated = replace(updated, nodes=MappingProxyType(nodes))
             updated = mark_descendants_stale(plan, updated, tuple(sorted(producers)))
         if direct:
             nodes = dict(updated.nodes)
@@ -1478,72 +1839,21 @@ class WorkflowStore:
         return updated
 
     def recover(self) -> RecoveryResult:
-        with self._lock():
+        with self._lock() as lease:
             archived: Path | None = None
             changed = False
             state_exists = self.paths.state.exists() or self.paths.state.is_symlink()
-            if not state_exists:
-                plan_exists = self.paths.plan.exists() or self.paths.plan.is_symlink()
-                events_exist = self.paths.events.exists() or self.paths.events.is_symlink()
-                if not plan_exists and not events_exist:
-                    return RecoveryResult("clean", "recovery.no_run")
-                if not plan_exists or not events_exist:
+            plan_exists = self.paths.plan.exists() or self.paths.plan.is_symlink()
+            events_exist = self.paths.events.exists() or self.paths.events.is_symlink()
+            run_dir_exists = self.paths.run_dir.exists() or self.paths.run_dir.is_symlink()
+            if not state_exists and not plan_exists and not events_exist:
+                if run_dir_exists:
                     return RecoveryResult("blocked", "recovery.incomplete_run")
-                try:
-                    plan = _plan_from_data(self._read_json(self.paths.plan, "plan.invalid"))
-                    events, tail, prefix = self._read_event_log(
-                        self.paths.events, allow_truncated=True
-                    )
-                except StoreError as exc:
-                    return RecoveryResult("blocked", exc.code)
-                if not events or events[0].event_type != "run_started":
-                    return RecoveryResult("blocked", "recovery.incomplete_run")
-                state: RunState | None = None
-                run_status = "active"
-                for event in events:
-                    raw_state = event.payload.get("state")
-                    next_status = event.payload.get("run_status")
-                    if (
-                        event.semantic_sha256 != plan.semantic_sha256
-                        or not isinstance(raw_state, Mapping)
-                        or next_status not in {"active", "stopped", "archived"}
-                    ):
-                        return RecoveryResult("blocked", "events.unreplayable")
-                    try:
-                        candidate = _state_from_data(raw_state)
-                    except StoreError:
-                        return RecoveryResult("blocked", "events.unreplayable")
-                    if (
-                        candidate.run_id != event.run_id
-                        or candidate.workflow_id != plan.workflow_id
-                        or candidate.semantic_sha256 != plan.semantic_sha256
-                        or set(candidate.nodes) != set(plan.nodes)
-                        or set(candidate.edges) != set(plan.edges)
-                    ):
-                        return RecoveryResult("blocked", "events.unreplayable")
-                    if state is not None and candidate.run_id != state.run_id:
-                        return RecoveryResult("blocked", "events.run_mismatch")
-                    state = candidate
-                    run_status = str(next_status)
-                assert state is not None
-                sequence = events[-1].event_seq
-                event_hash = events[-1].event_hash
-                if tail is not None:
-                    try:
-                        archived = self._archive_truncated_tail(tail, prefix)
-                    except StoreError as exc:
-                        return RecoveryResult("blocked", exc.code, state)
-                try:
-                    self._atomic_json(
-                        self.paths.state,
-                        _snapshot_data(state, sequence, event_hash, run_status=run_status),
-                    )
-                    self._write_projections(state, run_status)
-                except StoreError as exc:
-                    return RecoveryResult("blocked", exc.code, state, archived)
-                changed = True
-                tail = None
-            else:
+                return RecoveryResult("clean", "recovery.no_run")
+            if not plan_exists or not events_exist:
+                return RecoveryResult("blocked", "recovery.incomplete_run")
+
+            if state_exists:
                 try:
                     material = self._validated_run_material(
                         allow_truncated=True,
@@ -1552,48 +1862,80 @@ class WorkflowStore:
                 except StoreError as exc:
                     return RecoveryResult("blocked", exc.code)
                 plan, state, sequence, event_hash, run_status, events, tail, prefix = material
+                plan_sha256 = _sha256(_plan_data(plan))
+                expected_run_id: str | None = state.run_id
+                suffix = [event for event in events if event.event_seq > sequence]
+            else:
+                try:
+                    raw_plan = self._read_json(self.paths.plan, "plan.invalid")
+                    plan = _plan_from_data(raw_plan)
+                    if _canonical_bytes(raw_plan) != _canonical_bytes(_plan_data(plan)):
+                        raise StoreError("plan.invalid", "persisted plan is not canonical codec output")
+                    plan_sha256 = _sha256(raw_plan)
+                    events, tail, prefix = self._read_event_log(
+                        self.paths.events, allow_truncated=True
+                    )
+                except StoreError as exc:
+                    return RecoveryResult("blocked", exc.code)
+                if (
+                    not events
+                    or events[0].event_type != "run_started"
+                    or events[0].payload.get("plan_sha256") != plan_sha256
+                ):
+                    return RecoveryResult("blocked", "plan.digest_mismatch")
+                state = None
+                sequence = 0
+                event_hash = ZERO_HASH
+                run_status = "active"
+                expected_run_id = None
+                suffix = events
+
+            # Validate the entire replay suffix before any tail archive, log
+            # truncation, snapshot replacement, or projection regeneration.
+            try:
+                for event in suffix:
+                    candidate, next_status = self._replay_candidate(
+                        plan, event, expected_run_id
+                    )
+                    if expected_run_id is None:
+                        expected_run_id = candidate.run_id
+                    state = candidate
+                    sequence = event.event_seq
+                    event_hash = event.event_hash
+                    run_status = next_status
+            except StoreError as exc:
+                return RecoveryResult("blocked", exc.code, state)
+            if state is None:
+                return RecoveryResult("blocked", "recovery.incomplete_run")
+            replayed = bool(suffix)
+
             if tail is not None:
                 try:
                     archived = self._archive_truncated_tail(tail, prefix)
                 except StoreError as exc:
                     return RecoveryResult("blocked", exc.code, state)
                 changed = True
-            for event in events:
-                if event.event_seq <= sequence:
-                    continue
-                raw_state = event.payload.get("state")
-                next_status = event.payload.get("run_status")
-                if not isinstance(raw_state, Mapping) or next_status not in {"active", "stopped", "archived"}:
-                    return RecoveryResult("blocked", "events.unreplayable", state, archived)
-                try:
-                    candidate = _state_from_data(raw_state)
-                except StoreError:
-                    return RecoveryResult("blocked", "events.unreplayable", state, archived)
-                if (
-                    candidate.run_id != state.run_id
-                    or candidate.workflow_id != plan.workflow_id
-                    or candidate.semantic_sha256 != plan.semantic_sha256
-                ):
-                    return RecoveryResult("blocked", "events.unreplayable", state, archived)
-                state = candidate
-                sequence = event.event_seq
-                event_hash = event.event_hash
-                run_status = str(next_status)
-                changed = True
-            if changed:
+            if not state_exists or replayed:
                 try:
                     self._atomic_json(
                         self.paths.state,
-                        _snapshot_data(state, sequence, event_hash, run_status=run_status),
+                        _snapshot_data(
+                            state,
+                            sequence,
+                            event_hash,
+                            run_status=run_status,
+                            plan_sha256=plan_sha256,
+                        ),
                     )
                     self._write_projections(state, run_status)
                 except StoreError as exc:
                     return RecoveryResult("blocked", exc.code, state, archived)
+                changed = True
 
             drifted = list(self._artifact_drift_ids(state))
             if drifted:
                 stale = self._mark_drift(plan, state, drifted)
-                transaction = WorkflowTransaction(self)
+                transaction = self._transaction(lease)
                 transaction._set_loaded(plan, state, sequence, event_hash, run_status)
                 transaction._commit_event(
                     "artifacts_marked_stale",
@@ -1614,7 +1956,7 @@ class WorkflowStore:
                 for node_id in running:
                     nodes[node_id] = replace(nodes[node_id], status=NodeStatus.BLOCKED)
                 blocked = replace(state, nodes=MappingProxyType(nodes))
-                transaction = WorkflowTransaction(self)
+                transaction = self._transaction(lease)
                 transaction._set_loaded(plan, state, sequence, event_hash, run_status)
                 transaction._commit_event(
                     "recovery_running_blocked",
@@ -1642,14 +1984,39 @@ class WorkflowStore:
 class WorkflowTransaction:
     """One lock-scoped runtime transaction used by the Task 7 service layer."""
 
-    def __init__(self, store: WorkflowStore) -> None:
+    def __init__(self, store: WorkflowStore, *, _lease_token: object | None = None) -> None:
+        owner = (os.getpid(), threading.get_ident())
+        if _lease_token is None or not store._lease_is_valid(_lease_token, owner):
+            raise StoreError(
+                "store.transaction_invalid",
+                "transactions can only be created by an active locked_run() lease",
+            )
         self.store = store
+        self._lease_token = _lease_token
+        self._lease_owner = owner
+        self._lease_active = True
         self._plan: CompiledPlan | None = None
+        self._plan_sha256 = ""
         self._state: RunState | None = None
         self._event_seq = 0
         self._event_hash = ZERO_HASH
         self._run_status = "active"
         self._events: list[WorkflowEvent] = []
+
+    def _deactivate(self) -> None:
+        self._lease_active = False
+
+    def _require_lease(self) -> None:
+        current = (os.getpid(), threading.get_ident())
+        if current != self._lease_owner:
+            raise StoreError(
+                "store.transaction_wrong_owner",
+                "transaction used outside its owning process or thread",
+            )
+        if not self._lease_active or not self.store._lease_is_valid(
+            self._lease_token, self._lease_owner
+        ):
+            raise StoreError("store.transaction_inactive", "transaction lease is no longer active")
 
     def _set_loaded(
         self,
@@ -1660,7 +2027,9 @@ class WorkflowTransaction:
         run_status: str,
         events: Sequence[WorkflowEvent] = (),
     ) -> None:
+        self._require_lease()
         self._plan = plan
+        self._plan_sha256 = _sha256(_plan_data(plan))
         self._state = state
         self._event_seq = sequence
         self._event_hash = event_hash
@@ -1668,6 +2037,7 @@ class WorkflowTransaction:
         self._events = list(events)
 
     def load_active_run(self) -> tuple[CompiledPlan, RunState]:
+        self._require_lease()
         material = self.store._validated_run_material(
             allow_truncated=False,
             require_no_suffix=True,
@@ -1687,6 +2057,7 @@ class WorkflowTransaction:
         return tuple(event for event in self._events if event.event_type == event_type)
 
     def _require_loaded(self) -> tuple[CompiledPlan, RunState]:
+        self._require_lease()
         if self._plan is None or self._state is None:
             raise StoreError("store.transaction_not_loaded", "load_active_run() must be called first")
         return self._plan, self._state
@@ -1712,21 +2083,35 @@ class WorkflowTransaction:
     ) -> WorkflowEvent:
         plan, current = self._require_loaded()
         self._validate_binding(plan, updated_state)
+        state_data, updated_state = _validated_state_data(updated_state)
         self.store._require_verified_artifact_bytes(updated_state)
+        self.store._require_artifact_paths_contained(updated_state)
         if updated_state.run_id != current.run_id:
             raise StoreError("snapshot.run_mismatch", "updated runtime state belongs to another run")
         status = self._run_status if run_status is None else run_status
+        if status not in {"active", "stopped", "archived"}:
+            raise StoreError("snapshot.invalid", "runtime status is invalid")
         event_payload = dict(payload)
         if "state" in event_payload or "run_status" in event_payload:
             raise StoreError("events.reserved_payload", "transition payload uses a reserved field")
-        event_payload["state"] = _state_data(updated_state)
+        event_payload["state"] = state_data
         event_payload["run_status"] = status
+        try:
+            normalized_payload = _json_value(event_payload)
+            raw_payload = _canonical_bytes(normalized_payload)
+            decoded_payload = _strict_json_loads(raw_payload)
+        except (RecursionError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StoreError("events.invalid_event", "transition payload is not bounded JSON") from exc
+        if not isinstance(decoded_payload, Mapping) or _canonical_bytes(decoded_payload) != raw_payload:
+            raise StoreError("events.invalid_event", "transition payload is not canonical JSON")
+        if len(raw_payload) > MAX_EVENT_BYTES:
+            raise StoreError("events.input_too_large", "transition payload exceeds event size limit")
         event = WorkflowEvent.create(
             event_seq=self._event_seq + 1,
             run_id=updated_state.run_id,
             semantic_sha256=plan.semantic_sha256,
             event_type=event_type,
-            payload=event_payload,
+            payload=decoded_payload,
             previous_event_hash=self._event_hash,
         )
         try:
@@ -1741,7 +2126,13 @@ class WorkflowTransaction:
         if replace_snapshot:
             self.store._atomic_json(
                 self.store.paths.state,
-                _snapshot_data(updated_state, self._event_seq, self._event_hash, run_status=status),
+                _snapshot_data(
+                    updated_state,
+                    self._event_seq,
+                    self._event_hash,
+                    run_status=status,
+                    plan_sha256=self._plan_sha256,
+                ),
             )
             self.store._write_projections(updated_state, status)
         return event
@@ -1807,13 +2198,26 @@ class WorkflowTransaction:
     ) -> tuple[WorkflowEvent, ...]:
         plan, current = self._require_loaded()
         if not transitions:
-            if _state_data(current) != _state_data(final_state):
+            _validated_state_data(final_state)
+            if _canonical_bytes(_state_data(current)) != _canonical_bytes(_state_data(final_state)):
                 raise StoreError("control.final_state_mismatch", "empty control transition set changed state")
             return ()
-        events: list[WorkflowEvent] = []
+        simulated: list[tuple[ControlTransition, RunState]] = []
         intermediate = current
         for transition in transitions:
             intermediate = self._apply_control(plan, intermediate, transition)
+            self._validate_binding(plan, intermediate)
+            _validated_state_data(intermediate)
+            self.store._require_verified_artifact_bytes(intermediate)
+            self.store._require_artifact_paths_contained(intermediate)
+            simulated.append((transition, intermediate))
+        self._validate_binding(plan, final_state)
+        _validated_state_data(final_state)
+        self.store._require_artifact_paths_contained(final_state)
+        if _canonical_bytes(_state_data(intermediate)) != _canonical_bytes(_state_data(final_state)):
+            raise StoreError("control.final_state_mismatch", "control transitions do not produce supplied final state")
+        events: list[WorkflowEvent] = []
+        for transition, intermediate in simulated:
             event = self._commit_event(
                 transition.event_type,
                 intermediate,
@@ -1827,11 +2231,15 @@ class WorkflowTransaction:
                 replace_snapshot=False,
             )
             events.append(event)
-        if _state_data(intermediate) != _state_data(final_state):
-            raise StoreError("control.final_state_mismatch", "control transitions do not produce supplied final state")
         self.store._atomic_json(
             self.store.paths.state,
-            _snapshot_data(final_state, self._event_seq, self._event_hash, run_status=self._run_status),
+            _snapshot_data(
+                final_state,
+                self._event_seq,
+                self._event_hash,
+                run_status=self._run_status,
+                plan_sha256=self._plan_sha256,
+            ),
         )
         self.store._write_projections(final_state, self._run_status)
         self._state = final_state

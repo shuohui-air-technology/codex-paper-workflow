@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import stat
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Mapping
+
+
+MAX_JSON_BYTES = 8 * 1024 * 1024
+MAX_EVENT_BYTES = 2 * 1024 * 1024
 
 
 class PathSafetyError(RuntimeError):
@@ -117,8 +122,10 @@ def ensure_project_directory(
     for part in parts:
         current_relative.append(part)
         current = resolve_project_path(resolved_root, "/".join(current_relative))
+        created = False
         try:
             current.mkdir()
+            created = True
         except FileExistsError:
             pass
         except OSError as exc:
@@ -126,6 +133,8 @@ def ensure_project_directory(
         checked = resolve_project_path(resolved_root, "/".join(current_relative))
         if not checked.is_dir() or _is_link_or_reparse(checked):
             raise PathSafetyError(f"project path is not a plain directory: {checked}")
+        if created:
+            _fsync_directory(checked.parent)
     return resolve_project_path(resolved_root, "/".join(parts))
 
 
@@ -134,12 +143,15 @@ def _fsync_directory(path: Path) -> None:
         return
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        return
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+            return
+        raise
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+            raise
     finally:
         os.close(descriptor)
 
@@ -151,7 +163,7 @@ def _plain_regular_file(path: Path) -> bool:
         return False
     except OSError as exc:
         raise PathSafetyError(f"could not inspect material file: {path}") from exc
-    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
         raise PathSafetyError(f"material path is not a plain regular file: {path}")
     attributes = getattr(value, "st_file_attributes", 0)
     if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
@@ -210,27 +222,30 @@ def _write_bytes_atomic(
             pass
 
 
-def _backup_path(path: Path) -> Path:
-    direct = path.with_name(path.name + ".bak")
-    if not direct.exists() and not _is_link_or_reparse(direct):
-        return direct
-    for _ in range(32):
-        candidate = path.with_name(path.name + f".bak-{time.time_ns()}")
-        if not candidate.exists() and not _is_link_or_reparse(candidate):
-            return candidate
-    raise PathSafetyError(f"could not allocate backup generation for: {path}")
-
-
 def atomic_write_json(path: Path | str, value: object) -> None:
     """Durably replace canonical JSON and retain a validated backup generation."""
 
     target = Path(path)
+    try:
+        raw = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8") + b"\n"
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise PathSafetyError("JSON material cannot be encoded canonically") from exc
+    if len(raw) > MAX_JSON_BYTES:
+        raise PathSafetyError("refusing to write JSON beyond the bounded material size")
     _parent_identity(target.parent)
     target_identity: tuple[int, int, int, int] | None = None
     if _plain_regular_file(target):
         target_identity = _file_identity(target)
         try:
             old_bytes = target.read_bytes()
+            if len(old_bytes) > MAX_JSON_BYTES:
+                raise ValueError("persisted JSON exceeds the bounded input size")
             json.loads(
                 old_bytes.decode("utf-8"),
                 object_pairs_hook=_reject_duplicate_pairs,
@@ -238,16 +253,29 @@ def atomic_write_json(path: Path | str, value: object) -> None:
             )
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise PathSafetyError(f"refusing to replace invalid JSON evidence: {target}") from exc
-        _write_bytes_atomic(_backup_path(target), old_bytes, require_absent=True)
+        backup = target.with_name(target.name + ".bak")
+        backup_identity: tuple[int, int, int, int] | None = None
+        if _plain_regular_file(backup):
+            backup_identity = _file_identity(backup)
+            try:
+                backup_bytes = backup.read_bytes()
+                if len(backup_bytes) > MAX_JSON_BYTES:
+                    raise ValueError("persisted JSON backup exceeds the bounded input size")
+                json.loads(
+                    backup_bytes.decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_pairs,
+                    parse_constant=_reject_constant,
+                )
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                raise PathSafetyError(f"refusing to replace invalid JSON backup: {backup}") from exc
+        _write_bytes_atomic(
+            backup,
+            old_bytes,
+            expected_target_identity=backup_identity,
+            require_absent=backup_identity is None,
+        )
         if _file_identity(target) != target_identity:
             raise PathSafetyError("material target changed while its backup was created")
-    raw = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8") + b"\n"
     _write_bytes_atomic(
         target,
         raw,
@@ -267,13 +295,18 @@ def append_event(path: Path | str, event: object) -> None:
         payload = dict(event)
     else:
         raise PathSafetyError("event must be a mapping or expose to_payload()")
-    data = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8") + b"\n"
+    try:
+        data = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8") + b"\n"
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise PathSafetyError("event cannot be encoded canonically") from exc
+    if len(data) > MAX_EVENT_BYTES:
+        raise PathSafetyError("event exceeds the bounded canonical line size")
     target_existed = _plain_regular_file(target)
     target_identity = _file_identity(target) if target_existed else None
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
@@ -285,7 +318,13 @@ def append_event(path: Path | str, event: object) -> None:
     try:
         opened = os.fstat(descriptor)
         named = target.stat(follow_symlinks=False)
-        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or opened.st_nlink != 1
+            or named.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
             raise PathSafetyError("event path changed while opening")
         if target_identity is not None and (named.st_dev, named.st_ino) != target_identity[:2]:
             raise PathSafetyError("event target changed before append")
@@ -293,12 +332,15 @@ def append_event(path: Path | str, event: object) -> None:
         while offset < len(data):
             offset += os.write(descriptor, data[offset:])
         os.fsync(descriptor)
+        if not target_existed:
+            _fsync_directory(target.parent)
     finally:
         os.close(descriptor)
     final = target.stat(follow_symlinks=False)
     if (
         _parent_identity(target.parent) != parent_identity
         or _is_link_or_reparse(target)
+        or final.st_nlink != 1
         or (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
     ):
         raise PathSafetyError("event path changed during durable append")
