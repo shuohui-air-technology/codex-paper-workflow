@@ -2157,6 +2157,13 @@ class WorkflowStore:
                     if target not in affected:
                         affected.add(target)
                         pending.append(target)
+            independently_ready = dict(current.nodes)
+            for node_id in affected:
+                runtime = independently_ready[node_id]
+                if runtime.status is NodeStatus.READY:
+                    independently_ready[node_id] = replace(
+                        runtime, selected_inputs=MappingProxyType({})
+                    )
             refreshed: RunState | None = None
             for node_id in affected:
                 before = previous.nodes[node_id]
@@ -2166,7 +2173,29 @@ class WorkflowStore:
                         "artifact.authority_invalid",
                         f"external re-registration cannot continue running work: {node_id}",
                     )
-                if before.status in {NodeStatus.SUCCEEDED, NodeStatus.SKIPPED, NodeStatus.STALE}:
+                unattempted_exclusion = (
+                    before.status is NodeStatus.SKIPPED
+                    and before.attempt == 0
+                    and not before.outcome
+                    and not before.claim_token_hash
+                    and not before.selected_inputs
+                    and not before.outputs
+                    and not before.auxiliary_outputs
+                    and bool(plan.incoming[node_id])
+                )
+                unchanged_exclusion = unattempted_exclusion and all(
+                    previous.edges[edge_id] == current.edges[edge_id]
+                    and current.edges[edge_id].status is EdgeStatus.INACTIVE
+                    and previous.nodes[plan.edges[edge_id].source]
+                    == current.nodes[plan.edges[edge_id].source]
+                    for edge_id in plan.incoming[node_id]
+                )
+                if unattempted_exclusion:
+                    valid_status = (
+                        after == before if unchanged_exclusion
+                        else after == replace(before, status=NodeStatus.PENDING)
+                    )
+                elif before.status in {NodeStatus.SUCCEEDED, NodeStatus.SKIPPED, NodeStatus.STALE}:
                     valid_status = after.status is NodeStatus.STALE
                 elif before.status in {NodeStatus.PENDING, NodeStatus.READY}:
                     valid_status = after.status in {NodeStatus.PENDING, NodeStatus.READY}
@@ -2179,7 +2208,15 @@ class WorkflowStore:
                     )
                 for edge_id in plan.outgoing[node_id]:
                     edge = current.edges[edge_id]
-                    if edge.status is not EdgeStatus.WAITING or edge.selected_output_map:
+                    if unchanged_exclusion:
+                        valid_edge = (
+                            edge == previous.edges[edge_id]
+                            and edge.status is EdgeStatus.INACTIVE
+                            and not edge.selected_output_map
+                        )
+                    else:
+                        valid_edge = edge.status is EdgeStatus.WAITING and not edge.selected_output_map
+                    if not valid_edge:
                         raise StoreError(
                             "artifact.authority_invalid",
                             f"external re-registration must reset old output route: {edge_id}",
@@ -2191,7 +2228,11 @@ class WorkflowStore:
                     )
                 if after.status is NodeStatus.READY:
                     if refreshed is None:
-                        refreshed = refresh_ready(plan, current)
+                        refreshed = refresh_ready(
+                            plan, replace(
+                                current, nodes=MappingProxyType(independently_ready)
+                            )
+                        )
                     expected = refreshed.nodes[node_id]
                     if (
                         expected.status is not NodeStatus.READY

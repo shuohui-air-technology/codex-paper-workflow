@@ -163,6 +163,150 @@ def external_consumer_plan():
     )
 
 
+def any_success_refinement_plan():
+    first = compiled_node("first-task", entry=True, outputs=("first",))
+    other = compiled_node("other-task", entry=True, outputs=("other",))
+    join = replace(
+        compiled_node("join", node_type="join", outputs=("joined",)),
+        join_mode="any_success",
+    )
+    edges = {
+        "first-join": CompiledEdge(
+            "first-join", "first-task", "join", "succeeded",
+            MappingProxyType({"first": "joined"}),
+        ),
+        "other-join": CompiledEdge(
+            "other-join", "other-task", "join", "succeeded",
+            MappingProxyType({"other": "joined"}),
+        ),
+    }
+    return CompiledPlan(
+        workflow_id="any-success-refinement",
+        semantic_revision=1,
+        document_sha256=sha256_bytes(b"any-success-document"),
+        semantic_sha256=sha256_bytes(b"any-success-plan"),
+        external_inputs=("first",),
+        nodes=MappingProxyType({
+            "first-task": first, "other-task": other, "join": join,
+        }),
+        edges=MappingProxyType(edges),
+        incoming=MappingProxyType({
+            "first-task": (), "other-task": (),
+            "join": ("first-join", "other-join"),
+        }),
+        outgoing=MappingProxyType({
+            "first-task": ("first-join",), "other-task": ("other-join",),
+            "join": (),
+        }),
+        topological_order=("first-task", "other-task", "join"),
+        max_parallelism=2,
+    )
+
+
+def complete_any_success_refinement(store, plan):
+    external = ArtifactRuntime(
+        "first", "external.txt", sha256_bytes(b"external"), "verified", "external", 0
+    )
+    with store.locked_run() as transaction:
+        _, state = transaction.load_active_run()
+        registered = replace(state, artifacts=MappingProxyType({"first": external}))
+        transaction.commit_transition("artifact_registered", registered)
+        first_running = claim_transition(plan, registered, "first-task", "first-token")
+        transaction.commit_transition("node_claimed", first_running)
+        first_done = result_transition(plan, first_running, {
+            "node_id": "first-task", "attempt": 1, "status": "succeeded",
+            "outcome": "succeeded", "outputs": {"first": "first.txt"},
+            "artifacts": [ArtifactRuntime(
+                "first", "first.txt", sha256_bytes(b"first"),
+                "verified", "first-task", 1,
+            )],
+        })
+        transaction.commit_transition("node_result", first_done)
+        self_selected = first_done.nodes["join"].selected_inputs
+        assert self_selected == {"joined": "first.txt"}
+        other_running = claim_transition(plan, first_done, "other-task", "other-token")
+        transaction.commit_transition("node_claimed", other_running)
+        both_done = result_transition(plan, other_running, {
+            "node_id": "other-task", "attempt": 1, "status": "succeeded",
+            "outcome": "succeeded", "outputs": {"other": "other.txt"},
+            "artifacts": [ArtifactRuntime(
+                "other", "other.txt", sha256_bytes(b"other"),
+                "verified", "other-task", 1,
+            )],
+        })
+        transaction.commit_transition("node_result", both_done)
+    return both_done, external
+
+
+def excluded_branch_plan(*, artifact_condition=False):
+    predicate = (
+        {"op": "artifact_state_is", "artifact": "source", "value": "verified"}
+        if artifact_condition else {"op": "fact_is", "name": "flag", "value": True}
+    )
+
+
+    condition = compiled_node(
+        "choose", node_type="condition", entry=True,
+        outcomes=("go", "default"), cases=({"outcome": "go", "when": predicate},),
+    )
+    main = compiled_node("main")
+    fallback = compiled_node("fallback", inputs=("source",))
+    sink = compiled_node("sink")
+    edges = {
+        "choose-main": CompiledEdge(
+            "choose-main", "choose", "main", "go", MappingProxyType({})
+        ),
+        "choose-fallback": CompiledEdge(
+            "choose-fallback", "choose", "fallback", "default", MappingProxyType({})
+        ),
+        "fallback-sink": CompiledEdge(
+            "fallback-sink", "fallback", "sink", "succeeded", MappingProxyType({})
+        ),
+    }
+    return CompiledPlan(
+        workflow_id="excluded-branch-artifact" if artifact_condition else "excluded-branch-fact",
+        semantic_revision=1,
+        document_sha256=sha256_bytes(b"excluded-branch-document"),
+        semantic_sha256=sha256_bytes(b"excluded-branch-plan"),
+        external_inputs=("source",),
+        nodes=MappingProxyType({
+            "choose": condition, "main": main, "fallback": fallback, "sink": sink,
+        }),
+        edges=MappingProxyType(edges),
+        incoming=MappingProxyType({
+            "choose": (), "main": ("choose-main",),
+            "fallback": ("choose-fallback",), "sink": ("fallback-sink",),
+        }),
+        outgoing=MappingProxyType({
+            "choose": ("choose-main", "choose-fallback"), "main": (),
+            "fallback": ("fallback-sink",), "sink": (),
+        }),
+        topological_order=("choose", "main", "fallback", "sink"),
+        max_parallelism=1,
+    )
+
+
+def complete_excluded_branch(store, plan, *, artifact_condition=False):
+    source = ArtifactRuntime(
+        "source", "old.txt", sha256_bytes(b"old"), "verified", "external", 0
+    )
+    with store.locked_run() as transaction:
+        _, state = transaction.load_active_run()
+        registered = replace(state, artifacts=MappingProxyType({"source": source}))
+        transaction.commit_transition("artifact_registered", registered)
+        if not artifact_condition:
+            registered = replace(
+                registered, project_booleans=MappingProxyType({"flag": True})
+            )
+            transaction.commit_transition("fact_recorded", registered)
+        selected, transitions = stabilize_control_nodes(plan, registered)
+        transaction.commit_control_transitions(transitions, selected)
+    assert selected.nodes["choose"].status is NodeStatus.SUCCEEDED
+    assert selected.nodes["fallback"].status is NodeStatus.SKIPPED
+    assert selected.nodes["sink"].status is NodeStatus.SKIPPED
+    return selected
+
+
 def complete_external_consumer(store, plan):
     source = ArtifactRuntime(
         "source", "old.txt", sha256_bytes(b"old"), "verified", "external", 0
@@ -2392,6 +2536,222 @@ class WorkflowStoreTests(unittest.TestCase):
                     transaction.commit_transition("artifact_registered", stale_route)
                 self.assertEqual(selected.exception.code, "artifact.authority_invalid")
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_any_success_replacement_rejects_superseded_frozen_winner_at_every_boundary(self):
+        for boundary in ("direct", "suffix", "full_chain"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for name, value in (
+                    ("external.txt", b"external"), ("first.txt", b"first"),
+                    ("other.txt", b"other"),
+                ):
+                    root.joinpath(name).write_bytes(value)
+                plan = any_success_refinement_plan()
+                store = WorkflowStore(root)
+                store.start_run(plan, f"run-any-success-{boundary}")
+                complete, external = complete_any_success_refinement(store, plan)
+                self.assertEqual(complete.nodes["join"].status, NodeStatus.READY)
+                self.assertEqual(complete.nodes["join"].selected_inputs, {"joined": "first.txt"})
+                self.assertEqual(complete.edges["other-join"].status, EdgeStatus.SATISFIED)
+                nodes = dict(complete.nodes)
+                nodes["first-task"] = replace(nodes["first-task"], status=NodeStatus.STALE)
+                invalid = replace(
+                    complete,
+                    nodes=MappingProxyType(nodes),
+                    edges=MappingProxyType({
+                        **complete.edges,
+                        "first-join": EdgeRuntime(EdgeStatus.WAITING),
+                    }),
+                    artifacts=MappingProxyType({**complete.artifacts, "first": external}),
+                )
+                if boundary == "direct":
+                    with store.locked_run() as transaction:
+                        transaction.load_active_run()
+                        before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                        with self.assertRaises(StoreError) as caught:
+                            transaction.commit_transition("artifact_registered", invalid)
+                        self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                        self.assertEqual(
+                            (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                        )
+                    continue
+                event = append_rehashed_state_event(store, workflow_store._state_data(invalid))
+                if boundary == "full_chain":
+                    snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+                    snapshot["state"] = workflow_store._state_data(invalid)
+                    snapshot["last_applied_event_seq"] = event.event_seq
+                    snapshot["last_applied_event_hash"] = event.event_hash
+                    store.paths.state.write_text(
+                        json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    with store.paths.events.open("ab") as handle:
+                        handle.write(b'{"event_seq":99,"partial"')
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                recovered = WorkflowStore(root).recover()
+                self.assertEqual((recovered.status, recovered.code), ("blocked", "artifact.authority_invalid"))
+                self.assertEqual(
+                    (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                )
+                if boundary == "suffix":
+                    self.assertFalse(store.paths.recovery.exists())
+
+    def test_any_success_replacement_accepts_independently_derived_other_winner(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, value in (
+                ("external.txt", b"external"), ("first.txt", b"first"),
+                ("other.txt", b"other"),
+            ):
+                root.joinpath(name).write_bytes(value)
+            plan = any_success_refinement_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-any-success-valid")
+            complete, external = complete_any_success_refinement(store, plan)
+            nodes = dict(complete.nodes)
+            nodes["first-task"] = replace(nodes["first-task"], status=NodeStatus.STALE)
+            nodes["join"] = replace(
+                nodes["join"], selected_inputs=MappingProxyType({"joined": "other.txt"})
+            )
+            replacement = replace(
+                complete,
+                nodes=MappingProxyType(nodes),
+                edges=MappingProxyType({
+                    **complete.edges, "first-join": EdgeRuntime(EdgeStatus.WAITING),
+                }),
+                artifacts=MappingProxyType({**complete.artifacts, "first": external}),
+            )
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                transaction.commit_transition("artifact_registered", replacement)
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.status, "clean")
+            self.assertEqual(recovered.state.nodes["join"].selected_inputs, {"joined": "other.txt"})
+            with store.locked_run() as transaction:
+                _, current = transaction.load_active_run()
+                stabilized, transitions = stabilize_control_nodes(plan, current)
+                transaction.commit_control_transitions(transitions, stabilized)
+            self.assertEqual(stabilized.nodes["join"].status, NodeStatus.SUCCEEDED)
+            self.assertEqual(stabilized.nodes["join"].outputs, {"joined": "other.txt"})
+
+    def test_source_independent_zero_attempt_exclusion_survives_reregistration(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"old")
+            root.joinpath("new.txt").write_bytes(b"new")
+            plan = excluded_branch_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-independent-exclusion")
+            excluded = complete_excluded_branch(store, plan)
+            self.assertEqual(excluded.nodes["fallback"].attempt, 0)
+            self.assertEqual(excluded.edges["choose-fallback"].status, EdgeStatus.INACTIVE)
+            self.assertEqual(excluded.edges["fallback-sink"].status, EdgeStatus.INACTIVE)
+            changed = ArtifactRuntime(
+                "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+            )
+            candidate = replace(
+                excluded, artifacts=MappingProxyType({"source": changed})
+            )
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                transaction.commit_transition("artifact_registered", candidate)
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.status, "clean")
+            for node_id in ("fallback", "sink"):
+                self.assertEqual(recovered.state.nodes[node_id].status, NodeStatus.SKIPPED)
+            self.assertEqual(recovered.state.edges["fallback-sink"].status, EdgeStatus.INACTIVE)
+
+    def test_changed_controlling_lineage_reopens_unattempted_excluded_branch(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"old")
+            root.joinpath("new.txt").write_bytes(b"new")
+            plan = excluded_branch_plan(artifact_condition=True)
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-changed-exclusion")
+            selected = complete_excluded_branch(store, plan, artifact_condition=True)
+            changed = ArtifactRuntime(
+                "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+            )
+            nodes = dict(selected.nodes)
+            nodes["choose"] = replace(nodes["choose"], status=NodeStatus.STALE)
+            for node_id in ("main", "fallback", "sink"):
+                nodes[node_id] = replace(
+                    nodes[node_id], status=NodeStatus.PENDING,
+                    selected_inputs=MappingProxyType({}),
+                )
+            candidate = replace(
+                selected,
+                nodes=MappingProxyType(nodes),
+                edges=MappingProxyType({
+                    edge_id: EdgeRuntime(EdgeStatus.WAITING) for edge_id in plan.edges
+                }),
+                artifacts=MappingProxyType({"source": changed}),
+            )
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                unsafe = replace(candidate, nodes=MappingProxyType({
+                    **candidate.nodes, "fallback": selected.nodes["fallback"],
+                }))
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", unsafe)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+                transaction.commit_transition("artifact_registered", candidate)
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.status, "clean")
+            for node_id in ("fallback", "sink"):
+                self.assertEqual(recovered.state.nodes[node_id].status, NodeStatus.PENDING)
+                self.assertEqual(recovered.state.nodes[node_id].attempt, 0)
+
+    def test_attempted_skip_still_requires_stale_evidence_on_source_change(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"old")
+            root.joinpath("new.txt").write_bytes(b"new")
+            base = external_consumer_plan()
+            consumer = replace(base.nodes["consumer"], failure_policy="skip_branch")
+            plan = replace(base, nodes=MappingProxyType({"consumer": consumer}))
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-attempted-skip")
+            old = ArtifactRuntime(
+                "source", "old.txt", sha256_bytes(b"old"), "verified", "external", 0
+            )
+            new = ArtifactRuntime(
+                "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+            )
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                ready = refresh_ready(
+                    plan, replace(state, artifacts=MappingProxyType({"source": old}))
+                )
+                transaction.commit_transition("artifact_registered", ready)
+                running = claim_transition(plan, ready, "consumer", "skip-token")
+                transaction.commit_transition("node_claimed", running)
+                skipped = result_transition(plan, running, {
+                    "node_id": "consumer", "attempt": 1, "status": "failed",
+                    "outcome": "", "outputs": {}, "artifacts": [],
+                })
+                transaction.commit_transition("node_result", skipped)
+                self.assertEqual(skipped.nodes["consumer"].status, NodeStatus.SKIPPED)
+                self.assertEqual(skipped.nodes["consumer"].attempt, 1)
+                candidate = replace(
+                    skipped, artifacts=MappingProxyType({"source": new})
+                )
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", candidate)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+                stale = replace(candidate, nodes=MappingProxyType({
+                    "consumer": replace(
+                        skipped.nodes["consumer"], status=NodeStatus.STALE
+                    ),
+                }))
+                transaction.commit_transition("artifact_registered", stale)
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
 
     def test_changed_external_registration_stales_completed_consumer_but_identical_is_idempotent(self):
         with TemporaryDirectory() as temporary:
