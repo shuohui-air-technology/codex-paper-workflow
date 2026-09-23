@@ -19,6 +19,7 @@ from scripts.workflow_engine.catalog import CatalogResult, SkillIdentity, Valida
 from scripts.workflow_engine.compiler import CompiledEdge, CompiledNode, CompiledPlan, compile_workflow
 from scripts.workflow_engine import fs as workflow_fs
 from scripts.workflow_engine import store as workflow_store
+from scripts.workflow_engine.receipts import build_claim_evidence, build_stage_receipt
 from scripts.workflow_engine.fs import (
     PathSafetyError,
     append_event,
@@ -60,6 +61,27 @@ def sha256_bytes(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def commit_claim(transaction, running):
+    plan, before = transaction._require_loaded()
+    node_id, = [key for key in plan.nodes if running.nodes[key].status is NodeStatus.RUNNING
+                and before.nodes[key].status is not NodeStatus.RUNNING]
+    claim = build_claim_evidence(plan, running, node_id, transaction.input_witnesses(), "2026-09-23T00:00:00Z")
+    return transaction.commit_transition("node_claimed", running, {"claim_evidence": claim})
+
+
+def commit_result(transaction, completed):
+    plan, before = transaction._require_loaded()
+    node_id, = [key for key in plan.nodes if before.nodes[key].status is NodeStatus.RUNNING
+                and completed.nodes[key].status is not NodeStatus.RUNNING]
+    claim_event = next(event for event in reversed(transaction.events("node_claimed"))
+                       if event.payload["claim_evidence"]["node_id"] == node_id)
+    error = None if completed.nodes[node_id].status is NodeStatus.SUCCEEDED else {"code": "test.failed", "message": "Fixture task failed."}
+    receipt = build_stage_receipt(plan, completed, node_id, claim_event.payload["claim_evidence"],
+        summary="Fixture completion.", uncertainties=[], completed_at="2026-09-23T00:00:01Z", error=error)
+    return transaction.commit_receipted_transition("node_result_recorded", completed, receipt,
+        result_sha256=sha256_bytes(b"fixture-result"), claim_event_seq=claim_event.event_seq)
+
+
 def compiled_node(
     node_id,
     *,
@@ -71,6 +93,9 @@ def compiled_node(
     cases=(),
     skill=None,
 ):
+    if node_type == "task" and skill is None:
+        skill = SkillIdentity("test-skill", Path("/installed/skills"), "test-skill",
+                              sha256_bytes(b"skill"), "sha256:" + sha256_bytes(b"tree"), True)
     return CompiledNode(
         id=node_id,
         type=node_type,
@@ -274,7 +299,7 @@ def complete_compiled_winner(
         state = refresh_ready(plan, state)
         transaction.commit_transition("artifact_registered", state)
         running = claim_transition(plan, state, "b", "b-token")
-        transaction.commit_transition("node_claimed", running)
+        commit_claim(transaction, running)
         state = result_transition(plan, running, {
             "node_id": "b", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
             "outputs": {"draft": b_path, **({"notes": "notes.txt"} if "notes" in plan.nodes["b"].outputs else {})},
@@ -284,7 +309,7 @@ def complete_compiled_winner(
                   if "notes" in plan.nodes["b"].outputs else []),
             ],
         })
-        transaction.commit_transition("node_result", state)
+        commit_result(transaction, state)
         self_winner = state.nodes["joined"]
         assert self_winner.selected_inputs == {"joined": b_path}
         if complete_join:
@@ -293,22 +318,22 @@ def complete_compiled_winner(
             state = stable
         if downstream:
             running = claim_transition(plan, state, "consumer", "consumer-token")
-            transaction.commit_transition("node_claimed", running)
+            commit_claim(transaction, running)
             state = result_transition(plan, running, {
                 "node_id": "consumer", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
                 "outputs": {"final": "final.txt"},
                 "artifacts": [ArtifactRuntime("final", "final.txt", sha256_bytes(b"final"), "verified", "consumer", 1)],
             })
-            transaction.commit_transition("node_result", state)
+            commit_result(transaction, state)
         (root / a_path).write_bytes(b"winner" if a_path == b_path else b"late")
         running = claim_transition(plan, state, "a", "a-token")
-        transaction.commit_transition("node_claimed", running)
+        commit_claim(transaction, running)
         state = result_transition(plan, running, {
             "node_id": "a", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
             "outputs": {"draft": a_path},
             "artifacts": [ArtifactRuntime("draft", a_path, sha256_bytes(b"winner" if a_path == b_path else b"late"), "verified", "a", 1)],
         })
-        transaction.commit_transition("node_result", state)
+        commit_result(transaction, state)
     return state
 
 
@@ -373,7 +398,7 @@ def complete_any_success_refinement(store, plan):
         registered = replace(state, artifacts=MappingProxyType({"first": external}))
         transaction.commit_transition("artifact_registered", registered)
         first_running = claim_transition(plan, registered, "first-task", "first-token")
-        transaction.commit_transition("node_claimed", first_running)
+        commit_claim(transaction, first_running)
         first_done = result_transition(plan, first_running, {
             "node_id": "first-task", "attempt": 1, "status": "succeeded",
             "outcome": "succeeded", "outputs": {"first": "first.txt"},
@@ -382,11 +407,11 @@ def complete_any_success_refinement(store, plan):
                 "verified", "first-task", 1,
             )],
         })
-        transaction.commit_transition("node_result", first_done)
+        commit_result(transaction, first_done)
         self_selected = first_done.nodes["join"].selected_inputs
         assert self_selected == {"joined": "first.txt"}
         other_running = claim_transition(plan, first_done, "other-task", "other-token")
-        transaction.commit_transition("node_claimed", other_running)
+        commit_claim(transaction, other_running)
         both_done = result_transition(plan, other_running, {
             "node_id": "other-task", "attempt": 1, "status": "succeeded",
             "outcome": "succeeded", "outputs": {"other": "other.txt"},
@@ -395,7 +420,7 @@ def complete_any_success_refinement(store, plan):
                 "verified", "other-task", 1,
             )],
         })
-        transaction.commit_transition("node_result", both_done)
+        commit_result(transaction, both_done)
     return both_done, external
 
 
@@ -479,7 +504,7 @@ def complete_external_consumer(store, plan):
         )
         transaction.commit_transition("artifact_registered", registered)
         running = claim_transition(plan, registered, "consumer", "consumer-token")
-        transaction.commit_transition("node_claimed", running)
+        commit_claim(transaction, running)
         complete = result_transition(plan, running, {
             "node_id": "consumer", "attempt": 1, "status": "succeeded",
             "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
@@ -488,7 +513,7 @@ def complete_external_consumer(store, plan):
                 "verified", "consumer", 1,
             )],
         })
-        transaction.commit_transition("node_result", complete)
+        commit_result(transaction, complete)
         return complete
 
 
@@ -1452,13 +1477,13 @@ class WorkflowStoreTests(unittest.TestCase):
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
                 running = claim_transition(plan, state, "produce", "terminal-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 terminal = result_transition(plan, running, {
                     "node_id": "produce", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
                     "artifacts": [ArtifactRuntime("draft", "draft.txt", sha256_bytes(b"draft"), "verified", "produce", 1)],
                 })
-                transaction.commit_transition("node_result", terminal)
+                commit_result(transaction, terminal)
             with self.assertRaises(StoreError) as next_run:
                 store.start_run(plan, "run-must-not-replace")
             self.assertEqual(next_run.exception.code, "run.already_active")
@@ -1469,17 +1494,8 @@ class WorkflowStoreTests(unittest.TestCase):
             store.start_run(plan, "run-recovery-blocked")
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
-                running = replace(
-                    state,
-                    nodes=MappingProxyType(
-                        {
-                            "produce": replace(
-                                state.nodes["produce"], status=NodeStatus.RUNNING, attempt=1
-                            )
-                        }
-                    ),
-                )
-                transaction.commit_transition("node_claimed", running)
+                running = claim_transition(plan, state, "produce", "interrupted-token")
+                commit_claim(transaction, running)
             self.assertEqual(store.recover().code, "recovery.running_work_uncertain")
             with self.assertRaises(StoreError) as next_run:
                 store.start_run(plan, "run-after-block")
@@ -1885,7 +1901,7 @@ class WorkflowStoreTests(unittest.TestCase):
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
                 running = claim_transition(plan, state, "producer", "producer-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 completed = result_transition(plan, running, {
                     "node_id": "producer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {"first": "first.txt", "second": "second.txt"},
@@ -1894,14 +1910,14 @@ class WorkflowStoreTests(unittest.TestCase):
                         ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
                     ],
                 })
-                transaction.commit_transition("node_result", completed)
+                commit_result(transaction, completed)
                 running = claim_transition(plan, completed, "consumer", "consumer-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 completed = result_transition(plan, running, {
                     "node_id": "consumer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {}, "artifacts": [],
                 })
-                transaction.commit_transition("node_result", completed)
+                commit_result(transaction, completed)
 
             first_path.write_bytes(b"changed")
             recovered = WorkflowStore(root).recover()
@@ -2595,7 +2611,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 registered = replace(state, artifacts=MappingProxyType({"first": external}))
                 transaction.commit_transition("artifact_registered", registered)
                 running = claim_transition(plan, registered, "producer", "producer-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 produced = result_transition(plan, running, {
                     "node_id": "producer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded",
@@ -2605,7 +2621,7 @@ class WorkflowStoreTests(unittest.TestCase):
                         ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
                     ],
                 })
-                transaction.commit_transition("node_result", produced)
+                commit_result(transaction, produced)
                 self.assertEqual(produced.nodes["consumer"].status, NodeStatus.READY)
                 self.assertEqual(produced.nodes["consumer"].selected_inputs["first"], "first.txt")
                 reset_nodes = dict(produced.nodes)
@@ -2646,7 +2662,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 registered = replace(state, artifacts=MappingProxyType({"first": external}))
                 transaction.commit_transition("artifact_registered", registered)
                 running = claim_transition(plan, registered, "producer", "token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 produced = result_transition(plan, running, {
                     "node_id": "producer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {"first": "first.txt", "second": "second.txt"},
@@ -2655,7 +2671,7 @@ class WorkflowStoreTests(unittest.TestCase):
                         ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
                     ],
                 })
-                transaction.commit_transition("node_result", produced)
+                commit_result(transaction, produced)
                 nodes = dict(produced.nodes)
                 nodes["producer"] = replace(nodes["producer"], status=NodeStatus.STALE)
                 nodes["consumer"] = replace(nodes["consumer"], status=NodeStatus.STALE)
@@ -3079,7 +3095,7 @@ class WorkflowStoreTests(unittest.TestCase):
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
                 running = claim_transition(plan, state, "source", "token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 state = result_transition(plan, running, {
                     "node_id": "source", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
@@ -3088,7 +3104,7 @@ class WorkflowStoreTests(unittest.TestCase):
                         "verified", "source", 1,
                     )],
                 })
-                transaction.commit_transition("node_result", state)
+                commit_result(transaction, state)
                 stable, controls = stabilize_control_nodes(plan, state)
                 self.assertEqual((stable.nodes["merged"].status, len(controls)),
                                  (NodeStatus.SUCCEEDED, 3))
@@ -3106,7 +3122,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 _, state = transaction.load_active_run()
                 for source in ("source-a", "source-b"):
                     running = claim_transition(plan, state, source, f"token-{source}")
-                    transaction.commit_transition("node_claimed", running)
+                    commit_claim(transaction, running)
                     state = result_transition(plan, running, {
                         "node_id": source, "attempt": 1, "status": "succeeded",
                         "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
@@ -3115,7 +3131,7 @@ class WorkflowStoreTests(unittest.TestCase):
                             "verified", source, 1,
                         )],
                     })
-                    transaction.commit_transition("node_result", state)
+                    commit_result(transaction, state)
                 stable, controls = stabilize_control_nodes(plan, state)
                 self.assertEqual(stable.nodes["merged"].status, NodeStatus.SUCCEEDED)
                 before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
@@ -3172,7 +3188,7 @@ class WorkflowStoreTests(unittest.TestCase):
                     before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
                     recovered = WorkflowStore(root).recover()
                     self.assertEqual(recovered.status, "blocked")
-                    self.assertIn(recovered.code, {"edge.authority_invalid", "join.winner_invalid", "events.invalid_completion"})
+                    self.assertIn(recovered.code, {"edge.authority_invalid", "join.winner_invalid", "events.invalid_completion", "events.invalid_claim"})
                     self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
                     if boundary == "suffix":
                         self.assertFalse(store.paths.recovery.exists())
@@ -3187,7 +3203,7 @@ class WorkflowStoreTests(unittest.TestCase):
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
                 running = claim_transition(plan, state, "b", "b-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 no_receipt = result_transition(plan, running, {
                     "node_id": "b", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {"draft": "b.txt"}, "artifacts": [],
@@ -3195,7 +3211,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
                 with self.assertRaises(StoreError) as caught:
                     transaction.commit_transition("node_result", no_receipt)
-                self.assertEqual(caught.exception.code, "edge.witness_missing")
+                self.assertEqual(caught.exception.code, "events.invalid_completion")
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
 
     def test_late_same_path_rewrite_cannot_keep_old_winner_bytes_authoritative(self):
@@ -3209,15 +3225,15 @@ class WorkflowStoreTests(unittest.TestCase):
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
                 running = claim_transition(plan, state, "b", "b-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 state = result_transition(plan, running, {
                     "node_id": "b", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
                     "outputs": {"draft": "shared.txt"},
                     "artifacts": [ArtifactRuntime("draft", "shared.txt", sha256_bytes(b"winner"), "verified", "b", 1)],
                 })
-                transaction.commit_transition("node_result", state)
+                commit_result(transaction, state)
                 running = claim_transition(plan, state, "a", "a-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 shared.write_bytes(b"overwritten")
                 late = result_transition(plan, running, {
                     "node_id": "a", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
@@ -3226,7 +3242,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 })
                 before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
                 with self.assertRaises(StoreError) as caught:
-                    transaction.commit_transition("node_result", late)
+                    commit_result(transaction, late)
                 self.assertEqual(caught.exception.code, "artifact.verification_failed")
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
             recovered = WorkflowStore(root).recover()
@@ -3373,12 +3389,12 @@ class WorkflowStoreTests(unittest.TestCase):
                 )
                 transaction.commit_transition("artifact_registered", ready)
                 running = claim_transition(plan, ready, "consumer", "skip-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 skipped = result_transition(plan, running, {
                     "node_id": "consumer", "attempt": 1, "status": "failed",
                     "outcome": "", "outputs": {}, "artifacts": [],
                 })
-                transaction.commit_transition("node_result", skipped)
+                commit_result(transaction, skipped)
                 self.assertEqual(skipped.nodes["consumer"].status, NodeStatus.SKIPPED)
                 self.assertEqual(skipped.nodes["consumer"].attempt, 1)
                 candidate = replace(
@@ -3449,7 +3465,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 })))
                 transaction.commit_transition("artifact_registered", registered)
                 running = claim_transition(plan, registered, "consumer", "token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 changed = ArtifactRuntime(
                     "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
                 )
@@ -3539,7 +3555,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 registered = replace(state, artifacts=MappingProxyType({"first": external}))
                 transaction.commit_transition("artifact_registered", registered)
                 first_running = claim_transition(plan, registered, "producer", "first-token")
-                transaction.commit_transition("node_claimed", first_running)
+                commit_claim(transaction, first_running)
                 first_result = result_transition(plan, first_running, {
                     "node_id": "producer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded",
@@ -3549,9 +3565,9 @@ class WorkflowStoreTests(unittest.TestCase):
                         ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
                     ],
                 })
-                transaction.commit_transition("node_result", first_result)
+                commit_result(transaction, first_result)
                 second_running = claim_transition(plan, first_result, "consumer", "second-token")
-                transaction.commit_transition("node_claimed", second_running)
+                commit_claim(transaction, second_running)
                 second_result = result_transition(plan, second_running, {
                     "node_id": "consumer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {"first": "refined.txt"},
@@ -3560,7 +3576,7 @@ class WorkflowStoreTests(unittest.TestCase):
                         "verified", "consumer", 1,
                     )],
                 })
-                transaction.commit_transition("node_result", second_result)
+                commit_result(transaction, second_result)
             self.assertEqual(second_result.artifacts["first"].producer_node_id, "consumer")
             self.assertEqual(WorkflowStore(root).recover().status, "clean")
 
@@ -3581,7 +3597,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 registered = replace(state, artifacts=MappingProxyType({"first": external}))
                 transaction.commit_transition("artifact_registered", registered)
                 running = claim_transition(plan, registered, "producer", "producer-token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 produced = result_transition(plan, running, {
                     "node_id": "producer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded",
@@ -3591,14 +3607,14 @@ class WorkflowStoreTests(unittest.TestCase):
                         ArtifactRuntime("second", "second.txt", sha256_bytes(b"sibling"), "verified", "producer", 1),
                     ],
                 })
-                transaction.commit_transition("node_result", produced)
+                commit_result(transaction, produced)
                 consumer_running = claim_transition(plan, produced, "consumer", "consumer-token")
-                transaction.commit_transition("node_claimed", consumer_running)
+                commit_claim(transaction, consumer_running)
                 complete = result_transition(plan, consumer_running, {
                     "node_id": "consumer", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {}, "artifacts": [],
                 })
-                transaction.commit_transition("node_result", complete)
+                commit_result(transaction, complete)
                 self.assertEqual(complete.artifacts["first"].producer_node_id, "producer")
                 unsafe = replace(complete, artifacts=MappingProxyType({
                     **complete.artifacts, "first": external,
@@ -3673,7 +3689,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 registered = replace(state, artifacts=MappingProxyType({"draft": old}))
                 transaction.commit_transition("artifact_registered", registered)
                 running = claim_transition(plan, registered, "produce", "token")
-                transaction.commit_transition("node_claimed", running)
+                commit_claim(transaction, running)
                 completed = result_transition(plan, running, {
                     "node_id": "produce", "attempt": 1, "status": "succeeded",
                     "outcome": "succeeded", "outputs": {"draft": "new.txt"},
@@ -3681,7 +3697,7 @@ class WorkflowStoreTests(unittest.TestCase):
                         "draft", "new.txt", sha256_bytes(b"new"), "verified", "produce", 1
                     )],
                 })
-                transaction.commit_transition("node_result", completed)
+                commit_result(transaction, completed)
             forged = replace(completed, artifacts=MappingProxyType({"draft": old}))
             append_rehashed_state_event(store, workflow_store._state_data(forged))
             with store.paths.events.open("ab") as handle:
@@ -3699,9 +3715,8 @@ class WorkflowStoreTests(unittest.TestCase):
             store.start_run(plan, "run-running")
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
-                runtime = replace(state.nodes["produce"], status=NodeStatus.RUNNING, attempt=1)
-                running = replace(state, nodes=MappingProxyType({"produce": runtime}))
-                transaction.commit_transition("node_claimed", running)
+                running = claim_transition(plan, state, "produce", "interrupted-token")
+                commit_claim(transaction, running)
             result = store.recover()
             self.assertEqual((result.status, result.code), ("blocked", "recovery.running_work_uncertain"))
             self.assertEqual(result.state.nodes["produce"].status, NodeStatus.BLOCKED)

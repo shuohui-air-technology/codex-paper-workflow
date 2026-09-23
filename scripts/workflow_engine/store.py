@@ -50,6 +50,11 @@ from .scheduler import (
     mark_descendants_stale,
     refresh_ready,
     result_transition,
+    claim_transition,
+)
+from .receipts import (
+    ReceiptError, build_claim_evidence, build_stage_receipt, canonical_bytes,
+    validate_stage_receipt,
 )
 from .schema import (
     WorkflowDocument,
@@ -531,6 +536,7 @@ class StorePaths:
     summary: Path
     recovery: Path
     archived_runs: Path
+    receipts: Path
 
 
 def _document_data(document: WorkflowDocument) -> dict[str, object]:
@@ -1084,7 +1090,7 @@ def _validate_completion_transition(
     payload: Mapping[str, object],
 ) -> None:
     """Only a scheduler-equivalent result/control event can mint a live edge."""
-    if event_type == "node_result":
+    if event_type == "node_result_recorded":
         changed = [
             node_id for node_id in plan.nodes
             if previous.nodes[node_id].status is NodeStatus.RUNNING
@@ -1093,7 +1099,7 @@ def _validate_completion_transition(
             }
         ]
         if len(changed) != 1:
-            raise StoreError("events.invalid_completion", "node_result needs one running task completion")
+            raise StoreError("events.invalid_completion", "receipted result needs one running task completion")
         node_id = changed[0]
         node = plan.nodes[node_id]
         after = current.nodes[node_id]
@@ -1165,7 +1171,7 @@ def _validate_edge_and_winner_transition(
         if runtime.status is NodeStatus.SUCCEEDED
         and previous.nodes[node_id].status is not NodeStatus.SUCCEEDED
     }
-    if newly_succeeded and event_type not in {"node_result", "condition_selected", "join_succeeded"}:
+    if newly_succeeded and event_type not in {"node_result_recorded", "condition_selected", "join_succeeded"}:
         raise StoreError("events.invalid_completion", "non-completion event cannot finish a node")
     for edge_id, runtime in current.edges.items():
         before = previous.edges[edge_id]
@@ -1177,9 +1183,9 @@ def _validate_edge_and_winner_transition(
             and current.nodes[plan.edges[edge_id].source].status is NodeStatus.SUCCEEDED
         ):
             raise StoreError("edge.authority_invalid", f"completed source lost its satisfied route: {edge_id}")
-    if newly_satisfied and event_type not in {"node_result", "condition_selected", "join_succeeded"}:
+    if newly_satisfied and event_type not in {"node_result_recorded", "condition_selected", "join_succeeded"}:
         raise StoreError("events.invalid_completion", "non-completion event cannot create a satisfied edge")
-    if event_type in {"node_result", "condition_selected", "join_succeeded"}:
+    if event_type in {"node_result_recorded", "condition_selected", "join_succeeded"}:
         _validate_completion_transition(plan, previous, current, event_type, payload)
     for node_id, runtime in current.nodes.items():
         node = plan.nodes[node_id]
@@ -1198,6 +1204,101 @@ def _validate_edge_and_winner_transition(
 
 
 EdgeWitnesses = dict[str, dict[str, ArtifactRuntime]]
+
+
+def validate_node_evidence_delta(
+    plan: CompiledPlan,
+    before: RunState | None,
+    after: RunState,
+    event_type: str,
+    payload: Mapping[str, object],
+    prior_events: Sequence[WorkflowEvent],
+    witnesses: EdgeWitnesses,
+) -> None:
+    """Check claims/completions across every event name, both commit and replay."""
+    if before is None:
+        return
+    derived = None
+    for node_id, node in plan.nodes.items():
+        if node.type not in {"task", "validator"}:
+            continue
+        earlier, current = before.nodes[node_id], after.nodes[node_id]
+        if current.status is NodeStatus.SKIPPED and earlier.status not in {NodeStatus.RUNNING, NodeStatus.SKIPPED}:
+            if event_type not in {"node_result_recorded", "condition_selected", "join_succeeded"}:
+                if event_type not in {"readiness_refreshed", "artifact_registered", "fact_recorded", "decision_recorded"}:
+                    raise StoreError("events.invalid_completion", "event cannot exclude a task branch")
+                if derived is None:
+                    derived = refresh_ready(plan, replace(before, artifacts=after.artifacts,
+                                                          decisions=after.decisions, project_booleans=after.project_booleans))
+                if current != derived.nodes[node_id]:
+                    raise StoreError("events.invalid_completion", "skipped task is not a derived branch exclusion")
+        if current.status is NodeStatus.FAILED and earlier.status is not NodeStatus.FAILED:
+            if earlier.status is not NodeStatus.RUNNING or event_type != "node_result_recorded":
+                raise StoreError("events.invalid_completion", "execution failure requires a receipted running attempt")
+        if (earlier.status is current.status and earlier.status in {
+                NodeStatus.RUNNING, NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED
+            } and earlier != current):
+            raise StoreError("events.invalid_evidence", "an existing attempt's frozen evidence changed")
+        if earlier.status is NodeStatus.RUNNING and current.status is NodeStatus.BLOCKED and event_type != "recovery_running_blocked":
+            raise StoreError("events.invalid_evidence", "only recovery may block an interrupted attempt")
+        if earlier.attempt != current.attempt and event_type != "node_claimed":
+            raise StoreError("events.invalid_claim", "only a claim may advance an attempt")
+    for artifact_id, artifact in after.artifacts.items():
+        earlier = before.artifacts.get(artifact_id)
+        if (artifact != earlier and artifact.producer_node_id != _EXTERNAL_PRODUCER
+                and artifact.state == "verified" and event_type != "node_result_recorded"):
+            raise StoreError("artifact.authority_invalid", "only a receipted result may introduce verified produced evidence")
+    claims = [node_id for node_id in plan.nodes if after.nodes[node_id].status is NodeStatus.RUNNING
+              and (before.nodes[node_id].status is not NodeStatus.RUNNING
+                   or before.nodes[node_id].attempt != after.nodes[node_id].attempt
+                   or before.nodes[node_id].claim_token_hash != after.nodes[node_id].claim_token_hash)]
+    terminals = [node_id for node_id in plan.nodes if before.nodes[node_id].status is NodeStatus.RUNNING
+                 and after.nodes[node_id].status in {NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED}]
+    try:
+        if claims or event_type == "node_claimed":
+            if len(claims) != 1 or event_type != "node_claimed":
+                raise StoreError("events.invalid_claim", "running attempt requires a dedicated claim event")
+            node_id = claims[0]
+            _lower_sha256(after.nodes[node_id].claim_token_hash, "events.invalid_claim")
+            claim = payload.get("claim_evidence")
+            if not isinstance(claim, Mapping):
+                raise StoreError("events.invalid_claim", "claim evidence is missing")
+            started = claim.get("started_at")
+            if not isinstance(started, str) or not started.endswith("Z"):
+                raise StoreError("events.invalid_claim", "claim start timestamp is invalid")
+            try:
+                datetime.fromisoformat(started.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise StoreError("events.invalid_claim", "claim start timestamp is invalid") from exc
+            expected = claim_transition(plan, before, node_id, "evidence-verification")
+            nodes = dict(expected.nodes)
+            nodes[node_id] = replace(nodes[node_id], claim_token_hash=after.nodes[node_id].claim_token_hash)
+            expected = replace(expected, nodes=nodes)
+            if expected != after or _json_value(claim) != build_claim_evidence(plan, after, node_id, witnesses, started):
+                raise StoreError("events.invalid_claim", "claim differs from scheduler or frozen input evidence")
+        if terminals or event_type == "node_result_recorded":
+            if len(terminals) != 1 or event_type != "node_result_recorded":
+                raise StoreError("events.invalid_completion", "terminal attempt requires a receipted completion event")
+            node_id = terminals[0]
+            receipt = validate_stage_receipt(payload.get("receipt"))
+            digest = _lower_sha256(payload.get("result_sha256"), "events.invalid_completion")
+            claim_seq = payload.get("claim_event_seq")
+            matching = [event for event in prior_events if event.event_type == "node_claimed"
+                        and event.payload.get("claim_evidence", {}).get("node_id") == node_id
+                        and event.payload.get("claim_evidence", {}).get("attempt") == after.nodes[node_id].attempt]
+            if len(matching) != 1 or type(claim_seq) is not int or matching[0].event_seq != claim_seq:
+                raise StoreError("events.invalid_completion", "completion lacks one matching claim")
+            if any(event.event_type == "node_result_recorded" and event.payload.get("claim_event_seq") == claim_seq for event in prior_events):
+                raise StoreError("events.invalid_completion", "attempt already completed")
+            claim = matching[0].payload["claim_evidence"]
+            if before.nodes[node_id].claim_token_hash != claim["claim_token_sha256"]:
+                raise StoreError("events.invalid_completion", "claim token hash differs from running attempt")
+            expected = build_stage_receipt(plan, after, node_id, claim, summary=receipt["summary"],
+                                           uncertainties=receipt["uncertainties"], completed_at=receipt["completed_at"], error=receipt["error"])
+            if receipt != expected or not digest:
+                raise StoreError("events.invalid_completion", "receipt differs from claim and post-state")
+    except (ReceiptError, WorkflowError, KeyError, TypeError, ValueError) as exc:
+        raise StoreError("events.invalid_evidence", str(exc)) from exc
 
 
 def _edge_witnesses_after_step(
@@ -1374,6 +1475,7 @@ class WorkflowStore:
             summary=run_dir / "summary.md",
             recovery=run_dir / "recovery",
             archived_runs=base / "runs",
+            receipts=base / "receipts",
         )
 
     def _relative(self, path: Path) -> str:
@@ -2217,6 +2319,7 @@ class WorkflowStore:
                 previous_status,
                 previous_state,
                 witnesses,
+                events[:event.event_seq - 1],
             )
             if event.event_seq == sequence:
                 boundary_witnesses = {
@@ -2239,6 +2342,7 @@ class WorkflowStore:
             self._artifact_drift_ids(state) or self._witness_drift_producers(boundary_witnesses)
         ):
             raise StoreError("recovery.required", "artifact bytes must be recovered before mutation")
+        self._receipt_material(events, require_existing=require_no_suffix)
         return plan, state, sequence, event_hash, run_status, events, tail, prefix, boundary_witnesses
 
     def _replay_candidate(
@@ -2249,6 +2353,7 @@ class WorkflowStore:
         previous_status: str | None,
         previous_state: RunState | None,
         witnesses: EdgeWitnesses,
+        prior_events: Sequence[WorkflowEvent] = (),
     ) -> tuple[RunState, str]:
         raw_state = event.payload.get("state")
         if not isinstance(raw_state, Mapping):
@@ -2277,6 +2382,7 @@ class WorkflowStore:
             except PathSafetyError as exc:
                 raise StoreError("events.unreplayable", "event artifact path is unsafe") from exc
         _validate_artifact_authority(plan, state)
+        validate_node_evidence_delta(plan, previous_state, state, event.event_type, event.payload, prior_events, witnesses)
         _validate_edge_and_winner_transition(
             plan, previous_state, state, event.event_type, event.payload
         )
@@ -2289,6 +2395,48 @@ class WorkflowStore:
         witnesses.clear()
         witnesses.update(next_witnesses)
         return state, run_status
+
+    def _receipt_material(
+        self, events: Sequence[WorkflowEvent], *, require_existing: bool = False,
+    ) -> dict[Path, bytes]:
+        material = {}
+        for event in events:
+            if event.event_type != "node_result_recorded":
+                continue
+            try:
+                receipt = validate_stage_receipt(event.payload.get("receipt"))
+            except ReceiptError as exc:
+                raise StoreError("receipt.invalid", str(exc)) from exc
+            path = self.paths.receipts / receipt["run_id"] / f'{receipt["node_id"]}-attempt-{receipt["attempt"]}.json'
+            self._checked(path)
+            raw = canonical_bytes(receipt) + b"\n"
+            if path in material:
+                raise StoreError("receipt.conflict", "duplicate attempt receipt")
+            material[path] = raw
+            if path.exists():
+                if path.read_bytes() != raw:
+                    raise StoreError("receipt.conflict", "receipt projection differs from committed event")
+            elif require_existing:
+                raise StoreError("recovery.required", "committed receipt projection is missing")
+        if events:
+            directory = self.paths.receipts / events[0].run_id
+            self._checked(directory)
+            if directory.exists():
+                for path in directory.iterdir():
+                    self._checked(path)
+                    if path not in material:
+                        raise StoreError("receipt.orphan", "receipt file lacks a committed completion event")
+        return material
+
+    def _write_receipts(self, material: Mapping[Path, bytes]) -> bool:
+        changed = False
+        for path, raw in material.items():
+            self._checked(path)
+            if not path.exists():
+                self._ensure_locked_directory(path.parent)
+                self._atomic_bytes(path, raw)
+                changed = True
+        return changed
 
     def _write_projections(
         self,
@@ -2681,7 +2829,8 @@ class WorkflowStore:
             try:
                 for event in suffix:
                     candidate, next_status = self._replay_candidate(
-                        plan, event, expected_run_id, previous_status, previous_state, witnesses
+                        plan, event, expected_run_id, previous_status, previous_state, witnesses,
+                        events[:event.event_seq - 1],
                     )
                     if expected_run_id is None:
                         expected_run_id = candidate.run_id
@@ -2696,6 +2845,11 @@ class WorkflowStore:
             if state is None:
                 return RecoveryResult("blocked", "recovery.incomplete_run")
             replayed = bool(suffix)
+
+            try:
+                receipt_material = self._receipt_material(events)
+            except StoreError as exc:
+                return RecoveryResult("blocked", exc.code, state)
 
             if tail is not None:
                 try:
@@ -2764,6 +2918,7 @@ class WorkflowStore:
                     archived,
                 )
             try:
+                changed = self._write_receipts(receipt_material) or changed
                 self._write_projections(state, run_status)
             except StoreError as exc:
                 return RecoveryResult("blocked", exc.code, state, archived)
@@ -2890,6 +3045,8 @@ class WorkflowTransaction:
         self.store._require_verified_artifact_bytes(updated_state)
         self.store._require_artifact_paths_contained(updated_state)
         _validate_artifact_authority(plan, updated_state)
+        validate_node_evidence_delta(plan, current, updated_state, event_type, payload,
+                                     self._events, self._witnesses if witnesses is None else witnesses)
         _validate_edge_and_winner_transition(
             plan, current, updated_state, event_type, payload
         )
@@ -2970,6 +3127,7 @@ class WorkflowTransaction:
             snapshot, projections = self._preflight_snapshot_and_projections(
                 updated_state, event, status
             )
+        receipt_material = self.store._receipt_material([*self._events, event])
         try:
             self.store._append_event(self.store.paths.events, event)
         except Exception:
@@ -2987,6 +3145,7 @@ class WorkflowTransaction:
                 self.store._write_projections(
                     updated_state, status, prepared=projections
                 )
+                self.store._write_receipts(receipt_material)
             except Exception:
                 self._lease_active = False
                 raise
@@ -2999,6 +3158,18 @@ class WorkflowTransaction:
         payload: Mapping[str, object] | None = None,
     ) -> WorkflowEvent:
         return self._commit_event(event_type, updated_state, {} if payload is None else payload)
+
+    def commit_receipted_transition(self, event_type, updated_state, receipt, *, result_sha256, claim_event_seq):
+        if event_type != "node_result_recorded":
+            raise StoreError("events.invalid_completion", "unsupported receipt event type")
+        return self._commit_event(event_type, updated_state, {
+            "receipt": receipt, "result_sha256": result_sha256, "claim_event_seq": claim_event_seq,
+        })
+
+    def input_witnesses(self):
+        """Return an immutable copy of the verified, lock-scoped route evidence."""
+        self._require_loaded()
+        return MappingProxyType({edge_id: MappingProxyType(dict(items)) for edge_id, items in self._witnesses.items()})
 
     @staticmethod
     def _apply_control(

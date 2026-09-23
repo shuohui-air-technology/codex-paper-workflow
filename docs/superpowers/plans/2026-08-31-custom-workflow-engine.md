@@ -1218,6 +1218,13 @@ git commit -m "feat: persist custom workflow state"
 
 ### Task 7: Enforce invocation and result receipts through the manager CLI
 
+Implementation is reviewed in sequential slices: **7A** provides strict task
+invocation/result/receipt codecs, task service operations, claim/completion event
+authority, receipt projection recovery, and adversarial replay tests; **7B**
+adds the approved validator form/adapter contract; **7C** adds stale-rerun,
+remaining service operations, and the full JSON CLI. The command examples below
+describe the integrated Task 7 target, not the availability of the 7A slice.
+
 **Files:**
 - Create: `scripts/workflow_engine/receipts.py`
 - Create: `scripts/workflow_engine/validators.py`
@@ -1263,7 +1270,7 @@ class WorkflowManagerTests(unittest.TestCase):
             }
             receipt = service.submit_result(result)
             self.assertEqual(receipt["schema_version"], "stage-receipt-v2")
-            self.assertEqual(receipt["artifacts"][0]["sha256"], sha256_file(output))
+            self.assertEqual(receipt["output_artifacts"][0]["sha256"], sha256_file(output))
             self.assertEqual(service.submit_result(result), receipt)
 ```
 
@@ -1292,9 +1299,9 @@ Validate exact keys, bounded text, current run/node/attempt, declared outcome, t
 
 Every `stage-receipt-v2` contains exactly: schema version, workflow ID,
 semantic revision/hash, run ID, node ID/type, attempt, resolved Skill or
-validator identity, input artifact IDs/paths/hashes, output artifact
+validator identity, claim token SHA-256, input artifact target/source IDs/paths/hashes, output artifact
 IDs/paths/hashes, status, named outcome, start/completion UTC timestamps,
-summary, uncertainties, and structured error when present. Receipt creation and
+summary, uncertainties, and an error field (`null` or structured `code/message`). Receipt creation and
 artifact-registry updates occur in one locked transition; event recovery can
 reconstruct the same `ArtifactRuntime` entries from the receipt hashes.
 

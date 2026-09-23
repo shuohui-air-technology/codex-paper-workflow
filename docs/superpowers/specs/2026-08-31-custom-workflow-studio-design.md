@@ -274,6 +274,25 @@ attempt, input hashes, result schema, declared outcome, and project-contained
 paths. The store computes output hashes itself. An exact duplicate submission is
 idempotent; a stale attempt or mismatched token is rejected.
 
+The task result has exactly `schema_version`, `run_id`, `node_id`, `attempt`,
+`idempotency_token`, `status`, `outcome`, `summary`, `artifacts`, and
+`uncertainties`, with an optional `error`. Each submitted artifact has only `id`
+and `path`; a client-supplied hash is invalid. A failed result requires an empty
+outcome and artifact list plus a structured `error` with exactly `code` and
+`message`. A successful result has no execution error. Envelopes are limited to
+1 MiB, report text to 4,000 characters per string, and artifact/uncertainty lists
+to 1,000 entries; duplicate JSON members and non-finite numbers are invalid.
+
+The `node_claimed` event freezes the selected input target/source IDs, paths and
+hashes, resolved Skill identity, expected outputs/outcomes, attempt, token hash,
+and UTC start time. The plaintext token is returned only in the validated
+`node-invocation-v1` envelope. A `node_result_recorded` event carries the strict
+receipt, canonical result digest, matching claim event sequence, and complete
+scheduler-derived state. Commit and complete-chain recovery both check these
+relationships for every event name; a generic event cannot bypass the claim or
+completion evidence checks. Pre-release bare custom claim/result events are not
+accepted as completion authority.
+
 A task succeeds only when the submitted result is valid and every required
 output is present and verified. A task with no file output still requires a
 structured result summary in its receipt. Task results may select only outcomes
@@ -522,6 +541,23 @@ A node receipt binds at least:
 - status or named outcome;
 - start and completion timestamps; and
 - structured error or uncertainty data when present.
+
+For `stage-receipt-v2`, the exact top-level fields are `schema_version`,
+`workflow_id`, `semantic_revision`, `semantic_sha256`, `run_id`, `node_id`,
+`node_type`, `attempt`, `claim_token_sha256`, `resolved_identity`,
+`input_artifacts`, `output_artifacts`, `status`, `outcome`, `started_at`,
+`completed_at`, `summary`, `uncertainties`, and `error`. Input entries contain
+exactly `id`, `source_id`, `path`, and `sha256`; output entries contain exactly
+`id`, `path`, and `sha256`. Receipt artifact lists are sorted by unique ID.
+Timestamps use UTC with a `Z` suffix. `error` is `null` or exactly a `code` and
+`message` object. The receipt's token hash must equal its claim and running
+attempt; plaintext tokens are never persisted.
+
+The validated completion event is the receipt authority. The receipt JSON file
+is its exact canonical projection, written after the append/fsync commit point.
+Recovery recreates a missing projection only from a verified event; conflicting
+or orphaned files block recovery without overwriting them. An old receipt does
+not reactivate a stale or superseded attempt.
 
 ## 13. Crash recovery and stale propagation
 
