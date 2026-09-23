@@ -32,7 +32,9 @@ from scripts.workflow_engine.scheduler import (
     EdgeRuntime,
     EdgeStatus,
     NodeStatus,
+    claim_transition,
     initial_run,
+    result_transition,
     stabilize_control_nodes,
 )
 from scripts.workflow_engine.schema import document_sha256, parse_workflow
@@ -141,6 +143,21 @@ def produced_artifact_plan():
         topological_order=("producer", "consumer"),
         max_parallelism=1,
     )
+
+
+def append_rehashed_state_event(store, state, event_type="artifact_registered"):
+    prior = json.loads(store.paths.events.read_text(encoding="utf-8").splitlines()[-1])
+    forged = WorkflowEvent.create(
+        event_seq=prior["event_seq"] + 1,
+        run_id=prior["run_id"],
+        semantic_sha256=prior["semantic_sha256"],
+        event_type=event_type,
+        payload={"state": state, "run_status": "active"},
+        previous_event_hash=prior["event_hash"],
+    )
+    with store.paths.events.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(forged.to_payload(), sort_keys=True, separators=(",", ":")) + "\n")
+    return forged
 
 
 def validator_plan():
@@ -2105,6 +2122,253 @@ class WorkflowStoreTests(unittest.TestCase):
             )
             self.assertEqual(store.paths.events.read_bytes(), events_before)
             self.assertEqual(store.paths.state.read_bytes(), state_before)
+
+    def test_verified_produced_artifact_requires_completed_matching_attempt(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("draft.txt").write_bytes(b"draft")
+            store = WorkflowStore(root)
+            store.start_run(task_plan(), "run-unfinished-producer")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                running = replace(
+                    state.nodes["produce"],
+                    status=NodeStatus.RUNNING,
+                    attempt=1,
+                    claim_token_hash=sha256_bytes(b"claim"),
+                )
+                forged = replace(
+                    state,
+                    nodes=MappingProxyType({"produce": running}),
+                    artifacts=MappingProxyType({
+                        "draft": ArtifactRuntime(
+                            "draft", "draft.txt", sha256_bytes(b"draft"),
+                            "verified", "produce", 1,
+                        )
+                    }),
+                )
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", forged)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                self.assertEqual(
+                    (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                )
+
+            append_rehashed_state_event(store, workflow_store._state_data(forged))
+            with store.paths.events.open("ab") as handle:
+                handle.write(b'{"event_seq":3,"partial"')
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual((recovered.status, recovered.code), ("blocked", "artifact.authority_invalid"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+            self.assertFalse(store.paths.recovery.exists())
+
+    def test_produced_artifact_path_must_equal_completed_output_path(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("declared.txt").write_bytes(b"declared")
+            root.joinpath("other.txt").write_bytes(b"other")
+            store = WorkflowStore(root)
+            store.start_run(task_plan(), "run-output-path-mismatch")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                completed = replace(
+                    state.nodes["produce"], status=NodeStatus.SUCCEEDED,
+                    attempt=1, outputs=MappingProxyType({"draft": "declared.txt"}),
+                )
+                forged = replace(
+                    state,
+                    nodes=MappingProxyType({"produce": completed}),
+                    artifacts=MappingProxyType({
+                        "draft": ArtifactRuntime(
+                            "draft", "other.txt", sha256_bytes(b"other"),
+                            "verified", "produce", 1,
+                        )
+                    }),
+                )
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("result_forged", forged)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                self.assertEqual(
+                    (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                )
+
+            event = append_rehashed_state_event(
+                store, workflow_store._state_data(forged), "result_forged"
+            )
+            snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+            snapshot["state"] = workflow_store._state_data(forged)
+            snapshot["last_applied_event_seq"] = event.event_seq
+            snapshot["last_applied_event_hash"] = event.event_hash
+            store.paths.state.write_text(
+                json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual((recovered.status, recovered.code), ("blocked", "artifact.authority_invalid"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_historical_produced_receipt_forgery_blocks_valid_later_boundary(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("declared.txt").write_bytes(b"declared")
+            root.joinpath("other.txt").write_bytes(b"other")
+            store = WorkflowStore(root)
+            store.start_run(task_plan(), "run-historical-forgery")
+            first = json.loads(store.paths.events.read_text(encoding="utf-8"))
+            forged = copy.deepcopy(first["payload"]["state"])
+            forged["nodes"]["produce"].update({
+                "status": "succeeded", "attempt": 1,
+                "outputs": {"draft": "declared.txt"},
+            })
+            forged["artifacts"]["draft"] = {
+                "artifact_id": "draft", "path": "other.txt",
+                "sha256": sha256_bytes(b"other"), "state": "verified",
+                "producer_node_id": "produce", "producer_attempt": 1,
+            }
+            append_rehashed_state_event(store, forged, "result_forged")
+            last = append_rehashed_state_event(
+                store, first["payload"]["state"], "fact_recorded"
+            )
+            snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+            snapshot["last_applied_event_seq"] = last.event_seq
+            snapshot["last_applied_event_hash"] = last.event_hash
+            store.paths.state.write_text(
+                json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            result = WorkflowStore(root).recover()
+            self.assertEqual((result.status, result.code), ("blocked", "artifact.authority_invalid"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_same_id_external_refinement_requires_stale_lineage_on_reregistration(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"external")
+            root.joinpath("first.txt").write_bytes(b"refined")
+            root.joinpath("second.txt").write_bytes(b"sibling")
+            plan = replace(produced_artifact_plan(), external_inputs=("first",))
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-refine-external")
+            external = ArtifactRuntime(
+                "first", "old.txt", sha256_bytes(b"external"), "verified", "external", 0
+            )
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                registered = replace(state, artifacts=MappingProxyType({"first": external}))
+                transaction.commit_transition("artifact_registered", registered)
+                running = claim_transition(plan, registered, "producer", "producer-token")
+                transaction.commit_transition("node_claimed", running)
+                produced = result_transition(plan, running, {
+                    "node_id": "producer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded",
+                    "outputs": {"first": "first.txt", "second": "second.txt"},
+                    "artifacts": [
+                        ArtifactRuntime("first", "first.txt", sha256_bytes(b"refined"), "verified", "producer", 1),
+                        ArtifactRuntime("second", "second.txt", sha256_bytes(b"sibling"), "verified", "producer", 1),
+                    ],
+                })
+                transaction.commit_transition("node_result", produced)
+                consumer_running = claim_transition(plan, produced, "consumer", "consumer-token")
+                transaction.commit_transition("node_claimed", consumer_running)
+                complete = result_transition(plan, consumer_running, {
+                    "node_id": "consumer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {}, "artifacts": [],
+                })
+                transaction.commit_transition("node_result", complete)
+                self.assertEqual(complete.artifacts["first"].producer_node_id, "producer")
+                unsafe = replace(complete, artifacts=MappingProxyType({
+                    **complete.artifacts, "first": external,
+                }))
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", unsafe)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+                stale_nodes = {
+                    node_id: replace(runtime, status=NodeStatus.STALE)
+                    for node_id, runtime in complete.nodes.items()
+                }
+                legitimate = replace(
+                    complete,
+                    nodes=MappingProxyType(stale_nodes),
+                    artifacts=MappingProxyType({
+                        "first": external,
+                        "second": replace(complete.artifacts["second"], state="stale"),
+                    }),
+                )
+                incomplete_consumer = replace(
+                    legitimate,
+                    nodes=MappingProxyType({
+                        **legitimate.nodes,
+                        "consumer": complete.nodes["consumer"],
+                    }),
+                )
+                incomplete_sibling = replace(
+                    legitimate,
+                    artifacts=MappingProxyType({
+                        **legitimate.artifacts,
+                        "second": complete.artifacts["second"],
+                    }),
+                )
+                missing_prior_receipt = replace(
+                    complete,
+                    artifacts=MappingProxyType({"second": complete.artifacts["second"]}),
+                )
+                for name, event_type, candidate in (
+                    ("dependent", "artifact_registered", incomplete_consumer),
+                    ("sibling", "artifact_registered", incomplete_sibling),
+                    ("explicit_event", "fact_recorded", legitimate),
+                    ("deletion", "artifact_registered", missing_prior_receipt),
+                ):
+                    with self.subTest(name=name):
+                        before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                        with self.assertRaises(StoreError) as caught:
+                            transaction.commit_transition(event_type, candidate)
+                        self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                        self.assertEqual(
+                            (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                        )
+                transaction.commit_transition("artifact_registered", legitimate)
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+
+    def test_rehashed_produced_to_external_flip_blocks_before_tail_rewrite(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"old")
+            root.joinpath("new.txt").write_bytes(b"new")
+            plan = replace(task_plan(), external_inputs=("draft",))
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-flip-suffix")
+            old = ArtifactRuntime("draft", "old.txt", sha256_bytes(b"old"), "verified", "external", 0)
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                registered = replace(state, artifacts=MappingProxyType({"draft": old}))
+                transaction.commit_transition("artifact_registered", registered)
+                running = claim_transition(plan, registered, "produce", "token")
+                transaction.commit_transition("node_claimed", running)
+                completed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "new.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "new.txt", sha256_bytes(b"new"), "verified", "produce", 1
+                    )],
+                })
+                transaction.commit_transition("node_result", completed)
+            forged = replace(completed, artifacts=MappingProxyType({"draft": old}))
+            append_rehashed_state_event(store, workflow_store._state_data(forged))
+            with store.paths.events.open("ab") as handle:
+                handle.write(b'{"event_seq":6,"partial"')
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual((recovered.status, recovered.code), ("blocked", "artifact.authority_invalid"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+            self.assertFalse(store.paths.recovery.exists())
 
     def test_recovery_blocks_uncertain_running_work(self):
         with TemporaryDirectory() as temporary:

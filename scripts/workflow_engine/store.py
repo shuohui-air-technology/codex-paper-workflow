@@ -1014,6 +1014,11 @@ def _validate_artifact_authority(plan: CompiledPlan, state: RunState) -> None:
                 and artifact_id in producer.outputs
                 and artifact.producer_attempt > 0
                 and artifact.producer_attempt == runtime.attempt
+                and runtime.outputs.get(artifact_id) == artifact.path
+                and (
+                    artifact.state != "verified"
+                    or runtime.status is NodeStatus.SUCCEEDED
+                )
             )
         if not valid:
             raise StoreError(
@@ -1958,12 +1963,14 @@ class WorkflowStore:
                 raise StoreError("path.unsafe", "runtime artifact path is not project-contained") from exc
         _validate_artifact_authority(plan, state)
         previous_status: str | None = None
+        previous_state: RunState | None = None
         for event in events:
-            _candidate, previous_status = self._replay_candidate(
+            previous_state, previous_status = self._replay_candidate(
                 plan,
                 event,
                 state.run_id,
                 previous_status,
+                previous_state,
             )
         boundary = next((event for event in events if event.event_seq == sequence), None)
         if boundary is None or boundary.event_hash != event_hash:
@@ -1988,6 +1995,7 @@ class WorkflowStore:
         event: WorkflowEvent,
         expected_run_id: str | None,
         previous_status: str | None,
+        previous_state: RunState | None,
     ) -> tuple[RunState, str]:
         raw_state = event.payload.get("state")
         if not isinstance(raw_state, Mapping):
@@ -2016,6 +2024,9 @@ class WorkflowStore:
             except PathSafetyError as exc:
                 raise StoreError("events.unreplayable", "event artifact path is unsafe") from exc
         _validate_artifact_authority(plan, state)
+        self._validate_artifact_source_transition(
+            plan, previous_state, state, event.event_type
+        )
         return state, run_status
 
     def _write_projections(
@@ -2096,6 +2107,66 @@ class WorkflowStore:
             return any(WorkflowStore._predicate_mentions_artifact(item, artifact_id) for item in value)
         return False
 
+    def _validate_artifact_source_transition(
+        self,
+        plan: CompiledPlan,
+        previous: RunState | None,
+        current: RunState,
+        event_type: str,
+    ) -> None:
+        if previous is None:
+            return
+        for artifact_id, earlier in previous.artifacts.items():
+            replacement = current.artifacts.get(artifact_id)
+            if replacement is None:
+                raise StoreError(
+                    "artifact.authority_invalid",
+                    f"artifact provenance cannot be removed: {artifact_id}",
+                )
+            if (
+                earlier.producer_node_id == _EXTERNAL_PRODUCER
+                or replacement.producer_node_id != _EXTERNAL_PRODUCER
+            ):
+                continue
+            if event_type != "artifact_registered" or replacement.state != "verified":
+                raise StoreError(
+                    "artifact.authority_invalid",
+                    f"produced artifact needs explicit external re-registration: {artifact_id}",
+                )
+
+            affected = {earlier.producer_node_id}
+            for node_id, node in plan.nodes.items():
+                if artifact_id in node.inputs or any(
+                    self._predicate_mentions_artifact(case, artifact_id)
+                    for case in node.condition_cases
+                ):
+                    affected.add(node_id)
+            pending = list(affected)
+            while pending:
+                for edge_id in plan.outgoing[pending.pop()]:
+                    target = plan.edges[edge_id].target
+                    if target not in affected:
+                        affected.add(target)
+                        pending.append(target)
+            if any(current.nodes[node_id].status is not NodeStatus.STALE for node_id in affected):
+                raise StoreError(
+                    "artifact.authority_invalid",
+                    f"external re-registration must stale the prior lineage: {artifact_id}",
+                )
+            for sibling_id, sibling in previous.artifacts.items():
+                if sibling_id == artifact_id:
+                    continue
+                present_sibling = current.artifacts.get(sibling_id)
+                if (
+                    (sibling.producer_node_id, sibling.producer_attempt)
+                    == (earlier.producer_node_id, earlier.producer_attempt)
+                    or sibling.producer_node_id in affected
+                ) and (present_sibling is None or present_sibling.state != "stale"):
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"external re-registration must stale related evidence: {sibling_id}",
+                    )
+
     def _mark_drift(self, plan: CompiledPlan, state: RunState, drifted: Sequence[str]) -> RunState:
         artifacts = dict(state.artifacts)
         direct: set[str] = set()
@@ -2163,6 +2234,7 @@ class WorkflowStore:
                 expected_run_id: str | None = state.run_id
                 suffix = [event for event in events if event.event_seq > sequence]
                 previous_status: str | None = run_status
+                previous_state: RunState | None = state
             else:
                 try:
                     raw_plan = self._read_json(self.paths.plan, "plan.invalid")
@@ -2188,13 +2260,14 @@ class WorkflowStore:
                 expected_run_id = None
                 suffix = events
                 previous_status = None
+                previous_state = None
 
             # Validate the entire replay suffix before any tail archive, log
             # truncation, snapshot replacement, or projection regeneration.
             try:
                 for event in suffix:
                     candidate, next_status = self._replay_candidate(
-                        plan, event, expected_run_id, previous_status
+                        plan, event, expected_run_id, previous_status, previous_state
                     )
                     if expected_run_id is None:
                         expected_run_id = candidate.run_id
@@ -2203,6 +2276,7 @@ class WorkflowStore:
                     event_hash = event.event_hash
                     run_status = next_status
                     previous_status = next_status
+                    previous_state = candidate
             except StoreError as exc:
                 return RecoveryResult("blocked", exc.code, state)
             if state is None:
@@ -2389,6 +2463,9 @@ class WorkflowTransaction:
         self.store._require_verified_artifact_bytes(updated_state)
         self.store._require_artifact_paths_contained(updated_state)
         _validate_artifact_authority(plan, updated_state)
+        self.store._validate_artifact_source_transition(
+            plan, current, updated_state, event_type
+        )
         if updated_state.run_id != current.run_id:
             raise StoreError(
                 "snapshot.run_mismatch", "updated runtime state belongs to another run"
