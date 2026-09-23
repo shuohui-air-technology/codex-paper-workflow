@@ -2123,18 +2123,27 @@ class WorkflowStore:
                     "artifact.authority_invalid",
                     f"artifact provenance cannot be removed: {artifact_id}",
                 )
+            if replacement.producer_node_id != _EXTERNAL_PRODUCER:
+                continue
+            if earlier == replacement:
+                continue
             if (
                 earlier.producer_node_id == _EXTERNAL_PRODUCER
-                or replacement.producer_node_id != _EXTERNAL_PRODUCER
+                and earlier.path == replacement.path
+                and earlier.sha256 == replacement.sha256
+                and replacement.state == "stale"
+                and event_type == "artifacts_marked_stale"
             ):
                 continue
             if event_type != "artifact_registered" or replacement.state != "verified":
                 raise StoreError(
                     "artifact.authority_invalid",
-                    f"produced artifact needs explicit external re-registration: {artifact_id}",
+                    f"changed external artifact needs explicit re-registration: {artifact_id}",
                 )
 
-            affected = {earlier.producer_node_id}
+            affected = set()
+            if earlier.producer_node_id != _EXTERNAL_PRODUCER:
+                affected.add(earlier.producer_node_id)
             for node_id, node in plan.nodes.items():
                 if artifact_id in node.inputs or any(
                     self._predicate_mentions_artifact(case, artifact_id)
@@ -2148,11 +2157,55 @@ class WorkflowStore:
                     if target not in affected:
                         affected.add(target)
                         pending.append(target)
-            if any(current.nodes[node_id].status is not NodeStatus.STALE for node_id in affected):
-                raise StoreError(
-                    "artifact.authority_invalid",
-                    f"external re-registration must stale the prior lineage: {artifact_id}",
-                )
+            refreshed: RunState | None = None
+            for node_id in affected:
+                before = previous.nodes[node_id]
+                after = current.nodes[node_id]
+                if before.status is NodeStatus.RUNNING or after.status is NodeStatus.RUNNING:
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"external re-registration cannot continue running work: {node_id}",
+                    )
+                if before.status in {NodeStatus.SUCCEEDED, NodeStatus.SKIPPED, NodeStatus.STALE}:
+                    valid_status = after.status is NodeStatus.STALE
+                elif before.status in {NodeStatus.PENDING, NodeStatus.READY}:
+                    valid_status = after.status in {NodeStatus.PENDING, NodeStatus.READY}
+                else:
+                    valid_status = after.status in {before.status, NodeStatus.STALE}
+                if not valid_status:
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"external re-registration must invalidate completed evidence: {node_id}",
+                    )
+                for edge_id in plan.outgoing[node_id]:
+                    edge = current.edges[edge_id]
+                    if edge.status is not EdgeStatus.WAITING or edge.selected_output_map:
+                        raise StoreError(
+                            "artifact.authority_invalid",
+                            f"external re-registration must reset old output route: {edge_id}",
+                        )
+                if after.status is NodeStatus.PENDING and after.selected_inputs:
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"pending work retains superseded inputs: {node_id}",
+                    )
+                if after.status is NodeStatus.READY:
+                    if refreshed is None:
+                        refreshed = refresh_ready(plan, current)
+                    expected = refreshed.nodes[node_id]
+                    if (
+                        expected.status is not NodeStatus.READY
+                        or expected.selected_inputs != after.selected_inputs
+                    ):
+                        raise StoreError(
+                            "artifact.authority_invalid",
+                            f"ready work retains superseded inputs: {node_id}",
+                        )
+                if after.status in {NodeStatus.FAILED, NodeStatus.BLOCKED} and after.selected_inputs:
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"unfinished work retains superseded inputs: {node_id}",
+                    )
             for sibling_id, sibling in previous.artifacts.items():
                 if sibling_id == artifact_id:
                     continue

@@ -35,6 +35,7 @@ from scripts.workflow_engine.scheduler import (
     claim_transition,
     initial_run,
     result_transition,
+    refresh_ready,
     stabilize_control_nodes,
 )
 from scripts.workflow_engine.schema import document_sha256, parse_workflow
@@ -143,6 +144,47 @@ def produced_artifact_plan():
         topological_order=("producer", "consumer"),
         max_parallelism=1,
     )
+
+
+def external_consumer_plan():
+    consumer = compiled_node("consumer", entry=True, inputs=("source",), outputs=("draft",))
+    return CompiledPlan(
+        workflow_id="external-consumer-flow",
+        semantic_revision=1,
+        document_sha256=sha256_bytes(b"external-consumer-document"),
+        semantic_sha256=sha256_bytes(b"external-consumer-plan"),
+        external_inputs=("source",),
+        nodes=MappingProxyType({"consumer": consumer}),
+        edges=MappingProxyType({}),
+        incoming=MappingProxyType({"consumer": ()}),
+        outgoing=MappingProxyType({"consumer": ()}),
+        topological_order=("consumer",),
+        max_parallelism=1,
+    )
+
+
+def complete_external_consumer(store, plan):
+    source = ArtifactRuntime(
+        "source", "old.txt", sha256_bytes(b"old"), "verified", "external", 0
+    )
+    with store.locked_run() as transaction:
+        _, state = transaction.load_active_run()
+        registered = refresh_ready(
+            plan, replace(state, artifacts=MappingProxyType({"source": source}))
+        )
+        transaction.commit_transition("artifact_registered", registered)
+        running = claim_transition(plan, registered, "consumer", "consumer-token")
+        transaction.commit_transition("node_claimed", running)
+        complete = result_transition(plan, running, {
+            "node_id": "consumer", "attempt": 1, "status": "succeeded",
+            "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+            "artifacts": [ArtifactRuntime(
+                "draft", "draft.txt", sha256_bytes(b"draft"),
+                "verified", "consumer", 1,
+            )],
+        })
+        transaction.commit_transition("node_result", complete)
+        return complete
 
 
 def append_rehashed_state_event(store, state, event_type="artifact_registered"):
@@ -2245,6 +2287,279 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual((result.status, result.code), ("blocked", "artifact.authority_invalid"))
             self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
 
+    def test_produced_to_external_reset_preserves_unfinished_consumer(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"old")
+            root.joinpath("first.txt").write_bytes(b"first")
+            root.joinpath("second.txt").write_bytes(b"second")
+            plan = replace(produced_artifact_plan(), external_inputs=("first",))
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-reset-unfinished")
+            external = ArtifactRuntime(
+                "first", "old.txt", sha256_bytes(b"old"), "verified", "external", 0
+            )
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                registered = replace(state, artifacts=MappingProxyType({"first": external}))
+                transaction.commit_transition("artifact_registered", registered)
+                running = claim_transition(plan, registered, "producer", "producer-token")
+                transaction.commit_transition("node_claimed", running)
+                produced = result_transition(plan, running, {
+                    "node_id": "producer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded",
+                    "outputs": {"first": "first.txt", "second": "second.txt"},
+                    "artifacts": [
+                        ArtifactRuntime("first", "first.txt", sha256_bytes(b"first"), "verified", "producer", 1),
+                        ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
+                    ],
+                })
+                transaction.commit_transition("node_result", produced)
+                self.assertEqual(produced.nodes["consumer"].status, NodeStatus.READY)
+                self.assertEqual(produced.nodes["consumer"].selected_inputs["first"], "first.txt")
+                reset_nodes = dict(produced.nodes)
+                reset_nodes["producer"] = replace(reset_nodes["producer"], status=NodeStatus.STALE)
+                reset_nodes["consumer"] = replace(
+                    reset_nodes["consumer"], status=NodeStatus.PENDING,
+                    selected_inputs=MappingProxyType({}),
+                )
+                reset = replace(
+                    produced,
+                    nodes=MappingProxyType(reset_nodes),
+                    edges=MappingProxyType({
+                        "producer-consumer": EdgeRuntime(EdgeStatus.WAITING),
+                    }),
+                    artifacts=MappingProxyType({
+                        "first": external,
+                        "second": replace(produced.artifacts["second"], state="stale"),
+                    }),
+                )
+                transaction.commit_transition("artifact_registered", reset)
+                self.assertEqual(refresh_ready(plan, reset).nodes["consumer"].status, NodeStatus.PENDING)
+                with self.assertRaises(Exception):
+                    claim_transition(plan, reset, "consumer", "must-wait-for-new-producer")
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+
+    def test_source_replacement_rejects_old_satisfied_edge_and_selected_input(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"old")
+            root.joinpath("first.txt").write_bytes(b"first")
+            root.joinpath("second.txt").write_bytes(b"second")
+            plan = replace(produced_artifact_plan(), external_inputs=("first",))
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-old-edge")
+            external = ArtifactRuntime("first", "old.txt", sha256_bytes(b"old"), "verified", "external", 0)
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                registered = replace(state, artifacts=MappingProxyType({"first": external}))
+                transaction.commit_transition("artifact_registered", registered)
+                running = claim_transition(plan, registered, "producer", "token")
+                transaction.commit_transition("node_claimed", running)
+                produced = result_transition(plan, running, {
+                    "node_id": "producer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"first": "first.txt", "second": "second.txt"},
+                    "artifacts": [
+                        ArtifactRuntime("first", "first.txt", sha256_bytes(b"first"), "verified", "producer", 1),
+                        ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
+                    ],
+                })
+                transaction.commit_transition("node_result", produced)
+                nodes = dict(produced.nodes)
+                nodes["producer"] = replace(nodes["producer"], status=NodeStatus.STALE)
+                nodes["consumer"] = replace(nodes["consumer"], status=NodeStatus.STALE)
+                stale = replace(
+                    produced, nodes=MappingProxyType(nodes),
+                    artifacts=MappingProxyType({
+                        "first": external,
+                        "second": replace(produced.artifacts["second"], state="stale"),
+                    }),
+                )
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as edge:
+                    transaction.commit_transition("artifact_registered", stale)
+                self.assertEqual(edge.exception.code, "artifact.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+                nodes["consumer"] = replace(
+                    nodes["consumer"], status=NodeStatus.READY,
+                    selected_inputs=MappingProxyType({"first": "first.txt"}),
+                )
+                stale_route = replace(
+                    stale, nodes=MappingProxyType(nodes),
+                    edges=MappingProxyType({"producer-consumer": EdgeRuntime(EdgeStatus.WAITING)}),
+                )
+                with self.assertRaises(StoreError) as selected:
+                    transaction.commit_transition("artifact_registered", stale_route)
+                self.assertEqual(selected.exception.code, "artifact.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_changed_external_registration_stales_completed_consumer_but_identical_is_idempotent(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, value in (("old.txt", b"old"), ("new.txt", b"new"), ("draft.txt", b"draft")):
+                root.joinpath(name).write_bytes(value)
+            plan = external_consumer_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-external-change")
+            complete = complete_external_consumer(store, plan)
+            with store.locked_run() as transaction:
+                _, current = transaction.load_active_run()
+                transaction.commit_transition("artifact_registered", current)
+                self.assertEqual(transaction.load_active_run()[1].nodes["consumer"].status, NodeStatus.SUCCEEDED)
+                changed = ArtifactRuntime(
+                    "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+                )
+                unsafe = replace(current, artifacts=MappingProxyType({**current.artifacts, "source": changed}))
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", unsafe)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+                valid = replace(
+                    complete,
+                    nodes=MappingProxyType({
+                        "consumer": replace(complete.nodes["consumer"], status=NodeStatus.STALE),
+                    }),
+                    artifacts=MappingProxyType({
+                        "source": changed,
+                        "draft": replace(complete.artifacts["draft"], state="stale"),
+                    }),
+                )
+                transaction.commit_transition("artifact_registered", valid)
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+
+    def test_changed_external_registration_cannot_silently_continue_running_work(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"old")
+            root.joinpath("new.txt").write_bytes(b"new")
+            plan = external_consumer_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-external-running")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                registered = refresh_ready(plan, replace(state, artifacts=MappingProxyType({
+                    "source": ArtifactRuntime(
+                        "source", "old.txt", sha256_bytes(b"old"), "verified", "external", 0
+                    ),
+                })))
+                transaction.commit_transition("artifact_registered", registered)
+                running = claim_transition(plan, registered, "consumer", "token")
+                transaction.commit_transition("node_claimed", running)
+                changed = ArtifactRuntime(
+                    "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+                )
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", replace(
+                        running, artifacts=MappingProxyType({"source": changed})
+                    ))
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_rehashed_changed_external_registration_blocks_before_tail_rewrite(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, value in (("old.txt", b"old"), ("new.txt", b"new"), ("draft.txt", b"draft")):
+                root.joinpath(name).write_bytes(value)
+            plan = external_consumer_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-external-forgery")
+            complete = complete_external_consumer(store, plan)
+            forged = replace(complete, artifacts=MappingProxyType({
+                **complete.artifacts,
+                "source": ArtifactRuntime(
+                    "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+                ),
+            }))
+            append_rehashed_state_event(store, workflow_store._state_data(forged))
+            with store.paths.events.open("ab") as handle:
+                handle.write(b'{"event_seq":5,"partial"')
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual((recovered.status, recovered.code), ("blocked", "artifact.authority_invalid"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+            self.assertFalse(store.paths.recovery.exists())
+
+    def test_rehashed_changed_external_registration_blocks_full_chain(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, value in (("old.txt", b"old"), ("new.txt", b"new"), ("draft.txt", b"draft")):
+                root.joinpath(name).write_bytes(value)
+            plan = external_consumer_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-external-full-chain")
+            complete = complete_external_consumer(store, plan)
+            forged = replace(complete, artifacts=MappingProxyType({
+                **complete.artifacts,
+                "source": ArtifactRuntime(
+                    "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+                ),
+            }))
+            event = append_rehashed_state_event(store, workflow_store._state_data(forged))
+            snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+            snapshot["state"] = workflow_store._state_data(forged)
+            snapshot["last_applied_event_seq"] = event.event_seq
+            snapshot["last_applied_event_hash"] = event.event_hash
+            store.paths.state.write_text(
+                json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual((recovered.status, recovered.code), ("blocked", "artifact.authority_invalid"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_ordered_producers_may_refine_one_logical_artifact_id(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath("old.txt").write_bytes(b"external")
+            root.joinpath("first.txt").write_bytes(b"first")
+            root.joinpath("second.txt").write_bytes(b"second")
+            root.joinpath("refined.txt").write_bytes(b"refined")
+            base = produced_artifact_plan()
+            consumer = compiled_node(
+                "consumer", inputs=("first",), outputs=("first",)
+            )
+            plan = replace(
+                base, external_inputs=("first",),
+                nodes=MappingProxyType({**base.nodes, "consumer": consumer}),
+            )
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-ordered-refinement")
+            external = ArtifactRuntime(
+                "first", "old.txt", sha256_bytes(b"external"), "verified", "external", 0
+            )
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                registered = replace(state, artifacts=MappingProxyType({"first": external}))
+                transaction.commit_transition("artifact_registered", registered)
+                first_running = claim_transition(plan, registered, "producer", "first-token")
+                transaction.commit_transition("node_claimed", first_running)
+                first_result = result_transition(plan, first_running, {
+                    "node_id": "producer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded",
+                    "outputs": {"first": "first.txt", "second": "second.txt"},
+                    "artifacts": [
+                        ArtifactRuntime("first", "first.txt", sha256_bytes(b"first"), "verified", "producer", 1),
+                        ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
+                    ],
+                })
+                transaction.commit_transition("node_result", first_result)
+                second_running = claim_transition(plan, first_result, "consumer", "second-token")
+                transaction.commit_transition("node_claimed", second_running)
+                second_result = result_transition(plan, second_running, {
+                    "node_id": "consumer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"first": "refined.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "first", "refined.txt", sha256_bytes(b"refined"),
+                        "verified", "consumer", 1,
+                    )],
+                })
+                transaction.commit_transition("node_result", second_result)
+            self.assertEqual(second_result.artifacts["first"].producer_node_id, "consumer")
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+
     def test_same_id_external_refinement_requires_stale_lineage_on_reregistration(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2297,6 +2612,9 @@ class WorkflowStoreTests(unittest.TestCase):
                 legitimate = replace(
                     complete,
                     nodes=MappingProxyType(stale_nodes),
+                    edges=MappingProxyType({
+                        "producer-consumer": EdgeRuntime(EdgeStatus.WAITING),
+                    }),
                     artifacts=MappingProxyType({
                         "first": external,
                         "second": replace(complete.artifacts["second"], state="stale"),
