@@ -1252,7 +1252,9 @@ def _edge_witnesses_after_step(
                     and prior[incoming_id].get(output_id) is not None
                     and current.edges[incoming_id].selected_output_map.get(output_id) == path
                 ]
-                if len(matches) != 1:
+                # Fan-out/reconvergence may carry the same original receipt on
+                # multiple routes. Only distinct full provenance is ambiguous.
+                if len(set(matches)) != 1:
                     raise StoreError("edge.witness_missing", f"join edge cannot trace one incoming receipt: {edge_id}")
                 proof = matches[0]
             else:
@@ -2206,6 +2208,7 @@ class WorkflowStore:
         previous_status: str | None = None
         previous_state: RunState | None = None
         witnesses: EdgeWitnesses = {}
+        boundary_witnesses: EdgeWitnesses | None = None
         for event in events:
             previous_state, previous_status = self._replay_candidate(
                 plan,
@@ -2215,8 +2218,12 @@ class WorkflowStore:
                 previous_state,
                 witnesses,
             )
+            if event.event_seq == sequence:
+                boundary_witnesses = {
+                    edge_id: dict(proofs) for edge_id, proofs in witnesses.items()
+                }
         boundary = next((event for event in events if event.event_seq == sequence), None)
-        if boundary is None or boundary.event_hash != event_hash:
+        if boundary is None or boundary_witnesses is None or boundary.event_hash != event_hash:
             raise StoreError("snapshot.boundary_mismatch", "snapshot event boundary is not in the verified chain")
         boundary_state = boundary.payload.get("state")
         boundary_status = boundary.payload.get("run_status")
@@ -2229,10 +2236,10 @@ class WorkflowStore:
         if require_no_suffix and any(event.event_seq > sequence for event in events):
             raise StoreError("recovery.required", "verified event suffix must be recovered before mutation")
         if require_no_suffix and (
-            self._artifact_drift_ids(state) or self._witness_drift_producers(witnesses)
+            self._artifact_drift_ids(state) or self._witness_drift_producers(boundary_witnesses)
         ):
             raise StoreError("recovery.required", "artifact bytes must be recovered before mutation")
-        return plan, state, sequence, event_hash, run_status, events, tail, prefix, witnesses
+        return plan, state, sequence, event_hash, run_status, events, tail, prefix, boundary_witnesses
 
     def _replay_candidate(
         self,
@@ -2382,6 +2389,7 @@ class WorkflowStore:
     ) -> None:
         if previous is None:
             return
+        authorized_invalidation: set[str] = set()
         for artifact_id, earlier in previous.artifacts.items():
             replacement = current.artifacts.get(artifact_id)
             if replacement is None:
@@ -2431,6 +2439,7 @@ class WorkflowStore:
                     if target not in affected:
                         affected.add(target)
                         pending.append(target)
+            authorized_invalidation.update(affected)
             independently_ready = dict(current.nodes)
             for node_id in affected:
                 runtime = independently_ready[node_id]
@@ -2539,6 +2548,27 @@ class WorkflowStore:
                     raise StoreError(
                         "artifact.authority_invalid",
                         f"external re-registration must stale related evidence: {sibling_id}",
+                    )
+        if event_type == "artifact_registered":
+            for node_id, runtime in current.nodes.items():
+                if (
+                    runtime.status is NodeStatus.STALE
+                    and previous.nodes[node_id].status is not NodeStatus.STALE
+                    and node_id not in authorized_invalidation
+                ):
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"registration staled an unrelated source: {node_id}",
+                    )
+            for edge_id, runtime in current.edges.items():
+                if (
+                    previous.edges[edge_id].status is EdgeStatus.SATISFIED
+                    and runtime.status is not EdgeStatus.SATISFIED
+                    and plan.edges[edge_id].source not in authorized_invalidation
+                ):
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"registration removed an unrelated route: {edge_id}",
                     )
 
     def _mark_drift(

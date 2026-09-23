@@ -312,6 +312,58 @@ def complete_compiled_winner(
     return state
 
 
+def forged_unrelated_winner_invalidation(store, plan, state, root, *, change_source):
+    """A C-only registration (or no change) carrying a forged B invalidation."""
+    forged = store._mark_drift(plan, state, [], ["b"])
+    if not change_source:
+        return forged
+    (root / "source-new.txt").write_bytes(b"new source")
+    nodes = dict(forged.nodes)
+    nodes["c"] = replace(nodes["c"], selected_inputs=MappingProxyType({}))
+    return refresh_ready(plan, replace(
+        forged,
+        nodes=MappingProxyType(nodes),
+        artifacts=MappingProxyType({
+            **forged.artifacts,
+            "source": ArtifactRuntime(
+                "source", "source-new.txt", sha256_bytes(b"new source"),
+                "verified", "external", 0,
+            ),
+        }),
+    ))
+
+
+def compiled_reconvergence_plan(*, distinct_sources):
+    """Compile file-carrying branches that meet at an all-active join."""
+    from tests.test_workflow_scheduler import WorkflowSchedulerTests
+
+    if distinct_sources:
+        nodes = [
+            workflow_task("source-a", entry=True, outputs=("draft",)),
+            workflow_task("source-b", entry=True, outputs=("draft",)),
+            workflow_join("merged", outputs=("draft",)),
+            workflow_task("consumer", inputs=("draft",)),
+        ]
+        pairs = [("source-a", "merged"), ("source-b", "merged"), ("merged", "consumer")]
+    else:
+        nodes = [
+            workflow_task("source", entry=True, outputs=("draft",)),
+            workflow_join("left", outputs=("draft",)),
+            workflow_join("right", outputs=("draft",)),
+            workflow_join("merged", outputs=("draft",)),
+            workflow_task("consumer", inputs=("draft",)),
+        ]
+        pairs = [
+            ("source", "left"), ("source", "right"),
+            ("left", "merged"), ("right", "merged"), ("merged", "consumer"),
+        ]
+    return WorkflowSchedulerTests().compile(
+        nodes,
+        [workflow_edge(f"{source}-{target}", source, target,
+                       output_map={"draft": "draft"}) for source, target in pairs],
+    )
+
+
 def complete_any_success_refinement(store, plan):
     external = ArtifactRuntime(
         "first", "external.txt", sha256_bytes(b"external"), "verified", "external", 0
@@ -2943,6 +2995,136 @@ class WorkflowStoreTests(unittest.TestCase):
                     transaction.commit_transition("artifact_registered", candidate)
                 self.assertEqual(caught.exception.code, "edge.authority_invalid")
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_registration_cannot_stale_an_unaffected_winning_source_or_route(self):
+        for change_source in (False, True):
+            with self.subTest(change_source=change_source), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                plan = compiled_winner_plan()
+                store = WorkflowStore(root)
+                store.start_run(plan, "run-unrelated-winner-stale")
+                state = complete_compiled_winner(store, plan, root)
+                forged = forged_unrelated_winner_invalidation(
+                    store, plan, state, root, change_source=change_source
+                )
+                with store.locked_run() as transaction:
+                    transaction.load_active_run()
+                    before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                    with self.assertRaises(StoreError) as caught:
+                        transaction.commit_transition("artifact_registered", forged)
+                    self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                    self.assertEqual(
+                        (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                    )
+
+    def test_rehashed_unrelated_winner_invalidation_rejects_full_and_suffix_zero_write(self):
+        for boundary in ("full_chain", "suffix"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                plan = compiled_winner_plan()
+                store = WorkflowStore(root)
+                store.start_run(plan, f"run-forged-stale-{boundary}")
+                state = complete_compiled_winner(store, plan, root)
+                forged = forged_unrelated_winner_invalidation(
+                    store, plan, state, root, change_source=True
+                )
+                event = append_rehashed_state_event(
+                    store, workflow_store._state_data(forged), "artifact_registered"
+                )
+                if boundary == "full_chain":
+                    snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+                    snapshot["state"] = workflow_store._state_data(forged)
+                    snapshot["last_applied_event_seq"] = event.event_seq
+                    snapshot["last_applied_event_hash"] = event.event_hash
+                    store.paths.state.write_text(
+                        json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                recovered = WorkflowStore(root).recover()
+                self.assertEqual((recovered.status, recovered.code),
+                                 ("blocked", "artifact.authority_invalid"))
+                self.assertEqual(
+                    (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                )
+
+    def test_recovery_uses_snapshot_boundary_witnesses_for_valid_multi_event_suffix(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-boundary-witness")
+            complete_compiled_winner(store, plan, root)
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                transaction._commit_event("fact_recorded", state, {}, replace_snapshot=False)
+                (root / "b.txt").write_bytes(b"changed")
+                stale = store._mark_drift(plan, state, [], ["b"])
+                transaction._commit_event("artifacts_marked_stale", stale, {},
+                                          replace_snapshot=False)
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual((recovered.status, recovered.code),
+                             ("recovered", "recovery.replayed"))
+            self.assertEqual(recovered.state.nodes["joined"].status, NodeStatus.STALE)
+            self.assertEqual(recovered.state.nodes["joined"].winner_edge_id, "b-joined")
+            self.assertEqual(recovered.state.edges["b-joined"].status, EdgeStatus.WAITING)
+
+    def test_all_active_reconvergence_accepts_identical_historical_proof(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "draft.txt").write_bytes(b"draft")
+            plan = compiled_reconvergence_plan(distinct_sources=False)
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-identical-reconvergence")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "source", "token")
+                transaction.commit_transition("node_claimed", running)
+                state = result_transition(plan, running, {
+                    "node_id": "source", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "draft.txt", sha256_bytes(b"draft"),
+                        "verified", "source", 1,
+                    )],
+                })
+                transaction.commit_transition("node_result", state)
+                stable, controls = stabilize_control_nodes(plan, state)
+                self.assertEqual((stable.nodes["merged"].status, len(controls)),
+                                 (NodeStatus.SUCCEEDED, 3))
+                transaction.commit_control_transitions(controls, stable)
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+
+    def test_all_active_reconvergence_rejects_distinct_historical_proofs(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "draft.txt").write_bytes(b"draft")
+            plan = compiled_reconvergence_plan(distinct_sources=True)
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-distinct-reconvergence")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                for source in ("source-a", "source-b"):
+                    running = claim_transition(plan, state, source, f"token-{source}")
+                    transaction.commit_transition("node_claimed", running)
+                    state = result_transition(plan, running, {
+                        "node_id": source, "attempt": 1, "status": "succeeded",
+                        "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                        "artifacts": [ArtifactRuntime(
+                            "draft", "draft.txt", sha256_bytes(b"draft"),
+                            "verified", source, 1,
+                        )],
+                    })
+                    transaction.commit_transition("node_result", state)
+                stable, controls = stabilize_control_nodes(plan, state)
+                self.assertEqual(stable.nodes["merged"].status, NodeStatus.SUCCEEDED)
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_control_transitions(controls, stable)
+                self.assertEqual(caught.exception.code, "edge.witness_missing")
+                self.assertEqual(
+                    (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                )
 
     def test_rehashed_forgery_is_rejected_on_full_chain_and_suffix_before_writes(self):
         for forgery in ("edge_map", "winner_rebind", "false_registration", "false_result"):
