@@ -422,6 +422,12 @@ A join applies its own rule:
 
 Late successful results after an `any_success` join are retained as auxiliary
 artifacts and cannot replace the frozen winner or its downstream inputs.
+The custom runtime records the first uniquely satisfied incoming edge as
+`winner_edge_id`. The edge identity remains fixed for that run, including if
+its evidence later becomes stale; another successful edge is not promoted
+without starting a new run. Each live file-carrying edge retains the
+source/attempt/path/hash lineage of its completion event, even if a later
+branch replaces the same logical artifact ID in the current registry.
 
 Disabled nodes and all their incident edges are excluded from the compiled graph.
 The compiler does not invent a bypass edge. If disabling a node leaves another
@@ -523,6 +529,10 @@ Every event contains a monotonically increasing `event_seq`, run ID, semantic
 workflow hash, `previous_event_hash`, and its own hash over canonical event
 content. The state snapshot stores `last_applied_event_seq` and
 `last_applied_event_hash`.
+The internal custom-run state codec requires `winner_edge_id` on every node.
+Pre-release custom snapshots or events missing that field fail closed rather
+than silently reconstructing a winner. The official v1.0 progress format is
+separate and unchanged.
 
 An event line is appended and flushed before the corresponding snapshot is
 atomically replaced. On restart, recovery verifies the snapshot boundary and

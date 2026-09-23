@@ -127,6 +127,7 @@ class NodeRuntime:
     auxiliary_outputs: Mapping[str, tuple[str, ...]] = field(
         default_factory=lambda: _aux_map()
     )
+    winner_edge_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "selected_inputs", _string_map(self.selected_inputs))
@@ -247,19 +248,20 @@ def _join_inputs(
 ) -> tuple[Mapping[str, str], bool]:
     node = plan.nodes[node_id]
     runtime = state.nodes[node_id]
-    if (
-        node.join_mode == "any_success"
-        and runtime.status in {NodeStatus.READY, NodeStatus.SUCCEEDED}
-        and runtime.selected_inputs
-    ):
-        return _string_map(runtime.selected_inputs), True
     satisfied = [
         edge_id
         for edge_id in plan.incoming[node_id]
         if state.edges[edge_id].status is EdgeStatus.SATISFIED
     ]
     if node.join_mode == "any_success":
-        satisfied = satisfied[:1]
+        if runtime.winner_edge_id:
+            if runtime.winner_edge_id not in satisfied:
+                return _string_map(), False
+            satisfied = [runtime.winner_edge_id]
+        elif len(satisfied) != 1:
+            if len(satisfied) > 1:
+                _fail("runtime.ambiguous_winner", "simultaneous first join satisfactions have no unique winner", node_id=node_id)
+            return _string_map(), False
     selected: dict[str, str] = {}
     for edge_id in satisfied:
         for artifact_id, path in state.edges[edge_id].selected_output_map.items():
@@ -280,7 +282,10 @@ def _set_outgoing_status(
 ) -> None:
     for edge_id in plan.outgoing[node_id]:
         current = edges[edge_id]
-        edges[edge_id] = EdgeRuntime(status, current.selected_output_map)
+        edges[edge_id] = EdgeRuntime(
+            status,
+            current.selected_output_map if status is EdgeStatus.SATISFIED else _string_map(),
+        )
 
 
 def initial_run(plan: CompiledPlan, run_id: str) -> RunState:
@@ -339,8 +344,17 @@ def refresh_ready(plan: CompiledPlan, state: RunState) -> RunState:
 
             active = [status for status in incoming_statuses if status is not EdgeStatus.INACTIVE]
             if node.type == "join" and node.join_mode == "any_success":
-                if any(status is EdgeStatus.SATISFIED for status in active):
+                winner = runtime.winner_edge_id
+                satisfied_ids = [edge_id for edge_id in incoming_ids if edges[edge_id].status is EdgeStatus.SATISFIED]
+                if winner and edges[winner].status is not EdgeStatus.SATISFIED:
+                    dependencies_ready = False
+                    next_status = NodeStatus.STALE
+                elif not winner and len(satisfied_ids) > 1:
+                    _fail("runtime.ambiguous_winner", "simultaneous first join satisfactions have no unique winner", node_id=node_id)
+                elif satisfied_ids:
                     dependencies_ready = True
+                    if not winner:
+                        winner = satisfied_ids[0]
                 elif any(status is EdgeStatus.WAITING for status in active) or not active:
                     dependencies_ready = False
                     next_status = NodeStatus.PENDING
@@ -367,7 +381,12 @@ def refresh_ready(plan: CompiledPlan, state: RunState) -> RunState:
                     selected, inputs_ready = _resolve_node_inputs(plan, snapshot, node_id)
                 next_status = NodeStatus.READY if inputs_ready else NodeStatus.PENDING
 
-            updated = replace(runtime, status=next_status, selected_inputs=selected)
+            updated = replace(
+                runtime,
+                status=next_status,
+                selected_inputs=selected,
+                winner_edge_id=winner if node.type == "join" and node.join_mode == "any_success" else runtime.winner_edge_id,
+            )
             if updated != runtime:
                 nodes[node_id] = updated
                 changed = True
@@ -375,6 +394,8 @@ def refresh_ready(plan: CompiledPlan, state: RunState) -> RunState:
             before = dict(edges)
             if next_status is NodeStatus.BLOCKED:
                 _set_outgoing_status(plan, edges, node_id, EdgeStatus.FAILED)
+            elif next_status is NodeStatus.STALE:
+                _set_outgoing_status(plan, edges, node_id, EdgeStatus.WAITING)
             elif runtime.status is NodeStatus.BLOCKED and next_status in {
                 NodeStatus.PENDING,
                 NodeStatus.READY,
@@ -570,6 +591,8 @@ def _record_late_join_outputs(
             continue
         auxiliary = {key: list(values) for key, values in runtime.auxiliary_outputs.items()}
         for edge_id in plan.incoming[node_id]:
+            if edge_id == runtime.winner_edge_id:
+                continue
             edge_runtime = edges[edge_id]
             if edge_runtime.status is not EdgeStatus.SATISFIED:
                 continue
@@ -710,14 +733,25 @@ def mark_descendants_stale(
         current = pending.pop()
         for edge_id in plan.outgoing[current]:
             target = plan.edges[edge_id].target
+            target_node = plan.nodes[target]
+            if (
+                target_node.type == "join"
+                and target_node.join_mode == "any_success"
+                and state.nodes[target].winner_edge_id
+                and state.nodes[target].winner_edge_id != edge_id
+            ):
+                continue
             if target not in descendants and target not in changed_node_ids:
                 descendants.add(target)
                 pending.append(target)
     nodes = dict(state.nodes)
+    edges = dict(state.edges)
     artifacts = dict(state.artifacts)
     for node_id in descendants:
-        nodes[node_id] = replace(nodes[node_id], status=NodeStatus.STALE)
+        nodes[node_id] = replace(nodes[node_id], status=NodeStatus.STALE, selected_inputs=_string_map())
+    for node_id in set(changed_node_ids) | descendants:
+        _set_outgoing_status(plan, edges, node_id, EdgeStatus.WAITING)
     for artifact_id, artifact in state.artifacts.items():
         if artifact.producer_node_id in descendants and artifact.state != "stale":
             artifacts[artifact_id] = replace(artifact, state="stale")
-    return _replace_state(state, nodes=nodes, artifacts=artifacts)
+    return _replace_state(state, nodes=nodes, edges=edges, artifacts=artifacts)

@@ -12,6 +12,7 @@ from scripts.workflow_engine.conditions import evaluate_predicate
 from scripts.workflow_engine.schema import WorkflowError, parse_workflow
 from scripts.workflow_engine.scheduler import (
     ArtifactRuntime,
+    EdgeRuntime,
     EdgeStatus,
     NodeStatus,
     claim_transition,
@@ -304,11 +305,60 @@ class WorkflowSchedulerTests(unittest.TestCase):
         state = initial_run(plan, "run-any")
         state = self.complete(plan, state, "branch-a", outputs={"draft": "a.md"})
         self.assertEqual(state.nodes["join"].selected_inputs["draft"], "a.md")
+        self.assertEqual(state.nodes["join"].winner_edge_id, "z-first-arrival")
         state = self.complete(plan, state, "branch-b", outputs={"draft": "b.md"})
         self.assertEqual(state.nodes["join"].selected_inputs["draft"], "a.md")
+        self.assertEqual(state.nodes["join"].winner_edge_id, "z-first-arrival")
         state, _ = stabilize_control_nodes(plan, state)
         self.assertEqual(state.nodes["join"].selected_inputs["draft"], "a.md")
         self.assertEqual(state.nodes["join"].auxiliary_outputs["draft"], ("b.md",))
+
+    def test_any_success_winner_identity_survives_same_path_auxiliary_and_cuts_invalidated_route(self):
+        plan = self.compile(
+            [task("a", entry=True, outputs=("draft",)), task("b", entry=True, outputs=("draft",)),
+             join("joined", outputs=("draft",), mode="any_success"),
+             task("consumer", inputs=("draft",))],
+            [edge("a-join", "a", "joined", output_map={"draft": "draft"}),
+             edge("b-join", "b", "joined", output_map={"draft": "draft"}),
+             edge("join-consumer", "joined", "consumer")],
+            max_parallelism=2,
+        )
+        state = initial_run(plan, "run-same-path")
+        state = self.complete(plan, state, "b", outputs={"draft": "shared.md"})
+        self.assertEqual(state.nodes["joined"].winner_edge_id, "b-join")
+        state = self.complete(plan, state, "a", outputs={"draft": "shared.md"})
+        self.assertEqual(state.nodes["joined"].winner_edge_id, "b-join")
+        self.assertEqual(state.edges["a-join"].status, EdgeStatus.SATISFIED)
+        self.assertEqual(state.nodes["joined"].auxiliary_outputs, {})
+        state, _ = stabilize_control_nodes(plan, state)
+        unaffected = mark_descendants_stale(plan, state, ("a",))
+        self.assertEqual(unaffected.nodes["joined"].status, NodeStatus.SUCCEEDED)
+        invalidated = mark_descendants_stale(plan, state, ("b",))
+        self.assertEqual(invalidated.nodes["joined"].status, NodeStatus.STALE)
+        self.assertEqual(invalidated.edges["join-consumer"].status, EdgeStatus.WAITING)
+        self.assertEqual(invalidated.edges["join-consumer"].selected_output_map, {})
+        self.assertEqual(invalidated.nodes["joined"].winner_edge_id, "b-join")
+
+    def test_simultaneous_first_satisfactions_have_no_implicit_plan_order_winner(self):
+        plan = self.compile(
+            [task("a", entry=True, outputs=("draft",)), task("b", entry=True, outputs=("draft",)),
+             join("joined", outputs=("draft",), mode="any_success")],
+            [edge("a-join", "a", "joined", output_map={"draft": "draft"}),
+             edge("b-join", "b", "joined", output_map={"draft": "draft"})],
+        )
+        state = initial_run(plan, "run-simultaneous")
+        nodes = dict(state.nodes)
+        nodes["a"] = replace(nodes["a"], status=NodeStatus.SUCCEEDED,
+                             outcome="succeeded", outputs={"draft": "a.md"})
+        nodes["b"] = replace(nodes["b"], status=NodeStatus.SUCCEEDED,
+                             outcome="succeeded", outputs={"draft": "b.md"})
+        candidate = replace(state, nodes=MappingProxyType(nodes), edges=MappingProxyType({
+            "a-join": EdgeRuntime(EdgeStatus.SATISFIED, {"draft": "a.md"}),
+            "b-join": EdgeRuntime(EdgeStatus.SATISFIED, {"draft": "b.md"}),
+        }))
+        with self.assertRaises(WorkflowError) as caught:
+            refresh_ready(plan, candidate)
+        self.assertEqual(caught.exception.code, "runtime.ambiguous_winner")
 
     def test_any_success_blocks_only_after_every_active_edge_is_terminal(self):
         plan = self.compile(

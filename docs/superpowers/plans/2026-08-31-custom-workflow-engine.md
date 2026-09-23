@@ -967,6 +967,7 @@ class NodeRuntime:
     selected_inputs: Mapping[str, str] = field(default_factory=dict)
     outputs: Mapping[str, str] = field(default_factory=dict)
     auxiliary_outputs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    winner_edge_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1004,10 @@ declared output map, and retain later outputs in `auxiliary_outputs` without
 replacing the winner. If every active edge becomes terminal without a success,
 block the join; if every edge is inactive, skip it. Apply condition outcomes to
 matching/default edges. A skipped task makes every outgoing edge inactive.
+For an `any_success` join, set `winner_edge_id` with the unique first
+satisfaction, preserve it through late auxiliary results and stale state, and
+reject a simultaneous first satisfaction. Source invalidation cuts the old
+route and stales the frozen join rather than selecting another edge.
 
 Even when graph dependencies are satisfied, a node remains `PENDING` with
 `runtime.external_artifact_missing` guidance until every referenced declared
@@ -1183,6 +1188,12 @@ the artifact and dependent nodes stale before condition stabilization.
 Each event contains `event_seq`, `run_id`, `semantic_sha256`, `event_type`, `payload`, `previous_event_hash`, and `event_hash`. Compute `event_hash` from canonical JSON excluding itself. Snapshots contain `last_applied_event_seq` and `last_applied_event_hash`. Append and fsync the event before atomically replacing the snapshot.
 
 Recovery replays only the continuous verified suffix. Preserve a truncated final line under `recovery/events-truncated-{time_ns}.jsonl`, restore only through the last valid event, and block any possibly affected running node. Gaps, conflicting duplicates, or hash mismatches block the run without rewriting evidence.
+The custom state codec requires `winner_edge_id`; old pre-release states
+without it fail closed. Replay derives the live edge's historical
+source/attempt/path/hash witness from an authorized completion event and
+compares current bytes at the live boundary, including when the current
+artifact registry was overwritten by another branch. This does not alter the
+separate official v1.0 storage format.
 
 - [ ] **Step 6: Run focused, platform, and full tests**
 

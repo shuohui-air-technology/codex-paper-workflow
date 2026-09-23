@@ -15,8 +15,8 @@ from tempfile import TemporaryDirectory
 from types import MappingProxyType
 from unittest import mock
 
-from scripts.workflow_engine.catalog import SkillIdentity, ValidatorIdentity
-from scripts.workflow_engine.compiler import CompiledEdge, CompiledNode, CompiledPlan
+from scripts.workflow_engine.catalog import CatalogResult, SkillIdentity, ValidatorIdentity
+from scripts.workflow_engine.compiler import CompiledEdge, CompiledNode, CompiledPlan, compile_workflow
 from scripts.workflow_engine import fs as workflow_fs
 from scripts.workflow_engine import store as workflow_store
 from scripts.workflow_engine.fs import (
@@ -45,6 +45,11 @@ from scripts.workflow_engine.store import (
     WorkflowEvent,
     WorkflowStore,
     WorkflowTransaction,
+)
+from tests.test_workflow_scheduler import (
+    edge as workflow_edge,
+    join as workflow_join,
+    task as workflow_task,
 )
 
 
@@ -201,6 +206,110 @@ def any_success_refinement_plan():
         topological_order=("first-task", "other-task", "join"),
         max_parallelism=2,
     )
+
+
+def compiled_winner_plan(*, b_has_notes=False):
+    """Exercise the actual compiler, including repeated logical output IDs."""
+    nodes = [
+            workflow_task("a", entry=True, outputs=("draft",)),
+            workflow_task("b", entry=True, outputs=("draft", "notes") if b_has_notes else ("draft",)),
+            workflow_task("c", entry=True, inputs=("source",), outputs=("other",)),
+            workflow_join("joined", outputs=("joined",), mode="any_success"),
+            workflow_task("consumer", inputs=("joined",), outputs=("final",)),
+    ]
+    edges = [
+            workflow_edge("a-joined", "a", "joined", output_map={"draft": "joined"}),
+            workflow_edge("b-joined", "b", "joined", output_map={"draft": "joined"}),
+            workflow_edge("c-joined", "c", "joined", output_map={"other": "joined"}),
+            workflow_edge("joined-consumer", "joined", "consumer", output_map={"joined": "joined"}),
+    ]
+    raw = {
+        "schema_version": "paper-workflow-custom-v1",
+        "workflow_id": "compiled-winner-flow",
+        "document_revision": 1,
+        "semantic_revision": 1,
+        "derived_from": None,
+        "max_parallelism": 4,
+        "external_inputs": ["source"],
+        "nodes": nodes,
+        "edges": edges,
+        "ui": {"positions": {node["id"]: {"x": 0, "y": 0} for node in nodes}},
+    }
+    skills = {
+        node["skill_ref"]: SkillIdentity(
+            catalog_id=node["skill_ref"],
+            root=Path(__file__).resolve().parents[1] / "test-skills",
+            relative_path=node["skill_ref"],
+            skill_sha256=sha256_bytes((node["skill_ref"] + "/SKILL.md").encode()),
+            tree_sha256="sha256:" + sha256_bytes(node["skill_ref"].encode()),
+            locked=True,
+        )
+        for node in nodes if node["skill_ref"] is not None
+    }
+    compiled = compile_workflow(
+        parse_workflow(raw),
+        CatalogResult(skills, (), ()),
+        {},
+        json.loads((Path(__file__).resolve().parents[1] / "references/workflows/official-v1.0-studio-projection.json").read_text()),
+    )
+    if compiled.errors or compiled.plan is None:
+        raise AssertionError(f"compiled winner fixture is invalid: {compiled.errors}")
+    return compiled.plan
+
+
+def complete_compiled_winner(
+    store, plan, root, *, b_path="b.txt", a_path="a.txt",
+    downstream=True, complete_join=True,
+):
+    """B wins, then A completes late; all file receipts use actual bytes."""
+    (root / "source-old.txt").write_bytes(b"source-old")
+    (root / b_path).write_bytes(b"winner")
+    if "notes" in plan.nodes["b"].outputs:
+        (root / "notes.txt").write_bytes(b"notes")
+    (root / "final.txt").write_bytes(b"final")
+    with store.locked_run() as transaction:
+        _, state = transaction.load_active_run()
+        source = ArtifactRuntime("source", "source-old.txt", sha256_bytes(b"source-old"), "verified", "external", 0)
+        state = replace(state, artifacts=MappingProxyType({"source": source}))
+        state = refresh_ready(plan, state)
+        transaction.commit_transition("artifact_registered", state)
+        running = claim_transition(plan, state, "b", "b-token")
+        transaction.commit_transition("node_claimed", running)
+        state = result_transition(plan, running, {
+            "node_id": "b", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
+            "outputs": {"draft": b_path, **({"notes": "notes.txt"} if "notes" in plan.nodes["b"].outputs else {})},
+            "artifacts": [
+                ArtifactRuntime("draft", b_path, sha256_bytes(b"winner"), "verified", "b", 1),
+                *([ArtifactRuntime("notes", "notes.txt", sha256_bytes(b"notes"), "verified", "b", 1)]
+                  if "notes" in plan.nodes["b"].outputs else []),
+            ],
+        })
+        transaction.commit_transition("node_result", state)
+        self_winner = state.nodes["joined"]
+        assert self_winner.selected_inputs == {"joined": b_path}
+        if complete_join:
+            stable, controls = stabilize_control_nodes(plan, state)
+            transaction.commit_control_transitions(controls, stable)
+            state = stable
+        if downstream:
+            running = claim_transition(plan, state, "consumer", "consumer-token")
+            transaction.commit_transition("node_claimed", running)
+            state = result_transition(plan, running, {
+                "node_id": "consumer", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
+                "outputs": {"final": "final.txt"},
+                "artifacts": [ArtifactRuntime("final", "final.txt", sha256_bytes(b"final"), "verified", "consumer", 1)],
+            })
+            transaction.commit_transition("node_result", state)
+        (root / a_path).write_bytes(b"winner" if a_path == b_path else b"late")
+        running = claim_transition(plan, state, "a", "a-token")
+        transaction.commit_transition("node_claimed", running)
+        state = result_transition(plan, running, {
+            "node_id": "a", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
+            "outputs": {"draft": a_path},
+            "artifacts": [ArtifactRuntime("draft", a_path, sha256_bytes(b"winner" if a_path == b_path else b"late"), "verified", "a", 1)],
+        })
+        transaction.commit_transition("node_result", state)
+    return state
 
 
 def complete_any_success_refinement(store, plan):
@@ -426,12 +535,14 @@ def independent_condition_plan(large_outcome):
         node_type="condition",
         entry=True,
         outcomes=("short",),
+        cases=({"outcome": "short", "when": {"op": "not", "arg": {"op": "fact_is", "name": "unrecorded", "value": True}}},),
     )
     second = compiled_node(
         "second-condition",
         node_type="condition",
         entry=True,
         outcomes=(large_outcome,),
+        cases=({"outcome": large_outcome, "when": {"op": "not", "arg": {"op": "fact_is", "name": "unrecorded", "value": True}}},),
     )
     nodes = MappingProxyType(
         {"first-condition": first, "second-condition": second}
@@ -1285,15 +1396,17 @@ class WorkflowStoreTests(unittest.TestCase):
             store = WorkflowStore(Path(temporary))
             plan = task_plan()
             store.start_run(plan, "run-terminal-active")
+            Path(temporary, "draft.txt").write_bytes(b"draft")
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
-                terminal = replace(
-                    state,
-                    nodes=MappingProxyType(
-                        {"produce": replace(state.nodes["produce"], status=NodeStatus.SUCCEEDED)}
-                    ),
-                )
-                transaction.commit_transition("node_succeeded", terminal)
+                running = claim_transition(plan, state, "produce", "terminal-token")
+                transaction.commit_transition("node_claimed", running)
+                terminal = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime("draft", "draft.txt", sha256_bytes(b"draft"), "verified", "produce", 1)],
+                })
+                transaction.commit_transition("node_result", terminal)
             with self.assertRaises(StoreError) as next_run:
                 store.start_run(plan, "run-must-not-replace")
             self.assertEqual(next_run.exception.code, "run.already_active")
@@ -1719,42 +1832,24 @@ class WorkflowStoreTests(unittest.TestCase):
             store.start_run(plan, "run-produced-drift")
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
-                nodes = dict(state.nodes)
-                nodes["producer"] = replace(
-                    nodes["producer"],
-                    status=NodeStatus.SUCCEEDED,
-                    attempt=2,
-                    outputs=MappingProxyType(
-                        {"first": "first.txt", "second": "second.txt"}
-                    ),
-                )
-                nodes["consumer"] = replace(
-                    nodes["consumer"], status=NodeStatus.SUCCEEDED, attempt=1
-                )
-                artifacts = MappingProxyType(
-                    {
-                        "first": ArtifactRuntime(
-                            "first", "first.txt", sha256_bytes(b"first"), "verified", "producer", 2
-                        ),
-                        "second": ArtifactRuntime(
-                            "second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 2
-                        ),
-                    }
-                )
-                completed = replace(
-                    state,
-                    nodes=MappingProxyType(nodes),
-                    edges=MappingProxyType(
-                        {
-                            "producer-consumer": EdgeRuntime(
-                                EdgeStatus.SATISFIED,
-                                MappingProxyType({"first": "first.txt"}),
-                            )
-                        }
-                    ),
-                    artifacts=artifacts,
-                )
-                transaction.commit_transition("outputs_verified", completed)
+                running = claim_transition(plan, state, "producer", "producer-token")
+                transaction.commit_transition("node_claimed", running)
+                completed = result_transition(plan, running, {
+                    "node_id": "producer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"first": "first.txt", "second": "second.txt"},
+                    "artifacts": [
+                        ArtifactRuntime("first", "first.txt", sha256_bytes(b"first"), "verified", "producer", 1),
+                        ArtifactRuntime("second", "second.txt", sha256_bytes(b"second"), "verified", "producer", 1),
+                    ],
+                })
+                transaction.commit_transition("node_result", completed)
+                running = claim_transition(plan, completed, "consumer", "consumer-token")
+                transaction.commit_transition("node_claimed", running)
+                completed = result_transition(plan, running, {
+                    "node_id": "consumer", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {}, "artifacts": [],
+                })
+                transaction.commit_transition("node_result", completed)
 
             first_path.write_bytes(b"changed")
             recovered = WorkflowStore(root).recover()
@@ -2522,7 +2617,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
                 with self.assertRaises(StoreError) as edge:
                     transaction.commit_transition("artifact_registered", stale)
-                self.assertEqual(edge.exception.code, "artifact.authority_invalid")
+                self.assertEqual(edge.exception.code, "edge.authority_invalid")
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
                 nodes["consumer"] = replace(
                     nodes["consumer"], status=NodeStatus.READY,
@@ -2570,7 +2665,7 @@ class WorkflowStoreTests(unittest.TestCase):
                         before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
                         with self.assertRaises(StoreError) as caught:
                             transaction.commit_transition("artifact_registered", invalid)
-                        self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                        self.assertEqual(caught.exception.code, "join.winner_invalid")
                         self.assertEqual(
                             (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
                         )
@@ -2590,14 +2685,14 @@ class WorkflowStoreTests(unittest.TestCase):
                         handle.write(b'{"event_seq":99,"partial"')
                 before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
                 recovered = WorkflowStore(root).recover()
-                self.assertEqual((recovered.status, recovered.code), ("blocked", "artifact.authority_invalid"))
+                self.assertEqual((recovered.status, recovered.code), ("blocked", "join.winner_invalid"))
                 self.assertEqual(
                     (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
                 )
                 if boundary == "suffix":
                     self.assertFalse(store.paths.recovery.exists())
 
-    def test_any_success_replacement_accepts_independently_derived_other_winner(self):
+    def test_any_success_replacement_stales_winner_without_promoting_auxiliary(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name, value in (
@@ -2612,7 +2707,8 @@ class WorkflowStoreTests(unittest.TestCase):
             nodes = dict(complete.nodes)
             nodes["first-task"] = replace(nodes["first-task"], status=NodeStatus.STALE)
             nodes["join"] = replace(
-                nodes["join"], selected_inputs=MappingProxyType({"joined": "other.txt"})
+                nodes["join"], status=NodeStatus.STALE,
+                selected_inputs=MappingProxyType({}),
             )
             replacement = replace(
                 complete,
@@ -2627,13 +2723,379 @@ class WorkflowStoreTests(unittest.TestCase):
                 transaction.commit_transition("artifact_registered", replacement)
             recovered = WorkflowStore(root).recover()
             self.assertEqual(recovered.status, "clean")
-            self.assertEqual(recovered.state.nodes["join"].selected_inputs, {"joined": "other.txt"})
+            self.assertEqual(recovered.state.nodes["join"].status, NodeStatus.STALE)
+            self.assertEqual(recovered.state.nodes["join"].winner_edge_id, "first-join")
             with store.locked_run() as transaction:
                 _, current = transaction.load_active_run()
                 stabilized, transitions = stabilize_control_nodes(plan, current)
                 transaction.commit_control_transitions(transitions, stabilized)
-            self.assertEqual(stabilized.nodes["join"].status, NodeStatus.SUCCEEDED)
-            self.assertEqual(stabilized.nodes["join"].outputs, {"joined": "other.txt"})
+            self.assertEqual(transitions, ())
+            self.assertEqual(stabilized.nodes["join"].status, NodeStatus.STALE)
+
+    def test_stale_frozen_join_cannot_retain_a_selectable_old_input_path(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, value in (("external.txt", b"external"), ("first.txt", b"first"), ("other.txt", b"other")):
+                (root / name).write_bytes(value)
+            plan = any_success_refinement_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-stale-selected")
+            complete, external = complete_any_success_refinement(store, plan)
+            nodes = dict(complete.nodes)
+            nodes["first-task"] = replace(nodes["first-task"], status=NodeStatus.STALE)
+            nodes["join"] = replace(nodes["join"], status=NodeStatus.STALE)
+            candidate = replace(
+                complete,
+                nodes=MappingProxyType(nodes),
+                edges=MappingProxyType({**complete.edges, "first-join": EdgeRuntime(EdgeStatus.WAITING)}),
+                artifacts=MappingProxyType({**complete.artifacts, "first": external}),
+            )
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", candidate)
+                self.assertEqual(caught.exception.code, "join.winner_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_compiled_frozen_winner_survives_unrelated_registration_with_downstream(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-winner-unrelated")
+            state = complete_compiled_winner(store, plan, root)
+            self.assertEqual(state.nodes["joined"].winner_edge_id, "b-joined")
+            self.assertEqual(state.nodes["consumer"].status, NodeStatus.SUCCEEDED)
+            (root / "source-new.txt").write_bytes(b"source-new")
+            source = ArtifactRuntime("source", "source-new.txt", sha256_bytes(b"source-new"), "verified", "external", 0)
+            nodes = dict(state.nodes)
+            nodes["c"] = replace(nodes["c"], selected_inputs=MappingProxyType({}))
+            changed = replace(state, nodes=MappingProxyType(nodes), artifacts=MappingProxyType({**state.artifacts, "source": source}))
+            changed = refresh_ready(plan, changed)
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                transaction.commit_transition("artifact_registered", changed)
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.status, "clean")
+            self.assertEqual(recovered.state.nodes["joined"].winner_edge_id, "b-joined")
+            self.assertEqual(recovered.state.nodes["joined"].outputs, {"joined": "b.txt"})
+            self.assertEqual(recovered.state.nodes["consumer"].status, NodeStatus.SUCCEEDED)
+
+    def test_ready_frozen_winner_survives_unrelated_registration_after_late_auxiliary(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-ready-winner-unrelated")
+            state = complete_compiled_winner(store, plan, root, downstream=False, complete_join=False)
+            self.assertEqual(state.nodes["joined"].status, NodeStatus.READY)
+            self.assertEqual(state.nodes["joined"].winner_edge_id, "b-joined")
+            self.assertEqual(state.nodes["joined"].auxiliary_outputs["joined"], ("a.txt",))
+            (root / "source-new.txt").write_bytes(b"source-new")
+            source = ArtifactRuntime("source", "source-new.txt", sha256_bytes(b"source-new"), "verified", "external", 0)
+            nodes = dict(state.nodes)
+            nodes["c"] = replace(nodes["c"], selected_inputs=MappingProxyType({}))
+            changed = refresh_ready(plan, replace(
+                state, nodes=MappingProxyType(nodes),
+                artifacts=MappingProxyType({**state.artifacts, "source": source}),
+            ))
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                transaction.commit_transition("artifact_registered", changed)
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.status, "clean")
+            self.assertEqual(recovered.state.nodes["joined"].winner_edge_id, "b-joined")
+            self.assertEqual(recovered.state.nodes["joined"].selected_inputs, {"joined": "b.txt"})
+
+    def test_historical_winner_hash_survives_same_id_registry_overwrite_and_detects_drift(self):
+        for changed in ("a.txt", "b.txt"):
+            with self.subTest(changed=changed), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                plan = compiled_winner_plan()
+                store = WorkflowStore(root)
+                store.start_run(plan, f"run-witness-{changed[0]}")
+                state = complete_compiled_winner(store, plan, root)
+                self.assertEqual(state.artifacts["draft"].producer_node_id, "a")
+                self.assertEqual(state.nodes["joined"].winner_edge_id, "b-joined")
+                (root / changed).write_bytes(b"changed")
+                recovered = WorkflowStore(root).recover()
+                self.assertEqual(recovered.code, "recovery.artifact_drift")
+                if changed == "b.txt":
+                    self.assertEqual(recovered.state.nodes["joined"].status, NodeStatus.STALE)
+                    self.assertEqual(recovered.state.nodes["joined"].winner_edge_id, "b-joined")
+                    self.assertEqual(recovered.state.nodes["consumer"].status, NodeStatus.STALE)
+                    self.assertEqual(recovered.state.edges["joined-consumer"].status, EdgeStatus.WAITING)
+                else:
+                    self.assertEqual(recovered.state.nodes["joined"].status, NodeStatus.SUCCEEDED)
+                    self.assertEqual(recovered.state.nodes["consumer"].status, NodeStatus.SUCCEEDED)
+
+    def test_snapshotless_recovery_reconstructs_the_frozen_winner_and_its_old_hash(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-snapshotless-witness")
+            complete_compiled_winner(store, plan, root)
+            store.paths.state.unlink()
+            replayed = WorkflowStore(root).recover()
+            self.assertEqual((replayed.status, replayed.code), ("recovered", "recovery.replayed"))
+            self.assertEqual(replayed.state.nodes["joined"].winner_edge_id, "b-joined")
+            (root / "b.txt").write_bytes(b"drifted old winner")
+            drift = WorkflowStore(root).recover()
+            self.assertEqual(drift.code, "recovery.artifact_drift")
+            self.assertEqual(drift.state.nodes["joined"].status, NodeStatus.STALE)
+
+    def test_historical_winner_drift_stales_its_registry_visible_sibling_receipt(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan(b_has_notes=True)
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-winner-sibling")
+            state = complete_compiled_winner(store, plan, root)
+            self.assertEqual(state.artifacts["draft"].producer_node_id, "a")
+            self.assertEqual(state.artifacts["notes"].producer_node_id, "b")
+            (root / "b.txt").write_bytes(b"winner changed")
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.code, "recovery.artifact_drift")
+            self.assertEqual(recovered.state.nodes["joined"].status, NodeStatus.STALE)
+            self.assertEqual(recovered.state.artifacts["notes"].state, "stale")
+
+    def test_same_path_auxiliary_identity_and_changed_winner_bytes(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-same-path-winner")
+            state = complete_compiled_winner(store, plan, root, b_path="shared.txt", a_path="shared.txt")
+            self.assertEqual(state.nodes["joined"].winner_edge_id, "b-joined")
+            self.assertEqual(state.nodes["joined"].auxiliary_outputs, {})
+            self.assertEqual(state.edges["a-joined"].status, EdgeStatus.SATISFIED)
+            self.assertEqual(state.edges["b-joined"].status, EdgeStatus.SATISFIED)
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+            (root / "shared.txt").write_bytes(b"changed")
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.code, "recovery.artifact_drift")
+            self.assertEqual(recovered.state.nodes["joined"].status, NodeStatus.STALE)
+
+    def test_forged_unaffected_edge_and_false_completion_are_zero_write_rejections(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-forged-edge")
+            state = complete_compiled_winner(store, plan, root)
+            forged_edges = dict(state.edges)
+            forged_edges["a-joined"] = EdgeRuntime(EdgeStatus.SATISFIED, {"joined": "b.txt"})
+            forged = replace(state, edges=MappingProxyType(forged_edges))
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError):
+                    transaction.commit_transition("artifact_registered", forged)
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+        for event_type in ("artifact_registered", "node_result"):
+            with self.subTest(event_type=event_type), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "b.txt").write_bytes(b"winner")
+                plan = compiled_winner_plan()
+                store = WorkflowStore(root)
+                store.start_run(plan, f"run-false-{event_type}")
+                with store.locked_run() as transaction:
+                    _, state = transaction.load_active_run()
+                    nodes = dict(state.nodes)
+                    nodes["b"] = replace(nodes["b"], status=NodeStatus.SUCCEEDED, attempt=1,
+                                         outcome="succeeded", outputs=MappingProxyType({"draft": "b.txt"}))
+                    forged = replace(state, nodes=MappingProxyType(nodes),
+                                     edges=MappingProxyType({**state.edges, "b-joined": EdgeRuntime(EdgeStatus.SATISFIED, {"joined": "b.txt"})}),
+                                     artifacts=MappingProxyType({"draft": ArtifactRuntime("draft", "b.txt", sha256_bytes(b"winner"), "verified", "b", 1)}))
+                    forged = refresh_ready(plan, forged)
+                    before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                    with self.assertRaises(StoreError):
+                        transaction.commit_transition(event_type, forged)
+                    self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_registration_cannot_cut_a_satisfied_edge_from_an_unaffected_succeeded_source(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-forged-route-cut")
+            state = complete_compiled_winner(store, plan, root)
+            nodes = dict(state.nodes)
+            nodes["joined"] = replace(nodes["joined"], status=NodeStatus.STALE,
+                                      selected_inputs=MappingProxyType({}))
+            nodes["consumer"] = replace(nodes["consumer"], status=NodeStatus.STALE,
+                                        selected_inputs=MappingProxyType({}))
+            candidate = replace(state, nodes=MappingProxyType(nodes), edges=MappingProxyType({
+                **state.edges,
+                "b-joined": EdgeRuntime(EdgeStatus.WAITING),
+                "joined-consumer": EdgeRuntime(EdgeStatus.WAITING),
+            }), artifacts=MappingProxyType({
+                **state.artifacts,
+                "final": replace(state.artifacts["final"], state="stale"),
+            }))
+            with store.locked_run() as transaction:
+                transaction.load_active_run()
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("artifact_registered", candidate)
+                self.assertEqual(caught.exception.code, "edge.authority_invalid")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_rehashed_forgery_is_rejected_on_full_chain_and_suffix_before_writes(self):
+        for forgery in ("edge_map", "winner_rebind", "false_registration", "false_result"):
+            for boundary in ("suffix", "full_chain"):
+                with self.subTest(forgery=forgery, boundary=boundary), TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    plan = compiled_winner_plan()
+                    store = WorkflowStore(root)
+                    store.start_run(plan, f"run-forgery-{forgery}-{boundary}")
+                    if forgery in {"edge_map", "winner_rebind"}:
+                        state = complete_compiled_winner(store, plan, root)
+                        nodes = dict(state.nodes)
+                        edges = dict(state.edges)
+                        if forgery == "edge_map":
+                            edges["a-joined"] = EdgeRuntime(EdgeStatus.SATISFIED, {"joined": "b.txt"})
+                        else:
+                            nodes["joined"] = replace(nodes["joined"], winner_edge_id="a-joined",
+                                                       selected_inputs=MappingProxyType({"joined": "a.txt"}),
+                                                       outputs=MappingProxyType({"joined": "a.txt"}))
+                            edges["joined-consumer"] = EdgeRuntime(EdgeStatus.SATISFIED, {"joined": "a.txt"})
+                        forged = replace(state, nodes=MappingProxyType(nodes), edges=MappingProxyType(edges))
+                        event_type = "artifact_registered"
+                    else:
+                        (root / "b.txt").write_bytes(b"winner")
+                        with store.locked_run() as transaction:
+                            _, state = transaction.load_active_run()
+                        nodes = dict(state.nodes)
+                        nodes["b"] = replace(nodes["b"], status=NodeStatus.SUCCEEDED, attempt=1,
+                                             outcome="succeeded", outputs=MappingProxyType({"draft": "b.txt"}))
+                        forged = replace(state, nodes=MappingProxyType(nodes),
+                                         edges=MappingProxyType({**state.edges, "b-joined": EdgeRuntime(EdgeStatus.SATISFIED, {"joined": "b.txt"})}),
+                                         artifacts=MappingProxyType({"draft": ArtifactRuntime("draft", "b.txt", sha256_bytes(b"winner"), "verified", "b", 1)}))
+                        forged = refresh_ready(plan, forged)
+                        event_type = "node_result" if forgery == "false_result" else "artifact_registered"
+                    event = append_rehashed_state_event(store, workflow_store._state_data(forged), event_type)
+                    if boundary == "full_chain":
+                        snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+                        snapshot["state"] = workflow_store._state_data(forged)
+                        snapshot["last_applied_event_seq"] = event.event_seq
+                        snapshot["last_applied_event_hash"] = event.event_hash
+                        store.paths.state.write_text(json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+                    else:
+                        with store.paths.events.open("ab") as handle:
+                            handle.write(b'{"partial":')
+                    before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                    recovered = WorkflowStore(root).recover()
+                    self.assertEqual(recovered.status, "blocked")
+                    self.assertIn(recovered.code, {"edge.authority_invalid", "join.winner_invalid", "events.invalid_completion"})
+                    self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+                    if boundary == "suffix":
+                        self.assertFalse(store.paths.recovery.exists())
+
+    def test_file_carrying_task_edge_requires_a_real_completion_hash_receipt(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "b.txt").write_bytes(b"winner")
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-no-edge-witness")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "b", "b-token")
+                transaction.commit_transition("node_claimed", running)
+                no_receipt = result_transition(plan, running, {
+                    "node_id": "b", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "b.txt"}, "artifacts": [],
+                })
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("node_result", no_receipt)
+                self.assertEqual(caught.exception.code, "edge.witness_missing")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_late_same_path_rewrite_cannot_keep_old_winner_bytes_authoritative(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = root / "shared.txt"
+            shared.write_bytes(b"winner")
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-late-rewrite")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "b", "b-token")
+                transaction.commit_transition("node_claimed", running)
+                state = result_transition(plan, running, {
+                    "node_id": "b", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
+                    "outputs": {"draft": "shared.txt"},
+                    "artifacts": [ArtifactRuntime("draft", "shared.txt", sha256_bytes(b"winner"), "verified", "b", 1)],
+                })
+                transaction.commit_transition("node_result", state)
+                running = claim_transition(plan, state, "a", "a-token")
+                transaction.commit_transition("node_claimed", running)
+                shared.write_bytes(b"overwritten")
+                late = result_transition(plan, running, {
+                    "node_id": "a", "attempt": 1, "status": "succeeded", "outcome": "succeeded",
+                    "outputs": {"draft": "shared.txt"},
+                    "artifacts": [ArtifactRuntime("draft", "shared.txt", sha256_bytes(b"overwritten"), "verified", "a", 1)],
+                })
+                before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition("node_result", late)
+                self.assertEqual(caught.exception.code, "artifact.verification_failed")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(recovered.code, "recovery.running_work_uncertain")
+            self.assertEqual(recovered.state.nodes["joined"].status, NodeStatus.STALE)
+
+    def test_legacy_custom_state_without_winner_field_fails_closed(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = compiled_winner_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-old-custom-codec")
+            snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+            del snapshot["state"]["nodes"]["joined"]["winner_edge_id"]
+            store.paths.state.write_text(json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            result = WorkflowStore(root).recover()
+            self.assertEqual((result.status, result.code), ("blocked", "snapshot.invalid"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_rehashed_run_start_cannot_begin_with_an_already_completed_task(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "draft.txt").write_bytes(b"draft")
+            plan = task_plan()
+            store = WorkflowStore(root)
+            state = store.start_run(plan, "run-forged-start")
+            raw_first = json.loads(store.paths.events.read_text(encoding="utf-8").splitlines()[0])
+            nodes = dict(state.nodes)
+            nodes["produce"] = replace(nodes["produce"], status=NodeStatus.SUCCEEDED, attempt=1,
+                                       outcome="succeeded", outputs=MappingProxyType({"draft": "draft.txt"}))
+            forged = replace(state, nodes=MappingProxyType(nodes), artifacts=MappingProxyType({
+                "draft": ArtifactRuntime("draft", "draft.txt", sha256_bytes(b"draft"), "verified", "produce", 1)
+            }))
+            first = WorkflowEvent.create(
+                event_seq=1,
+                run_id=state.run_id,
+                semantic_sha256=plan.semantic_sha256,
+                event_type="run_started",
+                payload={**raw_first["payload"], "state": workflow_store._state_data(forged)},
+                previous_event_hash=ZERO_HASH,
+            )
+            store.paths.events.write_text(json.dumps(first.to_payload(), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+            snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+            snapshot["state"] = workflow_store._state_data(forged)
+            snapshot["last_applied_event_hash"] = first.event_hash
+            store.paths.state.write_text(json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+            before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+            result = WorkflowStore(root).recover()
+            self.assertEqual((result.status, result.code), ("blocked", "events.invalid_completion"))
+            self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
 
     def test_source_independent_zero_attempt_exclusion_survives_reregistration(self):
         with TemporaryDirectory() as temporary:

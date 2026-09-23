@@ -24,6 +24,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from .catalog import SkillIdentity, ValidatorIdentity
 from .compiler import CompiledEdge, CompiledNode, CompiledPlan
+from .conditions import evaluate_condition
 from .fs import (
     PathSafetyError,
     MAX_EVENT_BYTES,
@@ -42,9 +43,13 @@ from .scheduler import (
     NodeRuntime,
     NodeStatus,
     RunState,
+    _complete_control,
+    _edge_outputs,
+    condition_facts,
     initial_run,
     mark_descendants_stale,
     refresh_ready,
+    result_transition,
 )
 from .schema import (
     WorkflowDocument,
@@ -820,6 +825,7 @@ def _state_data(state: RunState) -> dict[str, object]:
                 "auxiliary_outputs": {
                     key: list(items) for key, items in runtime.auxiliary_outputs.items()
                 },
+                "winner_edge_id": runtime.winner_edge_id,
             }
             for node_id, runtime in sorted(state.nodes.items())
         },
@@ -868,7 +874,7 @@ def _state_from_data(value: object) -> RunState:
     if not isinstance(raw_nodes, Mapping) or not isinstance(raw_edges, Mapping) or not isinstance(raw_artifacts, Mapping):
         raise StoreError("snapshot.invalid", "runtime collections are invalid")
     node_fields = frozenset(
-        {"status", "attempt", "outcome", "claim_token_hash", "selected_inputs", "outputs", "auxiliary_outputs"}
+        {"status", "attempt", "outcome", "claim_token_hash", "selected_inputs", "outputs", "auxiliary_outputs", "winner_edge_id"}
     )
     nodes: dict[str, NodeRuntime] = {}
     for node_id, raw in raw_nodes.items():
@@ -892,6 +898,7 @@ def _state_from_data(value: object) -> RunState:
             MappingProxyType(
                 {str(key): _string_list(items, "snapshot.invalid") for key, items in auxiliary.items()}
             ),
+            _plain_string(runtime["winner_edge_id"], "snapshot.invalid", allow_empty=True),
         )
     edge_fields = frozenset({"status", "selected_output_map"})
     edges: dict[str, EdgeRuntime] = {}
@@ -1025,6 +1032,238 @@ def _validate_artifact_authority(plan: CompiledPlan, state: RunState) -> None:
                 "artifact.authority_invalid",
                 f"artifact receipt has no compiled producer authority: {artifact_id}",
             )
+
+
+def _validate_edge_and_winner_state(plan: CompiledPlan, state: RunState) -> None:
+    """Bind live routes to source outputs and a frozen, explicit join edge."""
+    for edge_id, runtime in state.edges.items():
+        edge = plan.edges[edge_id]
+        source = state.nodes[edge.source]
+        if runtime.status is EdgeStatus.SATISFIED:
+            if source.status is not NodeStatus.SUCCEEDED or edge.trigger != source.outcome:
+                raise StoreError("edge.authority_invalid", f"satisfied edge has no successful source: {edge_id}")
+            expected = _edge_outputs(plan, edge, source.outputs)
+            if runtime.selected_output_map != expected:
+                raise StoreError("edge.authority_invalid", f"edge output map differs from its source: {edge_id}")
+        elif runtime.selected_output_map:
+            raise StoreError("edge.authority_invalid", f"non-satisfied edge retains an output route: {edge_id}")
+    for node_id, runtime in state.nodes.items():
+        node = plan.nodes[node_id]
+        is_any = node.type == "join" and node.join_mode == "any_success"
+        if not is_any:
+            if runtime.winner_edge_id:
+                raise StoreError("join.winner_invalid", f"non-any-success node has a winner: {node_id}")
+            continue
+        winner = runtime.winner_edge_id
+        if winner and winner not in plan.incoming[node_id]:
+            raise StoreError("join.winner_invalid", f"winner is not an incoming edge: {node_id}")
+        if runtime.status in {NodeStatus.READY, NodeStatus.SUCCEEDED}:
+            if not winner or state.edges[winner].status is not EdgeStatus.SATISFIED:
+                raise StoreError("join.winner_invalid", f"ready or completed join has no live winner: {node_id}")
+            selected = state.edges[winner].selected_output_map
+            if runtime.selected_inputs != selected or (
+                runtime.status is NodeStatus.SUCCEEDED and runtime.outputs != selected
+            ):
+                raise StoreError("join.winner_invalid", f"join output differs from its frozen winner: {node_id}")
+        elif winner and runtime.status is not NodeStatus.STALE:
+            raise StoreError("join.winner_invalid", f"frozen join cannot silently return to pending: {node_id}")
+        if runtime.status is NodeStatus.STALE and runtime.selected_inputs:
+            raise StoreError("join.winner_invalid", f"stale join retains a selected input route: {node_id}")
+        if runtime.status is NodeStatus.STALE and any(
+            state.edges[edge_id].status is EdgeStatus.SATISFIED
+            for edge_id in plan.outgoing[node_id]
+        ):
+            raise StoreError("join.winner_invalid", f"stale join retains a live outgoing route: {node_id}")
+
+
+def _validate_completion_transition(
+    plan: CompiledPlan,
+    previous: RunState,
+    current: RunState,
+    event_type: str,
+    payload: Mapping[str, object],
+) -> None:
+    """Only a scheduler-equivalent result/control event can mint a live edge."""
+    if event_type == "node_result":
+        changed = [
+            node_id for node_id in plan.nodes
+            if previous.nodes[node_id].status is NodeStatus.RUNNING
+            and current.nodes[node_id].status in {
+                NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED
+            }
+        ]
+        if len(changed) != 1:
+            raise StoreError("events.invalid_completion", "node_result needs one running task completion")
+        node_id = changed[0]
+        node = plan.nodes[node_id]
+        after = current.nodes[node_id]
+        if node.type != "task":
+            raise StoreError("events.invalid_completion", "node_result source is not a task")
+        receipt_artifacts = [
+            artifact for artifact in current.artifacts.values()
+            if artifact.producer_node_id == node_id and artifact.producer_attempt == after.attempt
+        ]
+        result = {
+            "node_id": node_id,
+            "attempt": after.attempt,
+            "status": "succeeded" if after.status is NodeStatus.SUCCEEDED else "failed",
+            "outcome": after.outcome,
+            "outputs": dict(after.outputs) if after.status is NodeStatus.SUCCEEDED else {},
+            "artifacts": receipt_artifacts if after.status is NodeStatus.SUCCEEDED else [],
+        }
+        try:
+            expected = result_transition(plan, previous, result)
+        except WorkflowError as exc:
+            raise StoreError("events.invalid_completion", str(exc)) from exc
+        if _state_data(expected) != _state_data(current):
+            raise StoreError("events.invalid_completion", "node_result differs from the scheduler transition")
+    elif event_type in {"condition_selected", "join_succeeded"}:
+        if not {"node_id", "outcome", "edge_updates"}.issubset(payload):
+            raise StoreError("events.invalid_completion", "control completion lacks declared transition fields")
+        node_id = payload["node_id"]
+        if not isinstance(node_id, str) or node_id not in plan.nodes:
+            raise StoreError("events.invalid_completion", "control completion names an unknown node")
+        node = plan.nodes[node_id]
+        runtime = previous.nodes[node_id]
+        expected_type = "condition_selected" if node.type == "condition" else "join_succeeded"
+        if node.type not in {"condition", "join"} or event_type != expected_type or runtime.status is not NodeStatus.READY:
+            raise StoreError("events.invalid_completion", "control completion has the wrong ready source")
+        outcome = (
+            evaluate_condition(node.condition_cases, condition_facts(previous))
+            if node.type == "condition" else "succeeded"
+        )
+        if payload["outcome"] != outcome:
+            raise StoreError("events.invalid_completion", "control outcome differs from its declared evaluation")
+        expected, transition = _complete_control(plan, previous, node_id, outcome)
+        if payload["edge_updates"] != {key: value.value for key, value in transition.edge_updates.items()} or _state_data(expected) != _state_data(current):
+            raise StoreError("events.invalid_completion", "control completion differs from the scheduler transition")
+
+
+def _validate_edge_and_winner_transition(
+    plan: CompiledPlan,
+    previous: RunState | None,
+    current: RunState,
+    event_type: str,
+    payload: Mapping[str, object],
+) -> None:
+    _validate_edge_and_winner_state(plan, current)
+    if previous is None:
+        if _state_data(current) != _state_data(initial_run(plan, current.run_id)):
+            raise StoreError("events.invalid_completion", "run start differs from the scheduler's initial state")
+        if any(runtime.winner_edge_id for runtime in current.nodes.values()) or any(
+            runtime.status is EdgeStatus.SATISFIED for runtime in current.edges.values()
+        ):
+            raise StoreError("join.winner_invalid", "run start cannot contain completed routes")
+        return
+    newly_satisfied = {
+        edge_id for edge_id, runtime in current.edges.items()
+        if runtime.status is EdgeStatus.SATISFIED
+        and previous.edges[edge_id].status is not EdgeStatus.SATISFIED
+    }
+    newly_succeeded = {
+        node_id for node_id, runtime in current.nodes.items()
+        if runtime.status is NodeStatus.SUCCEEDED
+        and previous.nodes[node_id].status is not NodeStatus.SUCCEEDED
+    }
+    if newly_succeeded and event_type not in {"node_result", "condition_selected", "join_succeeded"}:
+        raise StoreError("events.invalid_completion", "non-completion event cannot finish a node")
+    for edge_id, runtime in current.edges.items():
+        before = previous.edges[edge_id]
+        if before.status is EdgeStatus.SATISFIED and runtime.status is EdgeStatus.SATISFIED and before != runtime:
+            raise StoreError("edge.authority_invalid", f"live edge map changed without a new completion: {edge_id}")
+        if (
+            before.status is EdgeStatus.SATISFIED
+            and runtime.status is not EdgeStatus.SATISFIED
+            and current.nodes[plan.edges[edge_id].source].status is NodeStatus.SUCCEEDED
+        ):
+            raise StoreError("edge.authority_invalid", f"completed source lost its satisfied route: {edge_id}")
+    if newly_satisfied and event_type not in {"node_result", "condition_selected", "join_succeeded"}:
+        raise StoreError("events.invalid_completion", "non-completion event cannot create a satisfied edge")
+    if event_type in {"node_result", "condition_selected", "join_succeeded"}:
+        _validate_completion_transition(plan, previous, current, event_type, payload)
+    for node_id, runtime in current.nodes.items():
+        node = plan.nodes[node_id]
+        if node.type != "join" or node.join_mode != "any_success":
+            continue
+        before = previous.nodes[node_id]
+        if before.winner_edge_id:
+            if runtime.winner_edge_id != before.winner_edge_id:
+                raise StoreError("join.winner_invalid", f"frozen winner changed: {node_id}")
+        elif runtime.winner_edge_id:
+            incoming_new = set(plan.incoming[node_id]) & newly_satisfied
+            if incoming_new != {runtime.winner_edge_id}:
+                raise StoreError("join.winner_invalid", f"join did not select a unique first satisfaction: {node_id}")
+        elif runtime.status in {NodeStatus.READY, NodeStatus.SUCCEEDED}:
+            raise StoreError("join.winner_invalid", f"join became ready without a winner: {node_id}")
+
+
+EdgeWitnesses = dict[str, dict[str, ArtifactRuntime]]
+
+
+def _edge_witnesses_after_step(
+    plan: CompiledPlan,
+    previous: RunState | None,
+    current: RunState,
+    prior: EdgeWitnesses,
+) -> EdgeWitnesses:
+    """Derive historical source receipts only at the edge's completion event.
+
+    The registry is a *current* view: a later branch may legally replace the
+    same logical ID.  Retained edges therefore keep the earlier event receipt.
+    """
+    result: EdgeWitnesses = {}
+    for edge_id, runtime in current.edges.items():
+        if runtime.status is not EdgeStatus.SATISFIED:
+            continue
+        if previous is not None and previous.edges[edge_id].status is EdgeStatus.SATISFIED:
+            if edge_id not in prior:
+                raise StoreError("edge.witness_missing", f"live edge lacks historical proof: {edge_id}")
+            result[edge_id] = dict(prior[edge_id])
+            continue
+        edge = plan.edges[edge_id]
+        source_node = plan.nodes[edge.source]
+        source = current.nodes[edge.source]
+        proofs: dict[str, ArtifactRuntime] = {}
+        for output_id, path in source.outputs.items():
+            target_id = edge.output_map.get(output_id, output_id)
+            if runtime.selected_output_map.get(target_id) != path:
+                continue
+            if source_node.type == "task":
+                artifact = current.artifacts.get(output_id)
+                if (
+                    artifact is None
+                    or artifact.state != "verified"
+                    or artifact.path != path
+                    or artifact.producer_node_id != edge.source
+                    or artifact.producer_attempt != source.attempt
+                ):
+                    raise StoreError("edge.witness_missing", f"task edge has no completion hash witness: {edge_id}")
+                proof = artifact
+            elif source_node.type == "join":
+                incoming_ids = (
+                    (source.winner_edge_id,)
+                    if source_node.join_mode == "any_success"
+                    else plan.incoming[edge.source]
+                )
+                matches = [
+                    prior[incoming_id][output_id]
+                    for incoming_id in incoming_ids
+                    if incoming_id in prior
+                    and prior[incoming_id].get(output_id) is not None
+                    and current.edges[incoming_id].selected_output_map.get(output_id) == path
+                ]
+                if len(matches) != 1:
+                    raise StoreError("edge.witness_missing", f"join edge cannot trace one incoming receipt: {edge_id}")
+                proof = matches[0]
+            else:
+                raise StoreError("edge.witness_missing", f"file-carrying edge lacks a supported source receipt: {edge_id}")
+            if target_id in proofs and proofs[target_id] != proof:
+                raise StoreError("edge.witness_missing", f"edge has conflicting source receipts: {edge_id}")
+            proofs[target_id] = proof
+        if set(proofs) != set(runtime.selected_output_map):
+            raise StoreError("edge.witness_missing", f"file-carrying edge lacks historical hash proof: {edge_id}")
+        result[edge_id] = proofs
+    return result
 
 
 def _preflight_json_output(value: object, code: str) -> object:
@@ -1639,7 +1878,7 @@ class WorkflowStore:
             allow_truncated=False,
             require_no_suffix=True,
         )
-        _plan, _state, _seq, _hash, run_status, _events, _tail, _prefix = material
+        _plan, _state, _seq, _hash, run_status, _events, _tail, _prefix, _witnesses = material
         if run_status == "active":
             raise StoreError("run.already_active", "a custom workflow run is already active")
 
@@ -1742,7 +1981,7 @@ class WorkflowStore:
                     allow_truncated=False,
                     require_no_suffix=True,
                 )
-                plan, state, sequence, event_hash, run_status, _events, _tail, _prefix = material
+                plan, state, sequence, event_hash, run_status, _events, _tail, _prefix, witnesses = material
                 if run_status == "active":
                     transaction = self._transaction(lease)
                     transaction._set_loaded(
@@ -1751,6 +1990,8 @@ class WorkflowStore:
                         sequence,
                         event_hash,
                         run_status,
+                        _events,
+                        witnesses,
                     )
                     transaction._commit_event("run_stopped", state, {}, run_status="stopped")
             selected = Selection("official", previous.selection_revision + 1)
@@ -1836,7 +2077,7 @@ class WorkflowStore:
                     allow_truncated=False,
                     require_no_suffix=True,
                 )
-                _old_plan, old_state, _seq, _hash, run_status, _events, _tail, _prefix = material
+                _old_plan, old_state, _seq, _hash, run_status, _events, _tail, _prefix, _witnesses = material
                 if run_status == "active":
                     raise StoreError("run.already_active", "a custom workflow run is already active")
                 self._archive_old_run(old_state)
@@ -1935,7 +2176,7 @@ class WorkflowStore:
         *,
         allow_truncated: bool,
         require_no_suffix: bool,
-    ) -> tuple[CompiledPlan, RunState, int, str, str, list[WorkflowEvent], bytes | None, bytes]:
+    ) -> tuple[CompiledPlan, RunState, int, str, str, list[WorkflowEvent], bytes | None, bytes, EdgeWitnesses]:
         if not self.paths.state.exists() and not self.paths.state.is_symlink():
             raise StoreError("run.not_found", "there is no active custom workflow run")
         raw_plan = self._read_json(self.paths.plan, "plan.invalid")
@@ -1964,6 +2205,7 @@ class WorkflowStore:
         _validate_artifact_authority(plan, state)
         previous_status: str | None = None
         previous_state: RunState | None = None
+        witnesses: EdgeWitnesses = {}
         for event in events:
             previous_state, previous_status = self._replay_candidate(
                 plan,
@@ -1971,6 +2213,7 @@ class WorkflowStore:
                 state.run_id,
                 previous_status,
                 previous_state,
+                witnesses,
             )
         boundary = next((event for event in events if event.event_seq == sequence), None)
         if boundary is None or boundary.event_hash != event_hash:
@@ -1985,9 +2228,11 @@ class WorkflowStore:
             raise StoreError("snapshot.boundary_mismatch", "snapshot content differs from its boundary event")
         if require_no_suffix and any(event.event_seq > sequence for event in events):
             raise StoreError("recovery.required", "verified event suffix must be recovered before mutation")
-        if require_no_suffix and self._artifact_drift_ids(state):
+        if require_no_suffix and (
+            self._artifact_drift_ids(state) or self._witness_drift_producers(witnesses)
+        ):
             raise StoreError("recovery.required", "artifact bytes must be recovered before mutation")
-        return plan, state, sequence, event_hash, run_status, events, tail, prefix
+        return plan, state, sequence, event_hash, run_status, events, tail, prefix, witnesses
 
     def _replay_candidate(
         self,
@@ -1996,6 +2241,7 @@ class WorkflowStore:
         expected_run_id: str | None,
         previous_status: str | None,
         previous_state: RunState | None,
+        witnesses: EdgeWitnesses,
     ) -> tuple[RunState, str]:
         raw_state = event.payload.get("state")
         if not isinstance(raw_state, Mapping):
@@ -2024,9 +2270,17 @@ class WorkflowStore:
             except PathSafetyError as exc:
                 raise StoreError("events.unreplayable", "event artifact path is unsafe") from exc
         _validate_artifact_authority(plan, state)
+        _validate_edge_and_winner_transition(
+            plan, previous_state, state, event.event_type, event.payload
+        )
         self._validate_artifact_source_transition(
             plan, previous_state, state, event.event_type
         )
+        next_witnesses = _edge_witnesses_after_step(
+            plan, previous_state, state, witnesses
+        )
+        witnesses.clear()
+        witnesses.update(next_witnesses)
         return state, run_status
 
     def _write_projections(
@@ -2044,7 +2298,7 @@ class WorkflowStore:
 
     def read_run_events(self) -> tuple[WorkflowEvent, ...]:
         with self._lock():
-            _plan, _state, _seq, _hash, _status, events, _tail, _prefix = (
+            _plan, _state, _seq, _hash, _status, events, _tail, _prefix, _witnesses = (
                 self._validated_run_material(
                     allow_truncated=False,
                     require_no_suffix=False,
@@ -2079,6 +2333,18 @@ class WorkflowStore:
             except (OSError, PathSafetyError):
                 drifted.append(artifact_id)
         return tuple(drifted)
+
+    def _witness_drift_producers(self, witnesses: EdgeWitnesses) -> tuple[str, ...]:
+        drifted: set[str] = set()
+        for edge_proofs in witnesses.values():
+            for proof in edge_proofs.values():
+                try:
+                    path = resolve_project_path(self.project_root, proof.path)
+                    if not path.is_file() or self._hash_file(path) != proof.sha256:
+                        drifted.add(proof.producer_node_id)
+                except (OSError, PathSafetyError):
+                    drifted.add(proof.producer_node_id)
+        return tuple(sorted(drifted))
 
     def _require_verified_artifact_bytes(self, state: RunState) -> None:
         drifted = self._artifact_drift_ids(state)
@@ -2154,6 +2420,14 @@ class WorkflowStore:
             while pending:
                 for edge_id in plan.outgoing[pending.pop()]:
                     target = plan.edges[edge_id].target
+                    target_node = plan.nodes[target]
+                    if (
+                        target_node.type == "join"
+                        and target_node.join_mode == "any_success"
+                        and previous.nodes[target].winner_edge_id
+                        and previous.nodes[target].winner_edge_id != edge_id
+                    ):
+                        continue
                     if target not in affected:
                         affected.add(target)
                         pending.append(target)
@@ -2198,7 +2472,13 @@ class WorkflowStore:
                 elif before.status in {NodeStatus.SUCCEEDED, NodeStatus.SKIPPED, NodeStatus.STALE}:
                     valid_status = after.status is NodeStatus.STALE
                 elif before.status in {NodeStatus.PENDING, NodeStatus.READY}:
-                    valid_status = after.status in {NodeStatus.PENDING, NodeStatus.READY}
+                    valid_status = after.status in {NodeStatus.PENDING, NodeStatus.READY} or (
+                        before.status is NodeStatus.READY
+                        and plan.nodes[node_id].type == "join"
+                        and plan.nodes[node_id].join_mode == "any_success"
+                        and bool(before.winner_edge_id)
+                        and after.status is NodeStatus.STALE
+                    )
                 else:
                     valid_status = after.status in {before.status, NodeStatus.STALE}
                 if not valid_status:
@@ -2261,10 +2541,19 @@ class WorkflowStore:
                         f"external re-registration must stale related evidence: {sibling_id}",
                     )
 
-    def _mark_drift(self, plan: CompiledPlan, state: RunState, drifted: Sequence[str]) -> RunState:
+    def _mark_drift(
+        self,
+        plan: CompiledPlan,
+        state: RunState,
+        drifted: Sequence[str],
+        historical_producers: Sequence[str] = (),
+    ) -> RunState:
         artifacts = dict(state.artifacts)
         direct: set[str] = set()
-        producers: set[str] = set()
+        producers: set[str] = set(historical_producers)
+        for artifact_id, artifact in tuple(artifacts.items()):
+            if artifact.producer_node_id in producers and artifact.state != "stale":
+                artifacts[artifact_id] = replace(artifact, state="stale")
         for artifact_id in drifted:
             artifact = artifacts[artifact_id]
             if artifact.producer_node_id in plan.nodes:
@@ -2323,7 +2612,7 @@ class WorkflowStore:
                     )
                 except StoreError as exc:
                     return RecoveryResult("blocked", exc.code)
-                plan, state, sequence, event_hash, run_status, events, tail, prefix = material
+                plan, state, sequence, event_hash, run_status, events, tail, prefix, witnesses = material
                 plan_sha256 = _sha256(_plan_data(plan))
                 expected_run_id: str | None = state.run_id
                 suffix = [event for event in events if event.event_seq > sequence]
@@ -2355,13 +2644,14 @@ class WorkflowStore:
                 suffix = events
                 previous_status = None
                 previous_state = None
+                witnesses = {}
 
             # Validate the entire replay suffix before any tail archive, log
             # truncation, snapshot replacement, or projection regeneration.
             try:
                 for event in suffix:
                     candidate, next_status = self._replay_candidate(
-                        plan, event, expected_run_id, previous_status, previous_state
+                        plan, event, expected_run_id, previous_status, previous_state, witnesses
                     )
                     if expected_run_id is None:
                         expected_run_id = candidate.run_id
@@ -2401,19 +2691,24 @@ class WorkflowStore:
                 changed = True
 
             drifted = list(self._artifact_drift_ids(state))
-            if drifted:
-                stale = self._mark_drift(plan, state, drifted)
+            historical_producers = self._witness_drift_producers(witnesses)
+            if drifted or historical_producers:
+                stale = self._mark_drift(plan, state, drifted, historical_producers)
                 transaction = self._transaction(lease)
-                transaction._set_loaded(plan, state, sequence, event_hash, run_status)
+                transaction._set_loaded(plan, state, sequence, event_hash, run_status, events, witnesses)
                 transaction._commit_event(
                     "artifacts_marked_stale",
                     stale,
-                    {"artifact_ids": list(drifted)},
+                    {
+                        "artifact_ids": list(drifted),
+                        "witness_producer_ids": list(historical_producers),
+                    },
                     run_status=run_status,
                 )
                 state = stale
                 sequence = transaction._event_seq
                 event_hash = transaction._event_hash
+                witnesses = transaction._witnesses
                 changed = True
 
             running = [
@@ -2425,7 +2720,7 @@ class WorkflowStore:
                     nodes[node_id] = replace(nodes[node_id], status=NodeStatus.BLOCKED)
                 blocked = replace(state, nodes=MappingProxyType(nodes))
                 transaction = self._transaction(lease)
-                transaction._set_loaded(plan, state, sequence, event_hash, run_status)
+                transaction._set_loaded(plan, state, sequence, event_hash, run_status, events, witnesses)
                 transaction._commit_event(
                     "recovery_running_blocked",
                     blocked,
@@ -2442,7 +2737,7 @@ class WorkflowStore:
                 self._write_projections(state, run_status)
             except StoreError as exc:
                 return RecoveryResult("blocked", exc.code, state, archived)
-            if drifted:
+            if drifted or historical_producers:
                 return RecoveryResult("recovered", "recovery.artifact_drift", state, archived)
             if changed:
                 return RecoveryResult("recovered", "recovery.replayed", state, archived)
@@ -2470,6 +2765,7 @@ class WorkflowTransaction:
         self._event_hash = ZERO_HASH
         self._run_status = "active"
         self._events: list[WorkflowEvent] = []
+        self._witnesses: EdgeWitnesses = {}
 
     def _deactivate(self) -> None:
         self._lease_active = False
@@ -2500,6 +2796,7 @@ class WorkflowTransaction:
         event_hash: str,
         run_status: str,
         events: Sequence[WorkflowEvent] = (),
+        witnesses: EdgeWitnesses | None = None,
     ) -> None:
         self._require_lease()
         self._plan = plan
@@ -2509,6 +2806,9 @@ class WorkflowTransaction:
         self._event_hash = event_hash
         self._run_status = run_status
         self._events = list(events)
+        self._witnesses = {} if witnesses is None else {
+            key: dict(value) for key, value in witnesses.items()
+        }
 
     def load_active_run(self) -> tuple[CompiledPlan, RunState]:
         self._require_lease()
@@ -2516,10 +2816,10 @@ class WorkflowTransaction:
             allow_truncated=False,
             require_no_suffix=True,
         )
-        plan, state, sequence, event_hash, run_status, events, _tail, _prefix = material
+        plan, state, sequence, event_hash, run_status, events, _tail, _prefix, witnesses = material
         if run_status != "active":
             raise StoreError("run.not_active", "custom workflow run is not active")
-        self._set_loaded(plan, state, sequence, event_hash, run_status, events)
+        self._set_loaded(plan, state, sequence, event_hash, run_status, events, witnesses)
         return plan, state
 
     def events(self, event_type: str | None = None) -> tuple[WorkflowEvent, ...]:
@@ -2550,16 +2850,30 @@ class WorkflowTransaction:
         event_seq: int,
         previous_event_hash: str,
         previous_status: str,
-    ) -> tuple[WorkflowEvent, RunState]:
-        plan, current = self._require_loaded()
+        witnesses: EdgeWitnesses | None = None,
+        previous_state: RunState | None = None,
+    ) -> tuple[WorkflowEvent, RunState, EdgeWitnesses]:
+        plan, loaded_current = self._require_loaded()
+        current = loaded_current if previous_state is None else previous_state
         self._validate_binding(plan, updated_state)
         state_data, updated_state = _validated_state_data(updated_state)
         self.store._require_verified_artifact_bytes(updated_state)
         self.store._require_artifact_paths_contained(updated_state)
         _validate_artifact_authority(plan, updated_state)
+        _validate_edge_and_winner_transition(
+            plan, current, updated_state, event_type, payload
+        )
         self.store._validate_artifact_source_transition(
             plan, current, updated_state, event_type
         )
+        next_witnesses = _edge_witnesses_after_step(
+            plan,
+            current,
+            updated_state,
+            self._witnesses if witnesses is None else witnesses,
+        )
+        if self.store._witness_drift_producers(next_witnesses):
+            raise StoreError("artifact.verification_failed", "live edge witness bytes have changed")
         if updated_state.run_id != current.run_id:
             raise StoreError(
                 "snapshot.run_mismatch", "updated runtime state belongs to another run"
@@ -2580,7 +2894,7 @@ class WorkflowTransaction:
             previous_event_hash=previous_event_hash,
         )
         _validate_lifecycle_step(event, previous_status)
-        return event, updated_state
+        return event, updated_state, next_witnesses
 
     def _preflight_snapshot_and_projections(
         self,
@@ -2611,7 +2925,7 @@ class WorkflowTransaction:
     ) -> WorkflowEvent:
         self._require_loaded()
         status = self._run_status if run_status is None else run_status
-        event, updated_state = self._prepare_event(
+        event, updated_state, next_witnesses = self._prepare_event(
             event_type,
             updated_state,
             payload,
@@ -2636,6 +2950,7 @@ class WorkflowTransaction:
         self._state = updated_state
         self._run_status = status
         self._events.append(event)
+        self._witnesses = next_witnesses
         if replace_snapshot:
             try:
                 self.store._atomic_json(self.store.paths.state, snapshot)
@@ -2718,12 +3033,14 @@ class WorkflowTransaction:
             return ()
         prepared: list[tuple[WorkflowEvent, RunState]] = []
         intermediate = current
+        witnesses = {key: dict(value) for key, value in self._witnesses.items()}
         next_sequence = self._event_seq
         next_hash = self._event_hash
         next_status = self._run_status
         for transition in transitions:
+            before_transition = intermediate
             intermediate = self._apply_control(plan, intermediate, transition)
-            event, intermediate = self._prepare_event(
+            event, intermediate, witnesses = self._prepare_event(
                 transition.event_type,
                 intermediate,
                 {
@@ -2738,6 +3055,8 @@ class WorkflowTransaction:
                 event_seq=next_sequence + 1,
                 previous_event_hash=next_hash,
                 previous_status=next_status,
+                witnesses=witnesses,
+                previous_state=before_transition,
             )
             prepared.append((event, intermediate))
             next_sequence = event.event_seq
@@ -2765,6 +3084,7 @@ class WorkflowTransaction:
                 self._state = event_state
                 self._events.append(event)
                 committed.append(event)
+            self._witnesses = witnesses
             self.store._atomic_json(self.store.paths.state, snapshot)
             self.store._write_projections(
                 normalized_final,
