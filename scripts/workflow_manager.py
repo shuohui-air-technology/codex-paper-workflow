@@ -159,6 +159,8 @@ class WorkflowService:
                 if receipt["node_id"] == node_id and receipt["attempt"] == result["attempt"]:
                     if event.payload["result_sha256"] != digest:
                         raise WorkflowManagerError("receipt.idempotency_conflict", "same attempt supplied a different result")
+                    if self.store._current_receipt_drift_nodes(state, (event,)):
+                        raise WorkflowManagerError("recovery.required", "current attempt receipt bytes changed")
                     return json.loads(canonical_bytes(receipt))
             claims = [event for event in transaction.events("node_claimed")
                       if event.payload["claim_evidence"]["node_id"] == node_id and event.payload["claim_evidence"]["attempt"] == runtime.attempt]

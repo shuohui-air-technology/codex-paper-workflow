@@ -53,7 +53,7 @@ from .scheduler import (
     claim_transition,
 )
 from .receipts import (
-    ReceiptError, build_claim_evidence, build_stage_receipt, canonical_bytes,
+    MAX_ENVELOPE_BYTES, ReceiptError, build_claim_evidence, build_stage_receipt, canonical_bytes,
     validate_stage_receipt,
 )
 from .schema import (
@@ -1218,11 +1218,40 @@ def validate_node_evidence_delta(
     """Check claims/completions across every event name, both commit and replay."""
     if before is None:
         return
+    if event_type == "recovery_running_blocked":
+        running = sorted(node_id for node_id, runtime in before.nodes.items()
+                         if runtime.status is NodeStatus.RUNNING)
+        expected_nodes = dict(before.nodes)
+        for node_id in running:
+            expected_nodes[node_id] = replace(expected_nodes[node_id], status=NodeStatus.BLOCKED)
+        if not running or _json_value(payload.get("node_ids")) != running or after != replace(before, nodes=expected_nodes):
+            raise StoreError("events.invalid_recovery", "uncertain-work recovery must only block every running attempt")
     derived = None
     for node_id, node in plan.nodes.items():
         if node.type not in {"task", "validator"}:
             continue
         earlier, current = before.nodes[node_id], after.nodes[node_id]
+        protected = earlier.status is NodeStatus.RUNNING or (
+            earlier.attempt > 0 and earlier.status in {
+                NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.BLOCKED,
+                NodeStatus.SKIPPED, NodeStatus.STALE,
+            }
+        )
+        if protected and earlier.status is not current.status:
+            completion = earlier.status is NodeStatus.RUNNING and current.status in {
+                NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED,
+            }
+            recovery = (earlier.status is NodeStatus.RUNNING and current.status is NodeStatus.BLOCKED
+                        and event_type == "recovery_running_blocked")
+            invalidation = current.status is NodeStatus.STALE and event_type in {"artifact_registered", "artifacts_marked_stale"}
+            if not (completion or recovery or invalidation):
+                code = "artifact.authority_invalid" if event_type == "artifact_registered" else "events.invalid_evidence"
+                raise StoreError(code, "attempt reset requires an authorized lifecycle transition")
+            if invalidation and (
+                current.claim_token_hash != earlier.claim_token_hash or current.outputs != earlier.outputs
+                or current.outcome != earlier.outcome
+            ):
+                raise StoreError("artifact.authority_invalid", "invalidation cannot rewrite the attempt's historical evidence")
         if current.status is NodeStatus.SKIPPED and earlier.status not in {NodeStatus.RUNNING, NodeStatus.SKIPPED}:
             if event_type not in {"node_result_recorded", "condition_selected", "join_succeeded"}:
                 if event_type not in {"readiness_refreshed", "artifact_registered", "fact_recorded", "decision_recorded"}:
@@ -1236,7 +1265,8 @@ def validate_node_evidence_delta(
             if earlier.status is not NodeStatus.RUNNING or event_type != "node_result_recorded":
                 raise StoreError("events.invalid_completion", "execution failure requires a receipted running attempt")
         if (earlier.status is current.status and earlier.status in {
-                NodeStatus.RUNNING, NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED
+                NodeStatus.RUNNING, NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED,
+                NodeStatus.BLOCKED, NodeStatus.STALE,
             } and earlier != current):
             raise StoreError("events.invalid_evidence", "an existing attempt's frozen evidence changed")
         if earlier.status is NodeStatus.RUNNING and current.status is NodeStatus.BLOCKED and event_type != "recovery_running_blocked":
@@ -2340,6 +2370,7 @@ class WorkflowStore:
             raise StoreError("recovery.required", "verified event suffix must be recovered before mutation")
         if require_no_suffix and (
             self._artifact_drift_ids(state) or self._witness_drift_producers(boundary_witnesses)
+            or self._current_receipt_drift_nodes(state, events)
         ):
             raise StoreError("recovery.required", "artifact bytes must be recovered before mutation")
         self._receipt_material(events, require_existing=require_no_suffix)
@@ -2383,6 +2414,7 @@ class WorkflowStore:
                 raise StoreError("events.unreplayable", "event artifact path is unsafe") from exc
         _validate_artifact_authority(plan, state)
         validate_node_evidence_delta(plan, previous_state, state, event.event_type, event.payload, prior_events, witnesses)
+        self._validate_drift_transition(plan, previous_state, state, event.event_type, event.payload, witnesses, prior_events)
         _validate_edge_and_winner_transition(
             plan, previous_state, state, event.event_type, event.payload
         )
@@ -2395,6 +2427,50 @@ class WorkflowStore:
         witnesses.clear()
         witnesses.update(next_witnesses)
         return state, run_status
+
+    def _read_receipt_projection(self, path: Path) -> bytes | None:
+        """Inspect without following links or blocking on nonregular files."""
+        self._checked(path)
+        limit = MAX_ENVELOPE_BYTES + 1  # The canonical projection adds one newline.
+        try:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(info.st_mode):
+                raise StoreError("receipt.invalid_projection", "receipt projection is not a regular file")
+            if info.st_size > limit:
+                raise StoreError("receipt.projection_too_large", "receipt projection exceeds its size limit")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise StoreError("receipt.invalid_projection", "receipt projection changed during inspection")
+                if opened.st_size > limit:
+                    raise StoreError("receipt.projection_too_large", "receipt projection exceeds its size limit")
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    raw = handle.read(limit + 1)
+            finally:
+                os.close(descriptor)
+            if len(raw) > limit:
+                raise StoreError("receipt.projection_too_large", "receipt projection exceeds its size limit")
+            return raw
+        except OSError as exc:
+            raise StoreError("receipt.inspection_failed", "could not safely inspect receipt projection") from exc
+
+    def _receipt_directory_entries(self, directory: Path):
+        self._checked(directory)
+        try:
+            try:
+                info = directory.lstat()
+            except FileNotFoundError:
+                return
+            if not stat.S_ISDIR(info.st_mode):
+                raise StoreError("receipt.invalid_projection", "receipt run path is not a directory")
+            yield from directory.iterdir()
+        except OSError as exc:
+            raise StoreError("receipt.inspection_failed", "could not safely inspect receipt directory") from exc
 
     def _receipt_material(
         self, events: Sequence[WorkflowEvent], *, require_existing: bool = False,
@@ -2413,29 +2489,30 @@ class WorkflowStore:
             if path in material:
                 raise StoreError("receipt.conflict", "duplicate attempt receipt")
             material[path] = raw
-            if path.exists():
-                if path.read_bytes() != raw:
+            existing = self._read_receipt_projection(path)
+            if existing is not None:
+                if existing != raw:
                     raise StoreError("receipt.conflict", "receipt projection differs from committed event")
             elif require_existing:
                 raise StoreError("recovery.required", "committed receipt projection is missing")
         if events:
             directory = self.paths.receipts / events[0].run_id
-            self._checked(directory)
-            if directory.exists():
-                for path in directory.iterdir():
-                    self._checked(path)
-                    if path not in material:
-                        raise StoreError("receipt.orphan", "receipt file lacks a committed completion event")
+            for path in self._receipt_directory_entries(directory):
+                self._checked(path)
+                if path not in material:
+                    raise StoreError("receipt.orphan", "receipt file lacks a committed completion event")
         return material
 
     def _write_receipts(self, material: Mapping[Path, bytes]) -> bool:
         changed = False
         for path, raw in material.items():
-            self._checked(path)
-            if not path.exists():
+            existing = self._read_receipt_projection(path)
+            if existing is None:
                 self._ensure_locked_directory(path.parent)
                 self._atomic_bytes(path, raw)
                 changed = True
+            elif existing != raw:
+                raise StoreError("receipt.conflict", "receipt projection changed before projection write")
         return changed
 
     def _write_projections(
@@ -2499,6 +2576,30 @@ class WorkflowStore:
                         drifted.add(proof.producer_node_id)
                 except (OSError, PathSafetyError):
                     drifted.add(proof.producer_node_id)
+        return tuple(sorted(drifted))
+
+    @staticmethod
+    def _current_success_receipts(state, events):
+        for event in events:
+            if event.event_type != "node_result_recorded":
+                continue
+            receipt = event.payload["receipt"]
+            runtime = state.nodes[receipt["node_id"]]
+            if (runtime.status is NodeStatus.SUCCEEDED and runtime.attempt == receipt["attempt"]
+                    and runtime.claim_token_hash == receipt["claim_token_sha256"]):
+                yield receipt
+
+    def _current_receipt_drift_nodes(self, state, events) -> tuple[str, ...]:
+        """Current successful attempts keep their own file authority after ID replacement."""
+        drifted = set()
+        for receipt in self._current_success_receipts(state, events):
+            for artifact in (*receipt["input_artifacts"], *receipt["output_artifacts"]):
+                try:
+                    path = resolve_project_path(self.project_root, artifact["path"])
+                    if not path.is_file() or self._hash_file(path) != artifact["sha256"]:
+                        drifted.add(receipt["node_id"])
+                except (OSError, PathSafetyError):
+                    drifted.add(receipt["node_id"])
         return tuple(sorted(drifted))
 
     def _require_verified_artifact_bytes(self, state: RunState) -> None:
@@ -2719,6 +2820,31 @@ class WorkflowStore:
                         f"registration removed an unrelated route: {edge_id}",
                     )
 
+    def _validate_drift_transition(self, plan, before, after, event_type, payload, witnesses, events):
+        if event_type != "artifacts_marked_stale":
+            return
+        artifact_ids = payload.get("artifact_ids")
+        producer_ids = payload.get("witness_producer_ids")
+        receipt_ids = payload.get("receipt_node_ids", ())
+        witnessed_producers = {proof.producer_node_id for proofs in witnesses.values() for proof in proofs.values()}
+        receipt_nodes = set() if before is None else {
+            receipt["node_id"] for receipt in self._current_success_receipts(before, events)
+        }
+        if (before is None or not isinstance(artifact_ids, (list, tuple))
+                or not isinstance(producer_ids, (list, tuple))
+                or not isinstance(receipt_ids, (list, tuple))
+                or any(not isinstance(item, str) or item not in before.artifacts for item in artifact_ids)
+                or any(not isinstance(item, str) or item not in witnessed_producers for item in producer_ids)
+                or any(not isinstance(item, str) or item not in receipt_nodes for item in receipt_ids)
+                or list(artifact_ids) != sorted(set(artifact_ids))
+                or list(producer_ids) != sorted(set(producer_ids))
+                or list(receipt_ids) != sorted(set(receipt_ids))
+                or not (artifact_ids or producer_ids or receipt_ids)):
+            raise StoreError("events.invalid_invalidation", "drift event requires canonical evidence identifiers")
+        expected = self._mark_drift(plan, before, artifact_ids, sorted(set(producer_ids) | set(receipt_ids)))
+        if after != expected:
+            raise StoreError("events.invalid_invalidation", "drift state differs from the defined lineage invalidation")
+
     def _mark_drift(
         self,
         plan: CompiledPlan,
@@ -2876,8 +3002,9 @@ class WorkflowStore:
 
             drifted = list(self._artifact_drift_ids(state))
             historical_producers = self._witness_drift_producers(witnesses)
-            if drifted or historical_producers:
-                stale = self._mark_drift(plan, state, drifted, historical_producers)
+            receipt_nodes = self._current_receipt_drift_nodes(state, events)
+            if drifted or historical_producers or receipt_nodes:
+                stale = self._mark_drift(plan, state, drifted, sorted(set(historical_producers) | set(receipt_nodes)))
                 transaction = self._transaction(lease)
                 transaction._set_loaded(plan, state, sequence, event_hash, run_status, events, witnesses)
                 transaction._commit_event(
@@ -2886,6 +3013,7 @@ class WorkflowStore:
                     {
                         "artifact_ids": list(drifted),
                         "witness_producer_ids": list(historical_producers),
+                        "receipt_node_ids": list(receipt_nodes),
                     },
                     run_status=run_status,
                 )
@@ -2922,7 +3050,7 @@ class WorkflowStore:
                 self._write_projections(state, run_status)
             except StoreError as exc:
                 return RecoveryResult("blocked", exc.code, state, archived)
-            if drifted or historical_producers:
+            if drifted or historical_producers or receipt_nodes:
                 return RecoveryResult("recovered", "recovery.artifact_drift", state, archived)
             if changed:
                 return RecoveryResult("recovered", "recovery.replayed", state, archived)
@@ -3047,6 +3175,10 @@ class WorkflowTransaction:
         _validate_artifact_authority(plan, updated_state)
         validate_node_evidence_delta(plan, current, updated_state, event_type, payload,
                                      self._events, self._witnesses if witnesses is None else witnesses)
+        self.store._validate_drift_transition(plan, current, updated_state, event_type, payload,
+                                              self._witnesses if witnesses is None else witnesses, self._events)
+        if self.store._current_receipt_drift_nodes(updated_state, self._events):
+            raise StoreError("artifact.verification_failed", "current attempt receipt bytes have changed")
         _validate_edge_and_winner_transition(
             plan, current, updated_state, event_type, payload
         )

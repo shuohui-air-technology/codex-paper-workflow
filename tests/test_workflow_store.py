@@ -3076,7 +3076,8 @@ class WorkflowStoreTests(unittest.TestCase):
                 transaction._commit_event("fact_recorded", state, {}, replace_snapshot=False)
                 (root / "b.txt").write_bytes(b"changed")
                 stale = store._mark_drift(plan, state, [], ["b"])
-                transaction._commit_event("artifacts_marked_stale", stale, {},
+                transaction._commit_event("artifacts_marked_stale", stale,
+                                          {"artifact_ids": [], "witness_producer_ids": ["b"]},
                                           replace_snapshot=False)
             recovered = WorkflowStore(root).recover()
             self.assertEqual((recovered.status, recovered.code),
@@ -3668,7 +3669,8 @@ class WorkflowStoreTests(unittest.TestCase):
                         before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
                         with self.assertRaises(StoreError) as caught:
                             transaction.commit_transition(event_type, candidate)
-                        self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                        expected_code = "events.invalid_evidence" if name == "explicit_event" else "artifact.authority_invalid"
+                        self.assertEqual(caught.exception.code, expected_code)
                         self.assertEqual(
                             (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
                         )

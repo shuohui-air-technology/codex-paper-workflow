@@ -2,6 +2,8 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -466,6 +468,201 @@ class TaskProtocolTests(unittest.TestCase):
         receipt = self.service.submit_result(result)
         self.assertEqual(receipt["output_artifacts"], [])
         self.assertEqual(receipt["summary"], "Created draft.")
+
+    def test_running_resets_and_malformed_recovery_fail_commit_and_rehashed_replay(self):
+        from scripts.workflow_engine import store as store_module
+        from scripts.workflow_engine.scheduler import NodeStatus
+        from scripts.workflow_engine.store import StoreError, WorkflowEvent, WorkflowStore
+        self.service.claim("directions")
+        store = self.service.store
+        original_log, original_snapshot = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+        with store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+        for status, event_type, payload in (
+            (NodeStatus.READY, "fact_recorded", {}),
+            (NodeStatus.PENDING, "unknown_event", {}),
+            (NodeStatus.BLOCKED, "recovery_running_blocked", {"node_ids": ["directions"]}),
+            (NodeStatus.STALE, "artifacts_marked_stale", {"artifact_ids": [], "witness_producer_ids": []}),
+        ):
+            forged = replace(state, nodes={"directions": replace(state.nodes["directions"], status=status, claim_token_hash="")})
+            with self.subTest(status=status, boundary="commit"), store.locked_run() as transaction:
+                transaction.load_active_run()
+                with self.assertRaises(StoreError):
+                    transaction.commit_transition(event_type, forged, payload)
+            self.assertEqual(store.paths.events.read_bytes(), original_log)
+            for boundary in ("full_chain", "suffix"):
+                with self.subTest(status=status, boundary=boundary):
+                    previous = json.loads(original_log.splitlines()[-1])
+                    event = WorkflowEvent.create(event_seq=previous["event_seq"] + 1,
+                        run_id=state.run_id, semantic_sha256=state.semantic_sha256,
+                        event_type=event_type, previous_event_hash=previous["event_hash"],
+                        payload={**payload, "state": store_module._state_data(forged), "run_status": "active"})
+                    store.paths.events.write_bytes(original_log + store_module._canonical_bytes(event.to_payload(), newline=True))
+                    if boundary == "full_chain":
+                        snapshot = json.loads(original_snapshot)
+                        snapshot.update(state=store_module._state_data(forged), last_applied_event_seq=event.event_seq, last_applied_event_hash=event.event_hash)
+                        store.paths.state.write_text(json.dumps(snapshot))
+                    else:
+                        with store.paths.events.open("ab") as handle:
+                            handle.write(b'{"partial":')
+                    before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                    recovered = WorkflowStore(self.project).recover()
+                    self.assertEqual(recovered.status, "blocked", recovered.code)
+                    self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+                    self.assertFalse(store.paths.recovery.exists())
+                    store.paths.events.write_bytes(original_log)
+                    store.paths.state.write_bytes(original_snapshot)
+
+    def test_current_receipt_drift_is_checked_after_legal_serial_same_id_replacement(self):
+        from scripts.workflow_engine.store import WorkflowStore
+        self.service.store.deactivate_custom()
+        document = copy.deepcopy(self.document)
+        other = dict(document["nodes"][0], id="other", entry=False)
+        document["nodes"].append(other)
+        document["ui"]["positions"]["other"] = {"x": 400, "y": 80}
+        document["edges"] = [{"id": "serial", "source": "directions", "target": "other", "trigger": "succeeded", "output_map": {}}]
+        validation = self.service.validate_document(document)
+        self.assertEqual(validation["status"], "pass", validation)
+        self.service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+        first = self.service.claim("directions")
+        original_result = self.result(first)
+        original_receipt = self.service.submit_result(original_result)
+        second = self.service.claim("other")
+        (self.project / "other.md").write_text("new output")
+        later_result = dict(task_result(), run_id=second["run_id"], node_id="other", attempt=second["attempt"],
+            idempotency_token=second["idempotency_token"], artifacts=[{"id": "research_idea_brief", "path": "other.md"}])
+        self.service.submit_result(later_result)
+        with self.service.store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+            self.assertEqual(state.artifacts["research_idea_brief"].path, "other.md")
+        before = self.service.store.paths.events.read_bytes()
+        self.assertEqual(self.service.submit_result(original_result), original_receipt)
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before)
+        self.assertEqual(self.service.store.recover().status, "clean")
+        receipt_path = self.service.store.paths.receipts / first["run_id"] / "directions-attempt-1.json"
+        old_receipt_bytes = receipt_path.read_bytes()
+        (self.project / "idea.md").write_text("actual old-output byte drift")
+        with self.assertRaises(Exception) as caught:
+            self.service.submit_result(original_result)
+        self.assertEqual(caught.exception.code, "recovery.required")
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before)
+        recovered = WorkflowStore(self.project).recover()
+        self.assertEqual((recovered.status, recovered.code), ("recovered", "recovery.artifact_drift"))
+        self.assertEqual(recovered.state.nodes["directions"].status.value, "stale")
+        self.assertEqual(recovered.state.nodes["other"].status.value, "stale")
+        self.assertEqual(receipt_path.read_bytes(), old_receipt_bytes)
+        self.assertEqual(WorkflowStore(self.project).recover().status, "clean")
+
+    def test_recovered_blocked_attempt_retains_its_claim_evidence(self):
+        from scripts.workflow_engine.store import StoreError
+        self.service.claim("directions")
+        recovered = self.service.store.recover()
+        self.assertEqual(recovered.state.nodes["directions"].status.value, "blocked")
+        before = self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()
+        with self.service.store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+            forged = replace(state, nodes={"directions": replace(state.nodes["directions"], claim_token_hash="")})
+            with self.assertRaises(StoreError) as caught:
+                transaction.commit_transition("fact_recorded", forged)
+            self.assertEqual(caught.exception.code, "events.invalid_evidence")
+        self.assertEqual((self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()), before)
+
+    def test_stale_attempt_retains_its_claim_evidence(self):
+        from scripts.workflow_engine.store import StoreError
+        invocation = self.service.claim("directions")
+        self.service.submit_result(self.result(invocation))
+        (self.project / "idea.md").write_text("drift")
+        recovered = self.service.store.recover()
+        self.assertEqual(recovered.state.nodes["directions"].status.value, "stale")
+        before = self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()
+        with self.service.store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+            forged = replace(state, nodes={"directions": replace(state.nodes["directions"], claim_token_hash="")})
+            with self.assertRaises(StoreError) as caught:
+                transaction.commit_transition("fact_recorded", forged)
+            self.assertEqual(caught.exception.code, "events.invalid_evidence")
+        self.assertEqual((self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()), before)
+
+    def test_directory_and_oversized_receipt_projections_block_without_rewrites(self):
+        invocation = self.service.claim("directions")
+        self.service.submit_result(self.result(invocation))
+        store = self.service.store
+        path = store.paths.receipts / invocation["run_id"] / "directions-attempt-1.json"
+        original = path.read_bytes()
+        for kind in ("directory", "oversize"):
+            path.unlink()
+            if kind == "directory":
+                path.mkdir()
+            else:
+                path.write_bytes(b"x" * (1024 * 1024 + 2))
+            before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+            with self.subTest(kind=kind):
+                result = store.recover()
+                self.assertEqual(result.status, "blocked")
+                self.assertIn(result.code, {"receipt.invalid_projection", "receipt.projection_too_large"})
+                with self.assertRaises(Exception) as caught:
+                    self.service.ready()
+                self.assertEqual(caught.exception.code, result.code)
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+            if kind == "directory":
+                path.rmdir()
+            else:
+                path.unlink()
+            path.write_bytes(original)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO is not supported on this platform")
+    def test_fifo_receipt_projection_never_blocks_recovery_on_open(self):
+        invocation = self.service.claim("directions")
+        self.service.submit_result(self.result(invocation))
+        store = self.service.store
+        path = store.paths.receipts / invocation["run_id"] / "directions-attempt-1.json"
+        path.unlink()
+        os.mkfifo(path)
+        before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+        probe = subprocess.run([sys.executable, "-B", "-c",
+            "import json,sys; from scripts.workflow_engine.store import WorkflowStore; r=WorkflowStore(sys.argv[1]).recover(); print(json.dumps({'status':r.status,'code':r.code}))",
+            str(self.project)], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=2)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(json.loads(probe.stdout), {"status": "blocked", "code": "receipt.invalid_projection"})
+        self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_duplicate_rechecks_receipt_after_other_locked_preflight_work(self):
+        invocation = self.service.claim("directions")
+        result = self.result(invocation)
+        self.service.submit_result(result)
+        before = self.service.store.paths.events.read_bytes()
+        original_identity = self.service._identity
+        def mutate_after_load(node):
+            identity = original_identity(node)
+            (self.project / "idea.md").write_text("changed after load but before duplicate response")
+            return identity
+        with mock.patch.object(self.service, "_identity", side_effect=mutate_after_load):
+            with self.assertRaises(Exception) as caught:
+                self.service.submit_result(result)
+        self.assertEqual(caught.exception.code, "recovery.required")
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before)
+
+    def test_projection_read_and_listing_errors_are_structured_and_zero_write(self):
+        invocation = self.service.claim("directions")
+        self.service.submit_result(self.result(invocation))
+        store = self.service.store
+        directory = store.paths.receipts / invocation["run_id"]
+        path = directory / "directions-attempt-1.json"
+        before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+        original_open, original_iterdir = os.open, Path.iterdir
+        def denied_read(target, *args, **kwargs):
+            if Path(target) == path:
+                raise PermissionError("injected receipt read failure")
+            return original_open(target, *args, **kwargs)
+        def denied_listing(target):
+            if target == directory:
+                raise PermissionError("injected receipt list failure")
+            return original_iterdir(target)
+        for target, replacement in (("os.open", denied_read), ("pathlib.Path.iterdir", denied_listing)):
+            with self.subTest(target=target), mock.patch(target, side_effect=replacement, autospec=True):
+                recovered = store.recover()
+                self.assertEqual((recovered.status, recovered.code), ("blocked", "receipt.inspection_failed"))
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
 
 
 class HistoricalInputEvidenceTests(unittest.TestCase):
