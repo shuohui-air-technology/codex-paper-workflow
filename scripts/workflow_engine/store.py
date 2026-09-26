@@ -50,6 +50,7 @@ from .scheduler import (
     mark_descendants_stale,
     refresh_ready,
     result_transition,
+    rerun_stale_transition,
     claim_transition,
     validator_claim_transition,
     validator_result_transition,
@@ -482,6 +483,13 @@ def _validate_lifecycle_step(
     if status not in {"active", "stopped", "archived"}:
         raise StoreError(
             "events.lifecycle_invalid", "runtime event has an invalid durable status"
+        )
+    if event.event_type == "stale_rerun_requested" and (
+        previous_status != "active" or status != "active"
+    ):
+        raise StoreError(
+            "events.invalid_stale_rerun",
+            "stale reruns are valid only within an active run",
         )
     if event.event_seq == 1:
         if (
@@ -1268,6 +1276,30 @@ def _validate_edge_and_winner_transition(
 EdgeWitnesses = dict[str, dict[str, ArtifactRuntime]]
 
 
+def _stale_rerun_event_fields(
+    plan: CompiledPlan,
+    before: RunState,
+    after: RunState,
+    root_node_id: str,
+    affected_node_ids: Sequence[str],
+) -> dict[str, object]:
+    affected = tuple(affected_node_ids)
+    reset_edges = sorted({
+        edge_id for node_id in affected for edge_id in plan.outgoing[node_id]
+    })
+    return {
+        "root_node_id": root_node_id,
+        "affected_node_ids": list(affected),
+        "reset_edge_ids": reset_edges,
+        "attempts_before": {
+            node_id: before.nodes[node_id].attempt for node_id in affected
+        },
+        "attempts_after": {
+            node_id: after.nodes[node_id].attempt for node_id in affected
+        },
+    }
+
+
 def validate_node_evidence_delta(
     plan: CompiledPlan,
     before: RunState | None,
@@ -1279,6 +1311,31 @@ def validate_node_evidence_delta(
 ) -> None:
     """Check claims/completions across every event name, both commit and replay."""
     if before is None:
+        return
+    if event_type == "stale_rerun_requested":
+        fields = {key: value for key, value in payload.items() if key not in {"state", "run_status"}}
+        expected_keys = {
+            "root_node_id", "affected_node_ids", "reset_edge_ids",
+            "attempts_before", "attempts_after",
+        }
+        root_node_id = fields.get("root_node_id")
+        if set(fields) != expected_keys or not isinstance(root_node_id, str):
+            raise StoreError("events.invalid_stale_rerun", "stale rerun event fields are invalid")
+        try:
+            expected, affected = rerun_stale_transition(plan, before, root_node_id)
+        except WorkflowError as exc:
+            raise StoreError("events.invalid_stale_rerun", str(exc)) from exc
+        expected_fields = _stale_rerun_event_fields(
+            plan, before, expected, root_node_id, affected
+        )
+        if (
+            _canonical_bytes(fields) != _canonical_bytes(expected_fields)
+            or _state_data(expected) != _state_data(after)
+        ):
+            raise StoreError(
+                "events.invalid_stale_rerun",
+                "stale rerun event differs from the scheduler's deterministic transition",
+            )
         return
     if event_type == "validator_retried":
         fields = set(payload) - {"state", "run_status"}
@@ -3462,6 +3519,16 @@ class WorkflowTransaction:
         payload: Mapping[str, object] | None = None,
     ) -> WorkflowEvent:
         return self._commit_event(event_type, updated_state, {} if payload is None else payload)
+
+    def request_stale_rerun(self, node_id: str) -> WorkflowEvent:
+        """Persist the explicit stale-rerun transition without claiming work."""
+        plan, state = self._require_loaded()
+        try:
+            updated, affected = rerun_stale_transition(plan, state, node_id)
+        except WorkflowError as exc:
+            raise StoreError(exc.code, str(exc)) from exc
+        payload = _stale_rerun_event_fields(plan, state, updated, node_id, affected)
+        return self._commit_event("stale_rerun_requested", updated, payload)
 
     def commit_receipted_transition(self, event_type, updated_state, receipt, *, result_sha256, claim_event_seq):
         if event_type not in {"node_result_recorded", "validator_result_recorded"}:

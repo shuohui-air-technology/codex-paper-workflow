@@ -23,6 +23,7 @@ from scripts.workflow_engine.scheduler import (
     refresh_ready,
     result_transition,
     retry_transition,
+    rerun_stale_transition,
     validator_claim_transition,
     validator_result_transition,
     validator_retry_transition,
@@ -603,6 +604,199 @@ class WorkflowSchedulerTests(unittest.TestCase):
         self.assertEqual(stale.nodes["a"].status, NodeStatus.SUCCEEDED)
         self.assertEqual(stale.nodes["b"].status, NodeStatus.STALE)
         self.assertEqual(stale.nodes["c"].status, NodeStatus.STALE)
+
+    def test_rerun_stale_requeues_only_the_stale_closure_without_consuming_attempts(self):
+        plan = self.compile(
+            [
+                task("a", entry=True, outputs=("draft",)),
+                task("b", inputs=("draft",)),
+                task("c"),
+                task("independent", entry=True),
+            ],
+            [edge("a-b", "a", "b", output_map={"draft": "draft"}), edge("b-c", "b", "c")],
+        )
+        state = initial_run(plan, "run-stale-rerun")
+        state = self.complete(
+            plan,
+            state,
+            "a",
+            outputs={"draft": "draft.md"},
+            artifacts=(self.artifact("draft", "draft.md", node="a", attempt=1),),
+        )
+        state = self.complete(plan, state, "b")
+        state = self.complete(plan, state, "c")
+        state = self.complete(plan, state, "independent")
+
+        nodes = dict(state.nodes)
+        for node_id in ("a", "b", "c"):
+            nodes[node_id] = replace(
+                nodes[node_id], status=NodeStatus.STALE, outcome="",
+                selected_inputs=MappingProxyType({}),
+                auxiliary_outputs=MappingProxyType({}), claim_token_hash="",
+            )
+        edges = {edge_id: EdgeRuntime(EdgeStatus.WAITING) for edge_id in plan.edges}
+        stale = replace(
+            state,
+            nodes=MappingProxyType(nodes),
+            edges=MappingProxyType(edges),
+            artifacts=MappingProxyType({
+                "draft": replace(state.artifacts["draft"], state="stale"),
+            }),
+        )
+        rerun, affected = rerun_stale_transition(plan, stale, "a")
+
+        self.assertEqual(affected, ("a", "b", "c"))
+        self.assertEqual(rerun.nodes["a"].status, NodeStatus.READY)
+        self.assertEqual(rerun.nodes["b"].status, NodeStatus.PENDING)
+        self.assertEqual(rerun.nodes["c"].status, NodeStatus.PENDING)
+        self.assertEqual(rerun.nodes["independent"], stale.nodes["independent"])
+        self.assertEqual(rerun.nodes["a"].attempt, stale.nodes["a"].attempt)
+        self.assertEqual(rerun.nodes["a"].outputs, stale.nodes["a"].outputs)
+        self.assertEqual(rerun.artifacts["draft"].state, "stale")
+        self.assertTrue(all(
+            rerun.edges[edge_id] == EdgeRuntime(EdgeStatus.WAITING)
+            for node_id in affected for edge_id in plan.outgoing[node_id]
+        ))
+        self.assertEqual(stale.nodes["a"].status, NodeStatus.STALE)
+
+        for invalid_id in ("missing", "independent"):
+            with self.subTest(invalid_id=invalid_id), self.assertRaises(WorkflowError) as caught:
+                rerun_stale_transition(plan, stale, invalid_id)
+            self.assertEqual(caught.exception.code, "runtime.invalid_stale_rerun")
+        with self.assertRaises(WorkflowError) as duplicate:
+            rerun_stale_transition(plan, rerun, "a")
+        self.assertEqual(duplicate.exception.code, "runtime.invalid_stale_rerun")
+
+    def test_rerun_stale_refuses_to_reset_a_frozen_any_success_winner(self):
+        plan = self.compile(
+            [
+                task("a", entry=True, outputs=("draft",)),
+                task("b", entry=True, outputs=("draft",)),
+                join("joined", outputs=("draft",), mode="any_success"),
+                task("consumer", inputs=("draft",)),
+            ],
+            [
+                edge("a-joined", "a", "joined", output_map={"draft": "draft"}),
+                edge("b-joined", "b", "joined", output_map={"draft": "draft"}),
+                edge("joined-consumer", "joined", "consumer", output_map={"draft": "draft"}),
+            ],
+        )
+        state = initial_run(plan, "run-stale-frozen-winner")
+        state = self.complete(
+            plan, state, "b", outputs={"draft": "draft.md"},
+            artifacts=(self.artifact("draft", "draft.md", node="b", attempt=1),),
+        )
+        state, _ = stabilize_control_nodes(plan, state)
+        self.assertEqual(state.nodes["joined"].status, NodeStatus.SUCCEEDED)
+        invalidated = mark_descendants_stale(plan, state, ("b",))
+        nodes = dict(invalidated.nodes)
+        nodes["b"] = replace(
+            nodes["b"], status=NodeStatus.STALE, outcome="",
+            selected_inputs=MappingProxyType({}),
+            auxiliary_outputs=MappingProxyType({}), claim_token_hash="",
+        )
+        invalidated = replace(
+            invalidated,
+            nodes=MappingProxyType(nodes),
+            artifacts=MappingProxyType({
+                "draft": replace(invalidated.artifacts["draft"], state="stale"),
+            }),
+        )
+        before = invalidated
+        with self.assertRaises(WorkflowError) as caught:
+            rerun_stale_transition(plan, invalidated, "b")
+        self.assertEqual(caught.exception.code, "runtime.stale_join_requires_new_run")
+        self.assertIs(invalidated, before)
+
+    def test_rerun_stale_closure_includes_artifact_state_condition_and_both_branches(self):
+        plan = self.compile(
+            [
+                task("a", entry=True, outputs=("doc",)),
+                condition("choose", entry=True, cases=(
+                    {"outcome": "drifted", "when": {
+                        "op": "artifact_state_is", "artifact": "doc", "value": "stale",
+                    }},
+                )),
+                task("on-stale"),
+                task("default"),
+            ],
+            [
+                edge("choose-on-stale", "choose", "on-stale", trigger="drifted"),
+                edge("choose-default", "choose", "default", trigger="default"),
+            ],
+        )
+        state = initial_run(plan, "run-artifact-state-condition-rerun")
+        state = self.complete(
+            plan, state, "a", outputs={"doc": "doc.md"},
+            artifacts=(self.artifact("doc", "doc.md", node="a", attempt=1),),
+        )
+        nodes = {
+            node_id: replace(
+                runtime, status=NodeStatus.STALE, outcome="",
+                selected_inputs=MappingProxyType({}),
+                auxiliary_outputs=MappingProxyType({}), claim_token_hash="",
+            )
+            for node_id, runtime in state.nodes.items()
+        }
+        stale = replace(
+            state,
+            nodes=MappingProxyType(nodes),
+            edges=MappingProxyType({
+                edge_id: EdgeRuntime(EdgeStatus.WAITING) for edge_id in plan.edges
+            }),
+            artifacts=MappingProxyType({
+                "doc": replace(state.artifacts["doc"], state="stale"),
+            }),
+        )
+
+        rerun, affected = rerun_stale_transition(plan, stale, "a")
+        self.assertEqual(affected, ("a", "choose", "default", "on-stale"))
+        self.assertEqual(rerun.nodes["choose"].status, NodeStatus.READY)
+        self.assertEqual(rerun.nodes["default"].status, NodeStatus.PENDING)
+        self.assertEqual(rerun.nodes["on-stale"].status, NodeStatus.PENDING)
+        stabilized, controls = stabilize_control_nodes(plan, rerun)
+        self.assertEqual(stabilized.nodes["choose"].outcome, "drifted")
+        self.assertEqual(stabilized.nodes["on-stale"].status, NodeStatus.READY)
+        self.assertEqual(stabilized.nodes["default"].status, NodeStatus.SKIPPED)
+        self.assertEqual(tuple(item.node_id for item in controls), ("choose",))
+
+    def test_rerun_stale_waits_for_a_reverified_external_input(self):
+        plan = self.compile(
+            [task("source", entry=True, inputs=("request",))],
+            [],
+            external_inputs=("request",),
+        )
+        initial = self.register(
+            initial_run(plan, "run-stale-external-input"),
+            self.artifact("request", "old-request.md"),
+        )
+        completed = self.complete(plan, initial, "source")
+        stale = replace(
+            completed,
+            nodes=MappingProxyType({
+                "source": replace(
+                    completed.nodes["source"], status=NodeStatus.STALE, outcome="",
+                    selected_inputs=MappingProxyType({}),
+                    auxiliary_outputs=MappingProxyType({}), claim_token_hash="",
+                ),
+            }),
+            artifacts=MappingProxyType({
+                "request": replace(completed.artifacts["request"], state="stale"),
+            }),
+        )
+
+        rerun, affected = rerun_stale_transition(plan, stale, "source")
+        self.assertEqual(affected, ("source",))
+        self.assertEqual(rerun.nodes["source"].status, NodeStatus.PENDING)
+        self.assertEqual(rerun.nodes["source"].attempt, 1)
+
+        fresh = self.artifact("request", "new-request.md")
+        refreshed = refresh_ready(
+            plan,
+            replace(rerun, artifacts=MappingProxyType({"request": fresh})),
+        )
+        self.assertEqual(refreshed.nodes["source"].status, NodeStatus.READY)
+        self.assertEqual(refreshed.nodes["source"].selected_inputs["request"], "new-request.md")
 
     def test_runtime_snapshots_and_nested_maps_are_immutable(self):
         plan = self.compile([task("entry", entry=True)], [])

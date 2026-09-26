@@ -871,3 +871,126 @@ def mark_descendants_stale(
         if artifact.producer_node_id in descendants and artifact.state != "stale":
             artifacts[artifact_id] = replace(artifact, state="stale")
     return _replace_state(state, nodes=nodes, edges=edges, artifacts=artifacts)
+
+
+def _predicate_mentions_any_artifact(value: object, artifact_ids: set[str]) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("op") == "artifact_state_is" and value.get("artifact") in artifact_ids:
+            return True
+        return any(_predicate_mentions_any_artifact(item, artifact_ids) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return any(_predicate_mentions_any_artifact(item, artifact_ids) for item in value)
+    return False
+
+
+def rerun_stale_transition(
+    plan: CompiledPlan,
+    state: RunState,
+    node_id: str,
+) -> tuple[RunState, tuple[str, ...]]:
+    """Explicitly requeue one stale node and its stale, winner-safe dependents.
+
+    Prior outputs and attempt numbers stay as history. Only the next claim starts
+    another attempt; stale artifact receipts remain stale until that claim succeeds.
+    """
+    _validate_binding(plan, state)
+    if node_id not in plan.nodes or state.nodes[node_id].status is not NodeStatus.STALE:
+        _fail(
+            "runtime.invalid_stale_rerun",
+            "only a currently stale node may be explicitly rerun",
+            node_id=node_id if node_id in plan.nodes else "",
+        )
+
+    affected: set[str] = set()
+    pending = [node_id]
+
+    def may_invalidate(candidate_id: str, edge_id: str | None) -> bool:
+        candidate = plan.nodes[candidate_id]
+        runtime = state.nodes[candidate_id]
+        if candidate.type != "join" or candidate.join_mode != "any_success":
+            return True
+        winner = runtime.winner_edge_id
+        return not winner or edge_id == winner
+
+    while pending:
+        current = pending.pop()
+        if current in affected or state.nodes[current].status is not NodeStatus.STALE:
+            continue
+        runtime = state.nodes[current]
+        node = plan.nodes[current]
+        if runtime.status is NodeStatus.RUNNING:
+            _fail(
+                "runtime.stale_rerun_running",
+                "stale rerun closure contains running work",
+                node_id=current,
+            )
+        if node.type == "join" and node.join_mode == "any_success" and runtime.winner_edge_id:
+            _fail(
+                "runtime.stale_join_requires_new_run",
+                "a frozen any-success winner cannot be rerun within this run",
+                node_id=current,
+            )
+        if runtime.outcome or runtime.selected_inputs or runtime.auxiliary_outputs or runtime.claim_token_hash:
+            _fail(
+                "runtime.stale_rerun_requires_recovery",
+                "stale live evidence must be quarantined before rerunning",
+                node_id=current,
+            )
+        if any(
+            state.edges[edge_id].status is not EdgeStatus.WAITING
+            or state.edges[edge_id].selected_output_map
+            for edge_id in plan.outgoing[current]
+        ):
+            _fail(
+                "runtime.stale_rerun_requires_recovery",
+                "stale outgoing routes must be cut before rerunning",
+                node_id=current,
+            )
+        affected.add(current)
+
+        for edge_id in plan.outgoing[current]:
+            target = plan.edges[edge_id].target
+            if (
+                state.nodes[target].status is NodeStatus.STALE
+                and may_invalidate(target, edge_id)
+            ):
+                pending.append(target)
+
+        stale_outputs = {
+            artifact_id
+            for artifact_id, artifact in state.artifacts.items()
+            if artifact.producer_node_id == current and artifact.state == "stale"
+        }
+        if stale_outputs:
+            for candidate_id, candidate in plan.nodes.items():
+                if candidate_id in affected or state.nodes[candidate_id].status is not NodeStatus.STALE:
+                    continue
+                consumes_output = bool(set(candidate.inputs) & stale_outputs)
+                condition_reads_output = candidate.type == "condition" and any(
+                    _predicate_mentions_any_artifact(case, stale_outputs)
+                    for case in candidate.condition_cases
+                )
+                if not (consumes_output or condition_reads_output):
+                    continue
+                if not may_invalidate(candidate_id, None):
+                    continue
+                pending.append(candidate_id)
+
+    nodes = dict(state.nodes)
+    edges = dict(state.edges)
+    for affected_id in affected:
+        nodes[affected_id] = replace(
+            nodes[affected_id],
+            status=NodeStatus.PENDING,
+            outcome="",
+            selected_inputs=_string_map(),
+            auxiliary_outputs=_aux_map(),
+            claim_token_hash="",
+        )
+        _set_outgoing_status(plan, edges, affected_id, EdgeStatus.WAITING)
+
+    refreshed = refresh_ready(
+        plan,
+        _replace_state(state, nodes=nodes, edges=edges),
+    )
+    return refreshed, tuple(sorted(affected))

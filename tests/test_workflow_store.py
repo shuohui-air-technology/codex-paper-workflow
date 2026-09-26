@@ -37,6 +37,7 @@ from scripts.workflow_engine.scheduler import (
     initial_run,
     result_transition,
     refresh_ready,
+    rerun_stale_transition,
     stabilize_control_nodes,
 )
 from scripts.workflow_engine.schema import document_sha256, parse_workflow
@@ -2702,6 +2703,298 @@ class WorkflowStoreTests(unittest.TestCase):
                 with self.subTest(receipt_output_field=field), self.assertRaises(StoreError) as caught:
                     workflow_store._validate_artifact_authority(plan, later_state, forged_history)
                 self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+
+    def test_stale_rerun_event_is_exact_idempotent_and_claim_advances_attempt(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            draft = root / "draft.txt"
+            draft.write_bytes(b"original")
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, "run-stale-rerun-event")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", "original-token")
+                commit_claim(transaction, running)
+                completed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "draft.txt", sha256_bytes(b"original"),
+                        "verified", "produce", 1,
+                    )],
+                })
+                commit_result(transaction, completed)
+
+            draft.write_bytes(b"changed")
+            stale = store.recover()
+            self.assertIn(stale.status, {"clean", "recovered"})
+            self.assertEqual(stale.state.nodes["produce"].status.value, "stale")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                expected, affected = rerun_stale_transition(plan, state, "produce")
+                payload = workflow_store._stale_rerun_event_fields(
+                    plan, state, expected, "produce", affected
+                )
+                before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_transition(
+                        "stale_rerun_requested", expected,
+                        {**payload, "affected_node_ids": []},
+                    )
+                self.assertEqual(caught.exception.code, "events.invalid_stale_rerun")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+                event = transaction.request_stale_rerun("produce")
+                self.assertEqual(event.event_type, "stale_rerun_requested")
+                _, rerun_state = transaction._require_loaded()
+                self.assertEqual(rerun_state.nodes["produce"].status, NodeStatus.READY)
+                self.assertEqual(rerun_state.nodes["produce"].attempt, 1)
+                self.assertEqual(rerun_state.nodes["produce"].outputs, {"draft": "draft.txt"})
+                self.assertEqual(rerun_state.artifacts["draft"].state, "stale")
+                self.assertEqual(event.payload["attempts_before"], {"produce": 1})
+                self.assertEqual(event.payload["attempts_after"], {"produce": 1})
+
+                before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+                with self.assertRaises(StoreError) as duplicate:
+                    transaction.request_stale_rerun("produce")
+                self.assertEqual(duplicate.exception.code, "runtime.invalid_stale_rerun")
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+            with store.locked_run() as transaction:
+                plan, rerun_state = transaction.load_active_run()
+                second_attempt = claim_transition(plan, rerun_state, "produce", "new-token")
+                commit_claim(transaction, second_attempt)
+                self.assertEqual(second_attempt.nodes["produce"].attempt, 2)
+                self.assertEqual(second_attempt.artifacts["draft"].state, "stale")
+
+    def test_rehashed_stale_rerun_forgery_blocks_full_chain_and_suffix_without_writes(self):
+        def stale_store(root, run_id):
+            draft = root / "draft.txt"
+            draft.write_bytes(b"original")
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, run_id)
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", f"{run_id}-token")
+                commit_claim(transaction, running)
+                completed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "draft.txt", sha256_bytes(b"original"),
+                        "verified", "produce", 1,
+                    )],
+                })
+                commit_result(transaction, completed)
+            draft.write_bytes(b"changed")
+            store.recover()
+            return store, plan
+
+        for boundary in ("suffix", "full_chain"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_id = f"run-stale-rerun-forged-{boundary}"
+                store, plan = stale_store(root, run_id)
+                with store.locked_run() as transaction:
+                    plan, state = transaction.load_active_run()
+                    expected, affected = rerun_stale_transition(plan, state, "produce")
+                    payload = workflow_store._stale_rerun_event_fields(
+                        plan, state, expected, "produce", affected
+                    )
+                forged_payload = {**payload, "affected_node_ids": []}
+                event = append_rehashed_state_event(
+                    store,
+                    workflow_store._state_data(expected),
+                    "stale_rerun_requested",
+                    forged_payload,
+                )
+                if boundary == "full_chain":
+                    snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+                    snapshot["state"] = workflow_store._state_data(expected)
+                    snapshot["last_applied_event_seq"] = event.event_seq
+                    snapshot["last_applied_event_hash"] = event.event_hash
+                    store.paths.state.write_text(
+                        json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+                recovered = WorkflowStore(root).recover()
+                self.assertEqual((recovered.status, recovered.code),
+                                 ("blocked", "events.invalid_stale_rerun"))
+                self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+    def test_stale_rerun_rejects_attempt_output_and_route_tampering_without_writes(self):
+        from tests.test_workflow_scheduler import WorkflowSchedulerTests
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            draft = root / "draft.txt"
+            draft.write_bytes(b"original")
+            plan = WorkflowSchedulerTests().compile(
+                [
+                    workflow_task("source", entry=True, outputs=("draft",)),
+                    workflow_task("sink", inputs=("draft",)),
+                ],
+                [workflow_edge(
+                    "source-sink", "source", "sink", output_map={"draft": "draft"}
+                )],
+            )
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-stale-rerun-forgery")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "source", "source-token")
+                commit_claim(transaction, running)
+                completed = result_transition(plan, running, {
+                    "node_id": "source", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "draft.txt", sha256_bytes(b"original"),
+                        "verified", "source", 1,
+                    )],
+                })
+                commit_result(transaction, completed)
+
+            draft.write_bytes(b"changed")
+            store.recover()
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                expected, affected = rerun_stale_transition(plan, state, "source")
+                payload = workflow_store._stale_rerun_event_fields(
+                    plan, state, expected, "source", affected
+                )
+                self.assertEqual(payload["reset_edge_ids"], ["source-sink"])
+                mutations = (
+                    ("edge_list", expected, {**payload, "reset_edge_ids": []}),
+                    ("attempt_map", expected, {
+                        **payload, "attempts_after": {"sink": 0, "source": 2},
+                    }),
+                    ("attempt_state", replace(expected, nodes=MappingProxyType({
+                        **expected.nodes,
+                        "source": replace(expected.nodes["source"], attempt=2),
+                    })), payload),
+                    ("output_resurrection", replace(expected, nodes=MappingProxyType({
+                        **expected.nodes,
+                        "source": replace(expected.nodes["source"], outcome="succeeded"),
+                    })), payload),
+                    ("satisfied_route", replace(expected, edges=MappingProxyType({
+                        **expected.edges,
+                        "source-sink": EdgeRuntime(EdgeStatus.SATISFIED, {"draft": "draft.txt"}),
+                    })), payload),
+                )
+                for name, forged, forged_payload in mutations:
+                    before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+                    with self.subTest(name=name), self.assertRaises(StoreError):
+                        transaction.commit_transition(
+                            "stale_rerun_requested", forged, forged_payload
+                        )
+                    self.assertEqual(
+                        (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                    )
+
+    def test_stale_rerun_suffix_recovery_applies_the_committed_transition(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            draft = root / "draft.txt"
+            draft.write_bytes(b"original")
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, "run-stale-rerun-suffix")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", "original-token")
+                commit_claim(transaction, running)
+                completed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "draft.txt", sha256_bytes(b"original"),
+                        "verified", "produce", 1,
+                    )],
+                })
+                commit_result(transaction, completed)
+            draft.write_bytes(b"changed")
+            store.recover()
+
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                updated, affected = rerun_stale_transition(plan, state, "produce")
+                payload = workflow_store._stale_rerun_event_fields(
+                    plan, state, updated, "produce", affected
+                )
+                transaction._commit_event(
+                    "stale_rerun_requested", updated, payload, replace_snapshot=False
+                )
+
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual((recovered.status, recovered.code),
+                             ("recovered", "recovery.replayed"))
+            self.assertEqual(recovered.state.nodes["produce"].status, NodeStatus.READY)
+            self.assertEqual(recovered.state.nodes["produce"].attempt, 1)
+            self.assertEqual(recovered.state.artifacts["draft"].state, "stale")
+            self.assertEqual(store.read_run_events()[-1].event_type, "stale_rerun_requested")
+
+    def test_stale_rerun_suffix_after_run_stop_is_rejected_without_writes(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            draft = root / "draft.txt"
+            draft.write_bytes(b"original")
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, "run-stale-rerun-stopped")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", "original-token")
+                commit_claim(transaction, running)
+                completed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "draft.txt", sha256_bytes(b"original"),
+                        "verified", "produce", 1,
+                    )],
+                })
+                commit_result(transaction, completed)
+
+            draft.write_bytes(b"changed")
+            store.recover()
+            store.deactivate_custom()
+            with store._lock():
+                material = store._validated_run_material(
+                    allow_truncated=False, require_no_suffix=True,
+                )
+            plan, state, sequence, event_hash, run_status, _events, _tail, _prefix, _witnesses = material
+            self.assertEqual(run_status, "stopped")
+            updated, affected = rerun_stale_transition(plan, state, "produce")
+            payload = workflow_store._stale_rerun_event_fields(
+                plan, state, updated, "produce", affected,
+            )
+            event = WorkflowEvent.create(
+                event_seq=sequence + 1,
+                run_id=state.run_id,
+                semantic_sha256=plan.semantic_sha256,
+                event_type="stale_rerun_requested",
+                payload={**payload, "state": workflow_store._state_data(updated),
+                         "run_status": "stopped"},
+                previous_event_hash=event_hash,
+            )
+            with store.paths.events.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    event.to_payload(), sort_keys=True, separators=(",", ":")
+                ) + "\n")
+
+            before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(
+                (recovered.status, recovered.code),
+                ("blocked", "events.invalid_stale_rerun"),
+            )
+            self.assertEqual(
+                (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before,
+            )
 
     def test_verified_produced_artifact_requires_completed_matching_attempt(self):
         with TemporaryDirectory() as temporary:
