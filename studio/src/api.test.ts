@@ -61,6 +61,7 @@ describe('Workflow Studio API client', () => {
     const bootstrap = {
       project_label: 'project',
       mode: 'official' as const,
+      active_workflow: null,
       document_revision: 0,
       csrf_token: 'c'.repeat(64),
       max_json_body_bytes: 2 * 1024 * 1024,

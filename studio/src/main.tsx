@@ -1,16 +1,8 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import '@xyflow/react/dist/style.css';
+import { App } from './App';
 import './styles.css';
-
-function FoundationScreen() {
-  return (
-    <main className="studio-foundation">
-      <p className="eyebrow">PAPER WORKFLOW ORCHESTRATOR</p>
-      <h1>Workflow Studio</h1>
-      <p>The local workflow editor is loading.</p>
-    </main>
-  );
-}
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {
@@ -19,6 +11,6 @@ if (!rootElement) {
 
 createRoot(rootElement).render(
   <StrictMode>
-    <FoundationScreen />
+    <App />
   </StrictMode>,
 );

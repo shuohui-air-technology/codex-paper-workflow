@@ -178,9 +178,28 @@ export interface ApiEnvelope<T> {
 export interface BootstrapData {
   project_label: string;
   mode: 'official' | 'custom';
+  active_workflow: ActiveWorkflowSummary | null;
   document_revision: number;
   csrf_token: string;
   max_json_body_bytes: number;
+}
+
+export interface ActiveWorkflowSummary {
+  workflow_id: string;
+  semantic_revision: number;
+  semantic_sha256: string;
+  run_id: string;
+}
+
+export interface SelectionData {
+  mode: 'official' | 'custom';
+  selection_revision: number;
+  workflow_id: string;
+  semantic_revision: number;
+  semantic_sha256: string;
+  acknowledged_warning_codes: string[];
+  acknowledged_semantic_sha256: string;
+  acknowledged_at: string;
 }
 
 export interface CatalogData {

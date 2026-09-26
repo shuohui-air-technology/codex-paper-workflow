@@ -5,6 +5,7 @@ import type {
   CompileData,
   ProjectionData,
   ValidationData,
+  SelectionData,
   WorkflowDocument,
   WorkflowData,
 } from './types';
@@ -102,11 +103,11 @@ export class ApiClient {
     expected_document_revision: number;
     semantic_sha256: string;
     acknowledged_warning_codes: string[];
-  }): Promise<ApiEnvelope<{ selection: Record<string, unknown>; run_id: string; document_revision: number }>> {
+  }): Promise<ApiEnvelope<{ selection: SelectionData; run_id: string; document_revision: number }>> {
     return this.write('/api/activate', 'POST', input);
   }
 
-  deactivateWorkflow(): Promise<ApiEnvelope<{ selection: Record<string, unknown> }>> {
+  deactivateWorkflow(): Promise<ApiEnvelope<{ selection: SelectionData }>> {
     return this.write('/api/deactivate', 'POST', {});
   }
 
