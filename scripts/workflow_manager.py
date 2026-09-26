@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import re
 import secrets
+import stat
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -17,15 +19,21 @@ if __package__ in {None, ""}:
 
 from scripts.workflow_engine.catalog import discover_skills, load_validator_registry, resolve_skill_roots
 from scripts.workflow_engine.compiler import compile_workflow
-from scripts.workflow_engine.fs import PathSafetyError, hash_project_file
+from scripts.workflow_engine.fs import (
+    MAX_JSON_BYTES,
+    PathSafetyError,
+    hash_project_file,
+    resolve_project_path,
+)
 from scripts.workflow_engine.receipts import (
+    ReceiptError,
     build_claim_evidence, build_invocation, build_stage_receipt,
     canonical_bytes, canonical_result_sha256, parse_result, resolved_identity,
 )
 from scripts.workflow_engine.scheduler import (
     ArtifactRuntime, NodeStatus, claim_transition, ready_node_ids, refresh_ready,
     result_transition, retry_transition, stabilize_control_nodes, validator_claim_transition,
-    validator_result_transition,
+    validator_result_transition, record_condition_fact_transition,
     validator_retry_transition,
 )
 from scripts.workflow_engine.schema import (
@@ -47,6 +55,242 @@ class WorkflowManagerError(WorkflowError):
 
 def _now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class _CLIError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class _JSONArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise _CLIError("cli.invalid_arguments", message)
+
+
+def _reject_duplicate_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON member: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _read_project_json(project_root, relative_path):
+    """Read one bounded, plain project file containing a strict JSON object."""
+    try:
+        path = resolve_project_path(project_root, relative_path)
+        before_hash = hash_project_file(project_root, relative_path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise PathSafetyError("JSON input is not a plain regular file")
+            if opened.st_size > MAX_JSON_BYTES:
+                raise PathSafetyError("JSON input exceeds the size limit")
+            chunks = bytearray()
+            while len(chunks) <= MAX_JSON_BYTES:
+                chunk = os.read(descriptor, min(1024 * 1024, MAX_JSON_BYTES + 1 - len(chunks)))
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            after = os.fstat(descriptor)
+            if (
+                after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or after.st_ctime_ns != opened.st_ctime_ns
+                or len(chunks) > MAX_JSON_BYTES
+            ):
+                raise PathSafetyError("JSON input changed while being read")
+        finally:
+            os.close(descriptor)
+        after_hash = hash_project_file(project_root, relative_path)
+        raw = bytes(chunks)
+        digest = hashlib.sha256(raw).hexdigest()
+        if before_hash != after_hash or digest != after_hash:
+            raise PathSafetyError("JSON input changed while being read")
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_pairs,
+            parse_constant=_reject_nonfinite_json,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, PathSafetyError) as exc:
+        code = getattr(exc, "code", "cli.invalid_json")
+        raise _CLIError(code, str(exc)) from exc
+    if not isinstance(value, dict):
+        raise _CLIError("cli.invalid_json", "JSON input must be an object")
+    return value
+
+
+def _add_cli_common(parser, *, skills=False):
+    parser.add_argument("--project", required=True, help="project directory")
+    if skills:
+        parser.add_argument("--skills-root", action="append", default=[], help="additional Skill catalog root")
+    parser.add_argument("--json", action="store_true", help="emit the JSON protocol response")
+
+
+def _build_cli_parser():
+    parser = _JSONArgumentParser(prog="workflow_manager.py")
+    commands = parser.add_subparsers(dest="command", required=True, parser_class=_JSONArgumentParser)
+
+    validate = commands.add_parser("validate")
+    _add_cli_common(validate, skills=True)
+    validate.add_argument("--workflow", required=True)
+
+    activate = commands.add_parser("activate")
+    _add_cli_common(activate, skills=True)
+    activate.add_argument("--workflow", required=True)
+    activate.add_argument("--ack-warning-code", action="append", default=[])
+
+    for command in ("ready", "summary", "deactivate"):
+        item = commands.add_parser(command)
+        _add_cli_common(item, skills=(command != "deactivate"))
+
+    for command in ("claim", "run-validator", "retry", "rerun-stale"):
+        item = commands.add_parser(command)
+        _add_cli_common(item, skills=True)
+        item.add_argument("--node", required=True)
+
+    submit = commands.add_parser("submit-result")
+    _add_cli_common(submit, skills=True)
+    submit.add_argument("--result", required=True)
+
+    for command, argument in (
+        ("register-artifact", "--artifact"),
+        ("record-decision", "--decision"),
+        ("record-fact", "--fact"),
+    ):
+        item = commands.add_parser(command)
+        _add_cli_common(item, skills=True)
+        item.add_argument(argument, required=True)
+    return parser
+
+
+def _cli_error_exit_code(code):
+    blocked_runtime_codes = {
+        "activation.validation_blocked",
+        "artifact.verification_failed",
+        "receipt.claim_missing",
+        "receipt.conflict",
+        "receipt.inspection_failed",
+        "receipt.input_stale",
+        "receipt.input_unverified",
+        "receipt.invalid_projection",
+        "receipt.orphan",
+        "receipt.projection_too_large",
+        "receipt.stale_attempt",
+        "recovery.artifact_drift",
+        "recovery.incomplete_run",
+        "recovery.no_run",
+        "recovery.required",
+        "recovery.running_work_uncertain",
+        "recovery.target_superseded",
+        "run.already_active",
+        "run.not_active",
+        "run.not_found",
+        "run.recovery_required",
+        "runtime.artifact_registration_running",
+        "runtime.decision_update_running",
+        "runtime.fact_update_running",
+        "runtime.identity_changed",
+        "runtime.node_not_ready",
+        "runtime.parallelism_exceeded",
+        "runtime.recovery_required",
+        "runtime.selection_mismatch",
+        "runtime.stale_join_requires_new_run",
+        "runtime.stale_rerun_requires_recovery",
+        "runtime.stale_rerun_running",
+        "selection.invalid",
+        "selection.journal_conflict",
+        "selection.journal_invalid",
+        "validator.identity_changed",
+        "validator.input_changed",
+        "validator.unavailable",
+    }
+    if code in blocked_runtime_codes:
+        return 2
+    return 1
+
+
+def _run_cli(args):
+    project = Path(args.project)
+    skills = tuple(Path(item) for item in getattr(args, "skills_root", ()))
+    service = WorkflowService(project, skill_roots=skills)
+    if args.command == "validate":
+        return service.validate_document(_read_project_json(project, args.workflow))
+    if args.command == "activate":
+        document = _read_project_json(project, args.workflow)
+        validation = service.validate_document(document)
+        if validation["status"] == "blocked":
+            return validation
+        return service.activate(document, acknowledged_warning_codes=args.ack_warning_code)
+    if args.command == "ready":
+        return service.ready()
+    if args.command == "summary":
+        return service.summary()
+    if args.command == "deactivate":
+        return service.deactivate()
+    if args.command == "claim":
+        return service.claim(args.node)
+    if args.command == "run-validator":
+        return service.run_validator(args.node)
+    if args.command == "retry":
+        return service.retry(args.node)
+    if args.command == "rerun-stale":
+        return service.rerun_stale(args.node)
+    if args.command == "submit-result":
+        return service.submit_result(_read_project_json(project, args.result))
+    if args.command == "register-artifact":
+        payload = _read_project_json(project, args.artifact)
+        if set(payload) != {"artifact_id", "path", "provenance_summary"}:
+            raise _CLIError("cli.invalid_json", "artifact input must contain exactly artifact_id, path, and provenance_summary")
+        return service.register_artifact(
+            payload["artifact_id"], payload["path"], payload["provenance_summary"]
+        )
+    if args.command == "record-decision":
+        payload = _read_project_json(project, args.decision)
+        if set(payload) != {"name", "value", "provenance_summary"}:
+            raise _CLIError("cli.invalid_json", "decision input must contain exactly name, value, and provenance_summary")
+        return service.record_decision(payload["name"], payload["value"], payload["provenance_summary"])
+    if args.command == "record-fact":
+        payload = _read_project_json(project, args.fact)
+        if set(payload) not in ({"name", "value"}, {"name", "value", "provenance_summary"}):
+            raise _CLIError("cli.invalid_json", "fact input must contain name and value, with optional provenance_summary")
+        return service.record_fact(
+            payload["name"], payload["value"],
+            payload.get("provenance_summary", "User-recorded project fact."),
+        )
+    raise _CLIError("cli.unknown_command", "unknown workflow-manager command")
+
+
+def main(argv=None):
+    """Run the strict JSON command-line protocol."""
+    try:
+        args = _build_cli_parser().parse_args(argv)
+        result = _run_cli(args)
+        status = result.get("status") if isinstance(result, dict) else None
+        output = result if isinstance(result, dict) else {"status": "pass", "result": result}
+        code = 2 if status == "blocked" else 0
+    except _CLIError as exc:
+        output = {"status": "error", "error": {"code": exc.code, "message": str(exc)[:4000]}}
+        code = _cli_error_exit_code(exc.code)
+    except (WorkflowError, StoreError, ReceiptError, ValidatorError, PathSafetyError) as exc:
+        error_code = getattr(exc, "code", "cli.runtime_error")
+        output = {"status": "error", "error": {"code": error_code, "message": str(exc)[:4000]}}
+        code = _cli_error_exit_code(error_code)
+    except Exception:
+        output = {"status": "error", "error": {
+            "code": "cli.internal_error", "message": "Unexpected workflow-manager failure.",
+        }}
+        code = 1
+    sys.stdout.write(json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    return code
 
 
 class WorkflowService:
@@ -442,6 +686,97 @@ class WorkflowService:
             "runtime.recovery_required", "artifact registration could not load an active run"
         )
 
+    def _record_condition_value(self, event_type, name, value, provenance_summary):
+        if (
+            not isinstance(name, str)
+            or not name
+            or name != name.strip()
+            or len(name) > 4000
+            or any(ord(char) < 32 for char in name)
+            or not isinstance(provenance_summary, str)
+            or not provenance_summary
+            or provenance_summary != provenance_summary.strip()
+            or len(provenance_summary) > 4000
+            or any(ord(char) < 32 for char in provenance_summary)
+        ):
+            raise WorkflowManagerError(
+                "runtime.invalid_fact_update",
+                "a normalized name and bounded provenance summary are required",
+            )
+        if event_type == "fact_recorded" and type(value) is not bool:
+            raise WorkflowManagerError(
+                "runtime.invalid_project_fact", "project fact value must be a JSON boolean"
+            )
+
+        decision = event_type == "decision_recorded"
+        recovered_before_update = False
+        for attempt in range(2):
+            try:
+                with self.store.locked_run() as transaction:
+                    plan, state = self._load(transaction)
+                    try:
+                        updated = record_condition_fact_transition(
+                            plan, state, name, value, decision=decision
+                        )
+                    except WorkflowError as exc:
+                        raise WorkflowManagerError(exc.code, str(exc)) from exc
+                    if updated is state:
+                        return {
+                            "status": "pass",
+                            "registration_status": "unchanged",
+                            "name": name,
+                            "value": value,
+                            "event_seq": None,
+                            "affected_node_ids": [],
+                            "recovered_before_update": recovered_before_update,
+                        }
+                    event = transaction.commit_transition(
+                        event_type,
+                        updated,
+                        {"name": name, "value": value, "provenance_summary": provenance_summary},
+                    )
+                    before_stabilization = state
+                    _, committed = transaction.load_active_run()
+                    stabilized = self._stabilize(transaction, plan, committed)
+                    changed_nodes = sorted(
+                        node_id for node_id in plan.nodes
+                        if before_stabilization.nodes[node_id] != stabilized.nodes[node_id]
+                    )
+                    return {
+                        "status": "pass",
+                        "registration_status": "recorded",
+                        "name": name,
+                        "value": value,
+                        "event_seq": event.event_seq,
+                        "affected_node_ids": changed_nodes,
+                        "recovered_before_update": recovered_before_update,
+                    }
+            except StoreError as exc:
+                if exc.code != "recovery.required" or attempt != 0:
+                    raise
+                recovery = self.store.recover()
+                if recovery.status not in {"clean", "recovered"}:
+                    raise WorkflowManagerError(
+                        "runtime.recovery_required",
+                        "existing evidence changes need recovery before recording a fact or decision",
+                    ) from exc
+                recovered_before_update = True
+        raise WorkflowManagerError(
+            "runtime.recovery_required", "fact/decision update could not load an active run"
+        )
+
+    def record_fact(self, name, value, provenance_summary="User-recorded project fact."):
+        """Record a registered project boolean and invalidate its condition lineage."""
+        return self._record_condition_value(
+            "fact_recorded", name, value, provenance_summary
+        )
+
+    def record_decision(self, name, value, provenance_summary):
+        """Record one bounded decision value and invalidate dependent conditions."""
+        return self._record_condition_value(
+            "decision_recorded", name, value, provenance_summary
+        )
+
     def retry(self, node_id):
         """Retry one failed/interrupted executable node without advancing its attempt."""
         with self.store.locked_run() as transaction:
@@ -499,9 +834,15 @@ class WorkflowService:
                     }
                     for artifact_id, artifact in sorted(state.artifacts.items())
                 ],
+                "decisions": dict(state.decisions),
+                "project_booleans": dict(state.project_booleans),
             }
 
     def deactivate(self):
         """Stop the active custom run and return the authoritative selection."""
         selection = self.store.deactivate_custom()
         return {"status": "pass", "selection": selection.to_payload()}
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

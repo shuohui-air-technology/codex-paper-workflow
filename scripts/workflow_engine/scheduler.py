@@ -883,6 +883,202 @@ def _predicate_mentions_any_artifact(value: object, artifact_ids: set[str]) -> b
     return False
 
 
+def _predicate_mentions_named_value(value: object, operation: str, name: str) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("op") == operation and value.get("name") == name:
+            return True
+        return any(
+            _predicate_mentions_named_value(item, operation, name)
+            for item in value.values()
+        )
+    if isinstance(value, (tuple, list)):
+        return any(
+            _predicate_mentions_named_value(item, operation, name)
+            for item in value
+        )
+    return False
+
+
+def _same_decision_value(left: object, right: object) -> bool:
+    """Compare JSON scalars using condition semantics (bool is not a number)."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left is right
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    return type(left) is type(right) and left == right
+
+
+def record_condition_fact_transition(
+    plan: CompiledPlan,
+    state: RunState,
+    name: str,
+    value: object,
+    *,
+    decision: bool = False,
+) -> RunState:
+    """Record one user fact/decision and stale condition-dependent lineage.
+
+    Project booleans are registered by using their name in a condition. Decisions
+    may be recorded without a current consumer, but only a changed value creates
+    a new state transition. Completed work is retained as history and explicitly
+    rerun from the stale condition after the update.
+    """
+    _validate_binding(plan, state)
+    if type(decision) is not bool:
+        _fail("runtime.invalid_fact_update", "decision selector must be a boolean")
+    operation = "decision_is" if decision else "fact_is"
+    if not isinstance(name, str) or not name or name != name.strip() or any(
+        ord(char) < 32 for char in name
+    ):
+        _fail("runtime.invalid_decision" if decision else "runtime.invalid_project_fact",
+              "recorded name must be a bounded normalized string")
+    if not decision and not any(
+        node.type == "condition"
+        and any(_predicate_mentions_named_value(case, operation, name) for case in node.condition_cases)
+        for node in plan.nodes.values()
+    ):
+        _fail("runtime.unregistered_project_fact", "project boolean is not used by a condition in this workflow")
+
+    if decision:
+        decisions = dict(state.decisions)
+        decisions[name] = value
+        updated = replace(state, decisions=decisions)
+        existed = name in state.decisions
+        unchanged = existed and _same_decision_value(state.decisions[name], updated.decisions[name])
+    else:
+        if type(value) is not bool:
+            _fail("runtime.invalid_project_fact", "project fact value must be a JSON boolean")
+        project_booleans = dict(state.project_booleans)
+        project_booleans[name] = value
+        updated = replace(state, project_booleans=project_booleans)
+        unchanged = name in state.project_booleans and state.project_booleans[name] is value
+
+    if unchanged:
+        return state
+
+    affected = {
+        node_id
+        for node_id, node in plan.nodes.items()
+        if node.type == "condition"
+        and any(
+            _predicate_mentions_named_value(case, operation, name)
+            for case in node.condition_cases
+        )
+    }
+
+    def reads_registry_input(node_id: str, artifact_ids: set[str]) -> bool:
+        return any(
+            artifact_id in plan.nodes[node_id].inputs
+            and not _producer_edges_for_input(plan, node_id, artifact_id)
+            for artifact_id in artifact_ids
+        )
+
+    pending = list(affected)
+    while pending:
+        current = pending.pop()
+        stale_outputs = {
+            artifact_id
+            for artifact_id, artifact in state.artifacts.items()
+            if artifact.producer_node_id == current and artifact.state != "stale"
+        }
+        if stale_outputs:
+            for target, node in plan.nodes.items():
+                if target in affected:
+                    continue
+                if reads_registry_input(target, stale_outputs) or (
+                    node.type == "condition"
+                    and any(
+                        _predicate_mentions_any_artifact(case, stale_outputs)
+                        for case in node.condition_cases
+                    )
+                ):
+                    affected.add(target)
+                    pending.append(target)
+        for edge_id in plan.outgoing[current]:
+            target = plan.edges[edge_id].target
+            target_node = plan.nodes[target]
+            if (
+                target_node.type == "join"
+                and target_node.join_mode == "any_success"
+                and state.nodes[target].winner_edge_id
+                and state.nodes[target].winner_edge_id != edge_id
+            ):
+                continue
+            if target not in affected:
+                affected.add(target)
+                pending.append(target)
+
+    running = sorted(
+        node_id for node_id in affected
+        if state.nodes[node_id].status is NodeStatus.RUNNING
+    )
+    if running:
+        code = "runtime.decision_update_running" if decision else "runtime.fact_update_running"
+        _fail(code, "fact/decision update cannot invalidate running work", node_id=running[0])
+
+    unchanged_exclusions = {
+        node_id
+        for node_id in affected
+        if state.nodes[node_id].status is NodeStatus.SKIPPED
+        and state.nodes[node_id].attempt == 0
+        and bool(plan.incoming[node_id])
+        and all(
+            state.edges[edge_id].status is EdgeStatus.INACTIVE
+            and plan.edges[edge_id].source not in affected
+            for edge_id in plan.incoming[node_id]
+        )
+    }
+
+    nodes = dict(state.nodes)
+    edges = dict(state.edges)
+    artifacts = dict(state.artifacts)
+    for node_id in affected:
+        if node_id in unchanged_exclusions:
+            continue
+        runtime = state.nodes[node_id]
+        node = plan.nodes[node_id]
+        frozen_any_success = (
+            node.type == "join"
+            and node.join_mode == "any_success"
+            and bool(runtime.winner_edge_id)
+        )
+        if runtime.status in {
+            NodeStatus.SUCCEEDED,
+            NodeStatus.FAILED,
+            NodeStatus.BLOCKED,
+            NodeStatus.STALE,
+        } or (runtime.status is NodeStatus.SKIPPED and runtime.attempt > 0) or frozen_any_success:
+            nodes[node_id] = replace(
+                runtime,
+                status=NodeStatus.STALE,
+                outcome="",
+                selected_inputs=_string_map(),
+                auxiliary_outputs=_aux_map(),
+                claim_token_hash="",
+            )
+        else:
+            nodes[node_id] = replace(
+                runtime,
+                status=NodeStatus.PENDING,
+                selected_inputs=_string_map(),
+            )
+        _set_outgoing_status(plan, edges, node_id, EdgeStatus.WAITING)
+
+    for artifact_id, artifact in state.artifacts.items():
+        if artifact.producer_node_id in affected and artifact.state != "stale":
+            artifacts[artifact_id] = replace(artifact, state="stale")
+
+    updated = replace(
+        updated,
+        nodes=MappingProxyType(nodes),
+        edges=MappingProxyType(edges),
+        artifacts=MappingProxyType(artifacts),
+    )
+    return refresh_ready(plan, updated)
+
+
 def register_external_artifacts_transition(
     plan: CompiledPlan,
     state: RunState,

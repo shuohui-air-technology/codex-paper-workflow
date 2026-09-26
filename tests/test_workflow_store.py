@@ -525,10 +525,14 @@ def complete_excluded_branch(store, plan, *, artifact_condition=False):
         registered = replace(state, artifacts=MappingProxyType({"source": source}))
         transaction.commit_transition("artifact_registered", registered)
         if not artifact_condition:
-            registered = replace(
-                registered, project_booleans=MappingProxyType({"flag": True})
+            from scripts.workflow_engine.scheduler import record_condition_fact_transition
+            registered = record_condition_fact_transition(
+                plan, registered, "flag", True
             )
-            transaction.commit_transition("fact_recorded", registered)
+            transaction.commit_transition("fact_recorded", registered, {
+                "name": "flag", "value": True,
+                "provenance_summary": "Test fixture condition fact.",
+            })
         selected, transitions = stabilize_control_nodes(plan, registered)
         transaction.commit_control_transitions(transitions, selected)
     assert selected.nodes["choose"].status is NodeStatus.SUCCEEDED
@@ -1234,13 +1238,9 @@ class WorkflowStoreTests(unittest.TestCase):
                 state = replace(
                     state,
                     nodes=MappingProxyType({"produce": runtime}),
-                    decisions=MappingProxyType(
-                        {"none": None, "false": False, "zero": 0, "one": 1, "float": 1.5, "text": "1"}
-                    ),
-                    project_booleans=MappingProxyType({"ready": True}),
                 )
                 transaction.commit_transition(
-                    "facts_recorded",
+                    "snapshot_fixture_recorded",
                     state,
                     {
                         "receipt": {
@@ -1250,10 +1250,22 @@ class WorkflowStoreTests(unittest.TestCase):
                         }
                     },
                 )
+                from scripts.workflow_engine.scheduler import record_condition_fact_transition
+                for name, value in {
+                    "none": None, "false": False, "zero": 0, "one": 1,
+                    "float": 1.5, "text": "1",
+                }.items():
+                    state = record_condition_fact_transition(
+                        loaded_plan, state, name, value, decision=True
+                    )
+                    transaction.commit_transition("decision_recorded", state, {
+                        "name": name, "value": value,
+                        "provenance_summary": "Round-trip test value.",
+                    })
 
             with WorkflowStore(root).locked_run() as transaction:
                 restarted_plan, restarted = transaction.load_active_run()
-                self.assertEqual(len(transaction.events("facts_recorded")), 1)
+                self.assertEqual(len(transaction.events("decision_recorded")), 6)
             self.assertEqual(restarted_plan, loaded_plan)
             self.assertIsInstance(restarted_plan.nodes, MappingProxyType)
             self.assertIsInstance(restarted.nodes, MappingProxyType)
@@ -1267,7 +1279,11 @@ class WorkflowStoreTests(unittest.TestCase):
                 ("first.md", "later.md"),
             )
             self.assertEqual(restarted_plan.nodes["produce"].skill, plan.nodes["produce"].skill)
-            receipt = WorkflowStore(root).read_run_events()[-1].payload["receipt"]
+            snapshot_event = next(
+                event for event in WorkflowStore(root).read_run_events()
+                if event.event_type == "snapshot_fixture_recorded"
+            )
+            receipt = snapshot_event.payload["receipt"]
             self.assertEqual(type(receipt["attempt"]), int)
             self.assertIs(receipt["accepted"], False)
             self.assertEqual(len(receipt["hashes"]), 2)
@@ -1469,11 +1485,16 @@ class WorkflowStoreTests(unittest.TestCase):
     def test_control_final_state_comparison_preserves_json_scalar_kinds(self):
         with TemporaryDirectory() as temporary:
             store = WorkflowStore(Path(temporary))
-            store.start_run(task_plan(), "run-control-kind")
+            plan = task_plan()
+            store.start_run(plan, "run-control-kind")
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
-                current = replace(state, decisions=MappingProxyType({"kind": False}))
-                transaction.commit_transition("fact", current)
+                from scripts.workflow_engine.scheduler import record_condition_fact_transition
+                current = record_condition_fact_transition(plan, state, "kind", False, decision=True)
+                transaction.commit_transition("decision_recorded", current, {
+                    "name": "kind", "value": False,
+                    "provenance_summary": "Control scalar test.",
+                })
             with store.locked_run() as transaction:
                 _, current = transaction.load_active_run()
                 changed = replace(current, decisions=MappingProxyType({"kind": 0}))
@@ -1810,15 +1831,19 @@ class WorkflowStoreTests(unittest.TestCase):
             old_snapshot = store.paths.state.read_bytes()
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
-                changed = replace(state, project_booleans=MappingProxyType({"ready": True}))
-                transaction.commit_transition("fact_recorded", changed)
+                from scripts.workflow_engine.scheduler import record_condition_fact_transition
+                changed = record_condition_fact_transition(plan, state, "ready", True, decision=True)
+                transaction.commit_transition("decision_recorded", changed, {
+                    "name": "ready", "value": True,
+                    "provenance_summary": "Recovery suffix test.",
+                })
             store.paths.state.write_bytes(old_snapshot)
             with store.paths.events.open("ab") as handle:
                 handle.write(b'{"event_seq":3,"partial"')
 
             result = store.recover()
             self.assertEqual(result.status, "recovered")
-            self.assertTrue(result.state.project_booleans["ready"])
+            self.assertTrue(result.state.decisions["ready"])
             archived = list(store.paths.recovery.glob("events-truncated-*.jsonl"))
             self.assertEqual(len(archived), 1)
             self.assertEqual(archived[0].read_bytes(), b'{"event_seq":3,"partial"')
@@ -3748,7 +3773,7 @@ class WorkflowStoreTests(unittest.TestCase):
             complete_compiled_winner(store, plan, root)
             with store.locked_run() as transaction:
                 _, state = transaction.load_active_run()
-                transaction._commit_event("fact_recorded", state, {}, replace_snapshot=False)
+                transaction._commit_event("readiness_refreshed", state, {}, replace_snapshot=False)
                 (root / "b.txt").write_bytes(b"changed")
                 stale = store._mark_drift(plan, state, [], ["b"])
                 transaction._commit_event("artifacts_marked_stale", stale,

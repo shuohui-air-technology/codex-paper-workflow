@@ -816,6 +816,30 @@ class ValidatorManagerTests(unittest.TestCase):
         value["ui"] = {"positions": positions}
         return value
 
+    def conditional_document(self, predicate_op="fact_is"):
+        value = json.loads((Path(__file__).parent / "fixtures/workflow_valid_branch_join.json").read_text())
+        value.update(workflow_id="condition-facts-flow", external_inputs=[], max_parallelism=2)
+        condition = value["nodes"][0]
+        condition["inputs"] = []
+        condition["condition_cases"] = [{
+            "outcome": "use_left",
+            "when": {"op": predicate_op, "name": "route", "value": True},
+        }]
+        left, right = value["nodes"][1:3]
+        left.update(id="left", skill_ref="test-workflow-task", inputs=[], outputs=[], write_scopes=[])
+        right.update(id="right", skill_ref="test-workflow-task", inputs=[], outputs=[], write_scopes=[])
+        value["nodes"] = [condition, left, right]
+        value["edges"] = [
+            {"id": "condition-left", "source": "condition", "target": "left", "trigger": "use_left", "output_map": {}},
+            {"id": "condition-right", "source": "condition", "target": "right", "trigger": "default", "output_map": {}},
+        ]
+        value["ui"] = {"positions": {
+            "condition": {"x": 80, "y": 180},
+            "left": {"x": 320, "y": 80},
+            "right": {"x": 320, "y": 280},
+        }}
+        return value
+
     def activate(self, *, validity_status="clear", with_routes=False):
         document = self.document(validity_status=validity_status, with_routes=with_routes)
         validation = self.service.validate_document(document)
@@ -873,6 +897,124 @@ class ValidatorManagerTests(unittest.TestCase):
         self.assertEqual(replaced["registration_status"], "registered")
         self.assertTrue(replaced["recovered_before_registration"])
         self.assertEqual(self.service.store.recover().status, "clean")
+
+    def test_record_fact_is_idempotent_and_changed_fact_invalidates_old_branch(self):
+        document = self.conditional_document()
+        validation = self.service.validate_document(document)
+        self.assertEqual(validation["status"], "pass", validation["errors"])
+        self.service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+
+        first = self.service.record_fact("route", True, "The requested route is available.")
+        self.assertEqual(first["registration_status"], "recorded")
+        self.assertEqual(first["affected_node_ids"], ["condition", "left", "right"])
+        with self.service.store.locked_run() as transaction:
+            plan, state = transaction.load_active_run()
+            self.assertIs(state.project_booleans["route"], True)
+            self.assertEqual(state.nodes["condition"].status.value, "succeeded")
+            self.assertEqual(state.nodes["left"].status.value, "ready")
+            self.assertEqual(state.nodes["right"].status.value, "skipped")
+        initial_events = self.service.store.read_run_events()
+        fact_events = [event for event in initial_events if event.event_type == "fact_recorded"]
+        self.assertEqual(len(fact_events), 1)
+        self.assertEqual(fact_events[0].payload["provenance_summary"], "The requested route is available.")
+
+        repeated = self.service.record_fact("route", True, "A different note for the same value.")
+        self.assertEqual(repeated["registration_status"], "unchanged")
+        self.assertEqual(len(self.service.store.read_run_events()), len(initial_events))
+
+        invocation = self.service.claim("left")
+        self.service.submit_result({
+            "schema_version": "node-result-v1", "run_id": invocation["run_id"],
+            "node_id": "left", "attempt": invocation["attempt"],
+            "idempotency_token": invocation["idempotency_token"],
+            "status": "succeeded", "outcome": "succeeded", "summary": "Completed the selected branch.",
+            "artifacts": [], "uncertainties": [],
+        })
+        changed = self.service.record_fact("route", False, "The input evidence changed.")
+        self.assertEqual(changed["registration_status"], "recorded")
+        self.assertEqual(changed["affected_node_ids"], ["condition", "left", "right"])
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            self.assertIs(state.project_booleans["route"], False)
+            self.assertEqual(state.nodes["condition"].status.value, "stale")
+            self.assertEqual(state.nodes["left"].status.value, "stale")
+
+        self.service.rerun_stale("condition")
+        self.service.ready()
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            self.assertEqual(state.nodes["condition"].status.value, "succeeded")
+            self.assertEqual(state.nodes["left"].status.value, "skipped")
+            self.assertEqual(state.nodes["right"].status.value, "ready")
+        self.assertEqual(self.service.store.recover().status, "clean")
+
+    def test_decision_change_is_type_safe_and_invalidates_condition_lineage(self):
+        document = self.conditional_document(predicate_op="decision_is")
+        validation = self.service.validate_document(document)
+        self.assertEqual(validation["status"], "pass", validation["errors"])
+        self.service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+
+        first = self.service.record_decision("route", True, "Initial route choice.")
+        self.assertEqual(first["registration_status"], "recorded")
+        event_count = len(self.service.store.read_run_events())
+        unchanged = self.service.record_decision("route", True, "Updated wording only.")
+        self.assertEqual(unchanged["registration_status"], "unchanged")
+        self.assertEqual(len(self.service.store.read_run_events()), event_count)
+
+        changed = self.service.record_decision("route", 1, "Numeric route identifier.")
+        self.assertEqual(changed["registration_status"], "recorded")
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            self.assertIs(type(state.decisions["route"]), int)
+            self.assertEqual(state.nodes["condition"].status.value, "stale")
+
+        unreferenced_first = self.service.record_decision("audit_marker", True, "An unreferenced decision.")
+        unreferenced_second = self.service.record_decision("audit_marker", 1, "A changed audit marker.")
+        self.assertEqual(unreferenced_first["registration_status"], "recorded")
+        self.assertEqual(unreferenced_second["registration_status"], "recorded")
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            self.assertIs(type(state.decisions["audit_marker"]), int)
+
+    def test_fact_and_decision_state_cannot_be_forged_through_generic_events(self):
+        from scripts.workflow_engine.store import StoreError
+        document = self.conditional_document(predicate_op="decision_is")
+        validation = self.service.validate_document(document)
+        self.service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+        before_log = self.service.store.paths.events.read_bytes()
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            forged = replace(state, decisions={"route": True})
+            with self.assertRaises(StoreError):
+                transaction.commit_transition("readiness_refreshed", forged)
+            with self.assertRaises(StoreError):
+                transaction.commit_transition("decision_recorded", forged, {
+                    "name": "route", "value": False,
+                    "provenance_summary": "Forged without the deterministic invalidation.",
+                })
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before_log)
+
+    def test_fact_registration_rejects_unknown_name_or_non_boolean_without_writes(self):
+        document = self.conditional_document()
+        validation = self.service.validate_document(document)
+        self.service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+        before = self.service.store.paths.events.read_bytes()
+        for name, value in (("unregistered", True), ("route", 1)):
+            with self.subTest(name=name, value=value), self.assertRaises(Exception):
+                self.service.record_fact(name, value, "A valid provenance summary.")
+            self.assertEqual(self.service.store.paths.events.read_bytes(), before)
+
+    def test_fact_change_cannot_invalidate_a_running_branch(self):
+        document = self.conditional_document()
+        validation = self.service.validate_document(document)
+        self.service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+        self.service.record_fact("route", True, "Initial route.")
+        self.service.claim("left")
+        before = self.service.store.paths.events.read_bytes()
+        with self.assertRaises(Exception) as caught:
+            self.service.record_fact("route", False, "Route changed during work.")
+        self.assertEqual(caught.exception.code, "runtime.fact_update_running")
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before)
 
     def test_service_registration_rejects_unsafe_and_undeclared_inputs_without_event(self):
         document = self.document()
@@ -1149,3 +1291,208 @@ class HistoricalInputEvidenceTests(unittest.TestCase):
                 claim = build_claim_evidence(plan, running, "consumer", transaction.input_witnesses(), "2026-09-23T00:00:00Z")
                 self.assertEqual(claim["input_artifacts"], [{"id": "joined", "source_id": "draft", "path": "b.txt", "sha256": hashlib.sha256(b"winner").hexdigest()}])
                 commit_claim(transaction, running)
+
+
+class WorkflowManagerCLITests(unittest.TestCase):
+    REPOSITORY = Path(__file__).resolve().parents[1]
+
+    def setUp(self):
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        self.project = root / "project"
+        self.project.mkdir()
+        self.outside = root / "outside"
+        self.outside.mkdir()
+        self.skill_root = self.project / "skills"
+        skill = self.skill_root / "test-workflow-task"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: test-workflow-task\ndescription: Test task\n---\nRun the test task.\n",
+            encoding="utf-8",
+        )
+        self.workflow_path = "workflow.json"
+        self.workflow = json.loads(
+            (self.REPOSITORY / "tests/fixtures/workflow_valid_linear.json").read_text(encoding="utf-8")
+        )
+        self.workflow.update(workflow_id="cli-test-flow", external_inputs=[], max_parallelism=1)
+        node = self.workflow["nodes"][0]
+        node.update(skill_ref="test-workflow-task", inputs=[], outputs=[], write_scopes=[])
+        self.workflow["nodes"] = [node]
+        self.workflow["edges"] = []
+        self.workflow["ui"] = {"positions": {node["id"]: {"x": 120, "y": 80}}}
+        self._write_json(self.workflow_path, self.workflow)
+        self.environment = os.environ.copy()
+        self.environment["PYTHONPATH"] = str(self.REPOSITORY) + os.pathsep + self.environment.get("PYTHONPATH", "")
+        self.environment["CODEX_HOME"] = str(self.project / "codex-home")
+
+    def _write_json(self, relative_path, value):
+        (self.project / relative_path).write_text(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+    def _run(self, mode, *arguments):
+        prefix = (
+            [sys.executable, str(self.REPOSITORY / "scripts/workflow_manager.py")]
+            if mode == "direct"
+            else [sys.executable, "-m", "scripts.workflow_manager"]
+        )
+        completed = subprocess.run(
+            prefix + list(arguments),
+            cwd=self.outside,
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.stderr, "")
+        value = json.loads(completed.stdout)
+        decoder = json.JSONDecoder()
+        _parsed, end = decoder.raw_decode(completed.stdout.lstrip())
+        self.assertEqual(completed.stdout.lstrip()[end:].strip(), "")
+        return completed.returncode, value
+
+    def _common(self):
+        return ["--project", str(self.project), "--skills-root", str(self.skill_root), "--json"]
+
+    def test_direct_and_module_validate_run_outside_repository(self):
+        for mode in ("direct", "module"):
+            with self.subTest(mode=mode):
+                code, result = self._run(
+                    mode, "validate", *self._common(), "--workflow", self.workflow_path
+                )
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result["status"], "pass")
+                self.assertEqual(result["errors"], [])
+
+    def test_runtime_commands_emit_json_for_summary_ready_claim_and_submit(self):
+        code, validation = self._run(
+            "direct", "validate", *self._common(), "--workflow", self.workflow_path
+        )
+        self.assertEqual(code, 0, validation)
+        activation = ["activate", *self._common(), "--workflow", self.workflow_path]
+        for warning in validation["required_warning_codes"]:
+            activation += ["--ack-warning-code", warning]
+        code, activated = self._run("direct", *activation)
+        self.assertEqual(code, 0, activated)
+
+        code, summary = self._run("direct", "summary", *self._common())
+        self.assertEqual((code, summary["status"]), (0, "pass"))
+        code, ready = self._run("module", "ready", *self._common())
+        self.assertEqual((code, ready["ready"][0]["node_id"]), (0, "directions"))
+        code, invocation = self._run("direct", "claim", *self._common(), "--node", "directions")
+        self.assertEqual((code, invocation["node_id"]), (0, "directions"))
+
+        result = {
+            "schema_version": "node-result-v1", "run_id": invocation["run_id"],
+            "node_id": invocation["node_id"], "attempt": invocation["attempt"],
+            "idempotency_token": invocation["idempotency_token"], "status": "succeeded",
+            "outcome": "succeeded", "summary": "Completed the CLI test node.",
+            "artifacts": [], "uncertainties": [],
+        }
+        self._write_json("result.json", result)
+        code, receipt = self._run("module", "submit-result", *self._common(), "--result", "result.json")
+        self.assertEqual((code, receipt["status"], receipt["node_id"]), (0, "succeeded", "directions"))
+
+    def test_fact_and_decision_commands_drive_a_rerunnable_condition(self):
+        document = json.loads(
+            (self.REPOSITORY / "tests/fixtures/workflow_valid_branch_join.json").read_text(encoding="utf-8")
+        )
+        document.update(workflow_id="cli-fact-flow", external_inputs=[], max_parallelism=2)
+        condition = document["nodes"][0]
+        condition["inputs"] = []
+        condition["condition_cases"] = [{
+            "outcome": "use_left",
+            "when": {"op": "all", "args": [
+                {"op": "fact_is", "name": "route", "value": True},
+                {"op": "decision_is", "name": "approved", "value": True},
+            ]},
+        }]
+        left, right = document["nodes"][1:3]
+        left.update(id="left", skill_ref="test-workflow-task", inputs=[], outputs=[], write_scopes=[])
+        right.update(id="right", skill_ref="test-workflow-task", inputs=[], outputs=[], write_scopes=[])
+        document["nodes"] = [condition, left, right]
+        document["edges"] = [
+            {"id": "to-left", "source": "condition", "target": "left", "trigger": "use_left", "output_map": {}},
+            {"id": "to-right", "source": "condition", "target": "right", "trigger": "default", "output_map": {}},
+        ]
+        document["ui"] = {"positions": {
+            "condition": {"x": 80, "y": 180},
+            "left": {"x": 320, "y": 80},
+            "right": {"x": 320, "y": 280},
+        }}
+        self._write_json(self.workflow_path, document)
+        code, validation = self._run("direct", "validate", *self._common(), "--workflow", self.workflow_path)
+        self.assertEqual(code, 0, validation)
+        activation = ["activate", *self._common(), "--workflow", self.workflow_path]
+        for warning in validation["required_warning_codes"]:
+            activation += ["--ack-warning-code", warning]
+        code, _activated = self._run("direct", *activation)
+        self.assertEqual(code, 0)
+
+        self._write_json("fact.json", {"name": "route", "value": True})
+        code, fact = self._run("direct", "record-fact", *self._common(), "--fact", "fact.json")
+        self.assertEqual((code, fact["registration_status"]), (0, "recorded"))
+
+        self._write_json("decision.json", {
+            "name": "approved", "value": True,
+            "provenance_summary": "The reviewer approved this route.",
+        })
+        code, decision = self._run(
+            "module", "record-decision", *self._common(), "--decision", "decision.json"
+        )
+        self.assertEqual((code, decision["registration_status"]), (0, "recorded"))
+        self.assertEqual(decision["affected_node_ids"], ["condition", "left", "right"])
+
+        code, stale = self._run(
+            "direct", "rerun-stale", *self._common(), "--node", "condition"
+        )
+        self.assertEqual((code, stale["root_node_id"]), (0, "condition"))
+        code, ready = self._run("module", "ready", *self._common())
+        self.assertEqual((code, ready["ready"][0]["node_id"]), (0, "left"))
+        code, summary = self._run("direct", "summary", *self._common())
+        self.assertEqual(summary["project_booleans"], {"route": True})
+        self.assertEqual(summary["decisions"], {"approved": True})
+
+    def test_cli_blocked_malformed_and_unknown_commands_use_documented_exit_codes(self):
+        from scripts.workflow_manager import _cli_error_exit_code
+        for code_name in (
+            "recovery.required",
+            "runtime.stale_rerun_requires_recovery",
+            "runtime.artifact_registration_running",
+            "runtime.parallelism_exceeded",
+            "run.already_active",
+            "run.not_active",
+            "selection.journal_invalid",
+            "receipt.invalid_projection",
+        ):
+            with self.subTest(blocked_code=code_name):
+                self.assertEqual(_cli_error_exit_code(code_name), 2)
+
+        code, no_run = self._run("direct", "ready", *self._common())
+        self.assertEqual((code, no_run["status"]), (2, "error"))
+        self.assertEqual(no_run["error"]["code"], "run.not_found")
+
+        invalid_workflow = json.loads(json.dumps(self.workflow))
+        invalid_workflow["nodes"][0]["skill_ref"] = "missing-skill"
+        self._write_json("invalid.json", invalid_workflow)
+        code, blocked = self._run(
+            "direct", "validate", *self._common(), "--workflow", "invalid.json"
+        )
+        self.assertEqual((code, blocked["status"]), (2, "blocked"))
+
+        (self.project / "malformed.json").write_text('{"x":1,"x":2}\n', encoding="utf-8")
+        code, malformed = self._run(
+            "module", "validate", *self._common(), "--workflow", "malformed.json"
+        )
+        self.assertEqual((code, malformed["status"]), (1, "error"))
+        self.assertEqual(malformed["error"]["code"], "cli.invalid_json")
+
+        code, unknown = self._run("direct", "not-a-command", "--project", str(self.project))
+        self.assertEqual((code, unknown["status"]), (1, "error"))
+
+        code, unsafe = self._run(
+            "direct", "validate", *self._common(), "--workflow", "../outside/workflow.json"
+        )
+        self.assertEqual((code, unsafe["status"]), (1, "error"))

@@ -54,6 +54,7 @@ from .scheduler import (
     rerun_stale_transition,
     claim_transition,
     register_external_artifacts_transition,
+    record_condition_fact_transition,
     retry_transition,
     validator_claim_transition,
     validator_result_transition,
@@ -1332,6 +1333,50 @@ def validate_node_evidence_delta(
     """Check claims/completions across every event name, both commit and replay."""
     if before is None:
         return
+    facts_changed = (
+        _canonical_bytes(dict(before.decisions)) != _canonical_bytes(dict(after.decisions))
+        or _canonical_bytes(dict(before.project_booleans))
+        != _canonical_bytes(dict(after.project_booleans))
+    )
+    fact_event = event_type in {"fact_recorded", "decision_recorded"}
+    if facts_changed and not fact_event:
+        raise StoreError("events.invalid_fact", "facts and decisions require their dedicated record event")
+    if fact_event:
+        fields = {
+            key: value for key, value in payload.items()
+            if key not in {"state", "run_status"}
+        }
+        name = fields.get("name")
+        provenance = fields.get("provenance_summary")
+        if (
+            set(fields) != {"name", "value", "provenance_summary"}
+            or not isinstance(name, str)
+            or not name
+            or name != name.strip()
+            or len(name) > 4000
+            or any(ord(char) < 32 for char in name)
+            or not isinstance(provenance, str)
+            or not provenance
+            or provenance != provenance.strip()
+            or len(provenance) > 4000
+            or any(ord(char) < 32 for char in provenance)
+        ):
+            raise StoreError("events.invalid_evidence", "fact/decision event fields or provenance are invalid")
+        try:
+            expected = record_condition_fact_transition(
+                plan,
+                before,
+                name,
+                fields["value"],
+                decision=event_type == "decision_recorded",
+            )
+        except WorkflowError as exc:
+            raise StoreError("events.invalid_fact", str(exc)) from exc
+        if (
+            expected is before
+            or _canonical_bytes(_state_data(expected)) != _canonical_bytes(_state_data(after))
+        ):
+            raise StoreError("events.invalid_fact", "fact/decision event differs from its deterministic transition")
     if event_type == "stale_rerun_requested":
         fields = {key: value for key, value in payload.items() if key not in {"state", "run_status"}}
         expected_keys = {
@@ -1406,7 +1451,9 @@ def validate_node_evidence_delta(
             }
             recovery = (earlier.status is NodeStatus.RUNNING and current.status is NodeStatus.BLOCKED
                         and event_type == "recovery_running_blocked")
-            invalidation = current.status is NodeStatus.STALE and event_type in {"artifact_registered", "artifacts_marked_stale"}
+            invalidation = current.status is NodeStatus.STALE and event_type in {
+                "artifact_registered", "artifacts_marked_stale", "fact_recorded", "decision_recorded",
+            }
             if not (completion or recovery or invalidation):
                 code = "artifact.authority_invalid" if event_type == "artifact_registered" else "events.invalid_evidence"
                 raise StoreError(code, "attempt reset requires an authorized lifecycle transition")
