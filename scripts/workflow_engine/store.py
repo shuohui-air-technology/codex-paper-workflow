@@ -2357,33 +2357,42 @@ class WorkflowStore:
 
     def deactivate_custom(self) -> Selection:
         with self._lock() as lease:
-            previous = self._selection_unlocked()
-            if self.paths.state.exists() or self.paths.state.is_symlink():
-                material = self._validated_run_material(
-                    allow_truncated=False,
-                    require_no_suffix=True,
-                )
-                plan, state, sequence, event_hash, run_status, _events, _tail, _prefix, witnesses = material
-                if run_status == "active":
-                    transaction = self._transaction(lease)
-                    transaction._set_loaded(
-                        plan,
-                        state,
-                        sequence,
-                        event_hash,
-                        run_status,
-                        _events,
-                        witnesses,
-                    )
-                    transaction._commit_event("run_stopped", state, {}, run_status="stopped")
-            selected = Selection("official", previous.selection_revision + 1)
-            self._audit_append(
-                "selection_deactivated",
-                previous.semantic_sha256 or ZERO_HASH,
-                {"selection": selected.to_payload()},
+            self._stop_active_run_unlocked(lease)
+            return self._record_official_selection_unlocked()
+
+    def _stop_active_run_unlocked(self, lease: object) -> None:
+        self._assert_active_lease(lease)
+        if not self.paths.state.exists() and not self.paths.state.is_symlink():
+            return
+        material = self._validated_run_material(
+            allow_truncated=False,
+            require_no_suffix=True,
+        )
+        plan, state, sequence, event_hash, run_status, events, _tail, _prefix, witnesses = material
+        if run_status == "active":
+            transaction = self._transaction(lease)
+            transaction._set_loaded(
+                plan,
+                state,
+                sequence,
+                event_hash,
+                run_status,
+                events,
+                witnesses,
             )
-            self._atomic_json(self.paths.selection, selected.to_payload())
-            return selected
+            transaction._commit_event("run_stopped", state, {}, run_status="stopped")
+
+    def _record_official_selection_unlocked(self) -> Selection:
+        self._assert_active_lease()
+        previous = self._selection_unlocked()
+        selected = Selection("official", previous.selection_revision + 1)
+        self._audit_append(
+            "selection_deactivated",
+            previous.semantic_sha256 or ZERO_HASH,
+            {"selection": selected.to_payload()},
+        )
+        self._atomic_json(self.paths.selection, selected.to_payload())
+        return selected
 
     def read_audit_events(self) -> tuple[WorkflowEvent, ...]:
         if not self.paths.audit_events.exists() and not self.paths.audit_events.is_symlink():
@@ -2436,11 +2445,30 @@ class WorkflowStore:
             high_risk_warning_codes, acknowledged_warning_codes
         )
         prepared = self._prepare_run_start(plan, run_id)
-        with self._lock():
+        with self._lock() as lease:
             selected, _normalized_plan = self._activate_custom_unlocked(
                 prepared[1], required
             )
-            state = self._start_run_unlocked(prepared)
+            try:
+                state = self._start_run_unlocked(prepared)
+            except Exception as start_error:
+                try:
+                    self._stop_active_run_unlocked(lease)
+                except Exception:
+                    # Preserve the original start failure; the fallback below
+                    # still restores the ordinary official-workflow selection.
+                    pass
+                try:
+                    self._record_official_selection_unlocked()
+                except Exception as rollback_error:
+                    raise StoreError(
+                        "activation.rollback_failed",
+                        "custom workflow startup failed and official mode could not be restored",
+                    ) from rollback_error
+                raise StoreError(
+                    "activation.start_failed",
+                    "custom workflow startup failed; official mode was restored, but local run files should be reviewed before retrying",
+                ) from start_error
             return selected, state
 
     def _prepare_run_start(self, plan: CompiledPlan, run_id: str):

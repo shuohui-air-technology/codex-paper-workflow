@@ -188,6 +188,10 @@ class WorkflowStudioServerTests(unittest.TestCase):
         self.assertEqual(skill["catalog_id"], "test-workflow-task")
         self.assertEqual(skill["relative_path"], "test-workflow-task")
         self.assertNotIn(str(self.skills), json.dumps(data))
+        validators = {item["validator_id"]: item for item in data["data"]["validators"]}
+        self.assertIn("contract", validators["experiment-contract"]["input_roles"])
+        self.assertIn("paper_type", validators["paper-section"]["options"])
+        self.assertFalse(validators["humanizer-preflight"]["available"])
 
     def test_catalog_marks_ambiguous_skill_without_exposing_absolute_paths(self):
         duplicate_root = self.root / "duplicate-skills"
@@ -292,6 +296,92 @@ class WorkflowStudioServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(data["errors"][0]["code"], "http.invalid_request")
+
+    def test_failed_run_start_restores_official_selection(self):
+        workflow = self.valid_workflow()
+        status, validation, _ = self.request(
+            "POST", "/api/validate", body={"workflow": workflow}, headers=self.write_headers()
+        )
+        self.assertEqual(status, 200)
+        status, saved, _ = self.request(
+            "PUT",
+            "/api/workflow",
+            body={"workflow": workflow, "expected_document_revision": 0},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200)
+        activation_request = {
+            "workflow_id": workflow["workflow_id"],
+            "expected_document_revision": saved["data"]["document_revision"],
+            "semantic_sha256": validation["data"]["semantic_sha256"],
+            "acknowledged_warning_codes": sorted(
+                item["code"] for item in validation["warnings"]
+            ),
+        }
+        with mock.patch.object(
+            self.server.application.service.store,
+            "_start_run_unlocked",
+            side_effect=OSError("injected run-start failure"),
+        ):
+            status, failed, _ = self.request(
+                "POST", "/api/activate", body=activation_request,
+                headers=self.write_headers(),
+            )
+
+        self.assertEqual(status, 500, failed)
+        self.assertEqual(failed["errors"][0]["code"], "activation.start_failed")
+        self.assertTrue(failed["wrote_files"])
+        self.assertIn("Official mode was restored", failed["errors"][0]["recovery"])
+        status, bootstrap, _ = self.request("GET", "/api/bootstrap")
+        self.assertEqual((status, bootstrap["data"]["mode"]), (200, "official"))
+        self.assertFalse(
+            (self.project / ".research" / "custom-workflow" / "active-run" / "state.json").exists()
+        )
+
+    def test_failed_run_start_after_state_write_stops_partial_activation(self):
+        workflow = self.valid_workflow()
+        status, validation, _ = self.request(
+            "POST", "/api/validate", body={"workflow": workflow}, headers=self.write_headers()
+        )
+        self.assertEqual(status, 200)
+        status, saved, _ = self.request(
+            "PUT",
+            "/api/workflow",
+            body={"workflow": workflow, "expected_document_revision": 0},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200)
+        activation_request = {
+            "workflow_id": workflow["workflow_id"],
+            "expected_document_revision": saved["data"]["document_revision"],
+            "semantic_sha256": validation["data"]["semantic_sha256"],
+            "acknowledged_warning_codes": sorted(
+                item["code"] for item in validation["warnings"]
+            ),
+        }
+        store = self.server.application.service.store
+        original_start = store._start_run_unlocked
+
+        def write_then_fail(prepared):
+            original_start(prepared)
+            raise OSError("injected failure after durable run start")
+
+        with mock.patch.object(store, "_start_run_unlocked", side_effect=write_then_fail):
+            status, failed, _ = self.request(
+                "POST", "/api/activate", body=activation_request,
+                headers=self.write_headers(),
+            )
+
+        self.assertEqual(status, 500, failed)
+        self.assertEqual(failed["errors"][0]["code"], "activation.start_failed")
+        self.assertTrue(failed["wrote_files"])
+        status, bootstrap, _ = self.request("GET", "/api/bootstrap")
+        self.assertEqual((status, bootstrap["data"]["mode"]), (200, "official"))
+        state = json.loads(
+            (self.project / ".research" / "custom-workflow" / "active-run" / "state.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["run_status"], "stopped")
 
     def test_state_change_requires_exact_origin_csrf_and_json(self):
         missing_origin = self.write_headers()
@@ -663,6 +753,60 @@ class WorkflowStudioServerTests(unittest.TestCase):
         self.assertTrue(data["data"]["shutdown_requested"])
         self.thread.join(timeout=2)
         self.assertFalse(self.thread.is_alive())
+
+    def test_server_close_waits_for_an_in_flight_draft_write(self):
+        workflow = self.valid_workflow()
+        entered_save = threading.Event()
+        resume_save = threading.Event()
+        close_finished = threading.Event()
+        original_save = self.server.application.service.save_draft
+
+        def pause_save(document, *, expected_document_revision):
+            entered_save.set()
+            if not resume_save.wait(timeout=5):
+                raise TimeoutError("test draft save did not resume")
+            return original_save(
+                document, expected_document_revision=expected_document_revision
+            )
+
+        results = {}
+        with mock.patch.object(
+            self.server.application.service, "save_draft", side_effect=pause_save
+        ):
+            save_thread = threading.Thread(
+                target=lambda: results.setdefault(
+                    "save",
+                    self.request(
+                        "PUT",
+                        "/api/workflow",
+                        body={"workflow": workflow, "expected_document_revision": 0},
+                        headers=self.write_headers(),
+                    ),
+                )
+            )
+            save_thread.start()
+            self.assertTrue(entered_save.wait(timeout=5))
+            status, shutdown, _ = self.request(
+                "POST", "/api/shutdown", body={}, headers=self.write_headers()
+            )
+            self.assertEqual(status, 200, shutdown)
+            self.thread.join(timeout=2)
+            self.assertFalse(self.thread.is_alive())
+
+            close_thread = threading.Thread(
+                target=lambda: (self.server.server_close(), close_finished.set())
+            )
+            close_thread.start()
+            self.assertFalse(close_finished.wait(timeout=0.1))
+            resume_save.set()
+            save_thread.join(timeout=5)
+            close_thread.join(timeout=5)
+
+        self.assertFalse(save_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertTrue(close_finished.is_set())
+        self.assertEqual(results["save"][0], 200, results["save"][1])
+        self.assertTrue(results["save"][1]["wrote_files"])
 
     def test_idle_timeout_stops_an_unused_server(self):
         config = StudioConfig(

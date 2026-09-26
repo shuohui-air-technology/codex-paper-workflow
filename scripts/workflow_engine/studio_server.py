@@ -23,7 +23,7 @@ from .catalog import (
     discover_skills,
     load_validator_registry,
 )
-from .schema import WorkflowError, WorkflowIssue
+from .schema import WorkflowError, WorkflowIssue, validator_form_metadata
 from .store import StoreError
 from .validators import ValidatorError
 from .fs import PathSafetyError
@@ -298,6 +298,8 @@ class StudioApplication:
         status_by_code = {
             "activation.acknowledgement_mismatch": 409,
             "activation.draft_mismatch": 409,
+            "activation.start_failed": 500,
+            "activation.rollback_failed": 500,
             "http.invalid_request": 400,
             "run.already_active": 409,
             "run.not_found": 404,
@@ -311,13 +313,22 @@ class StudioApplication:
             "studio.activation_validation_blocked": 422,
         }
         http_status = status_by_code.get(code, 400)
+        recovery = "Reload the current workflow state, review the reported issue, and retry."
+        if code == "activation.start_failed":
+            recovery = "Official mode was restored. Keep the project files and review local custom-run state before retrying."
+        elif code == "activation.rollback_failed":
+            recovery = "Do not retry activation yet. Preserve the project files and inspect the local workflow selection and run state."
         issue = _issue(
             code,
             message,
             operation=operation,
-            recovery="Reload the current workflow state, review the reported issue, and retry.",
+            recovery=recovery,
         )
-        return http_status, envelope(status="error", errors=(issue,))
+        return http_status, envelope(
+            status="error",
+            errors=(issue,),
+            wrote_files=code in {"activation.start_failed", "activation.rollback_failed"},
+        )
 
     def _read_draft_if_present(self):
         path = self.service.store.paths.workflow
@@ -378,6 +389,7 @@ class StudioApplication:
                 recovery="Verify the installed Orchestrator files and retry.",
             )
             return {"skills": skills, "validators": []}, [issue], []
+        validator_forms = validator_form_metadata()
         validator_data = [
             {
                 "validator_id": item.validator_id,
@@ -387,6 +399,7 @@ class StudioApplication:
                 "input_schema": item.input_schema,
                 "control_tags": list(item.control_tags),
                 "outcomes": list(item.outcomes),
+                **validator_forms.get(item.validator_id, {}),
             }
             for _key, item in sorted(validators.items())
         ]
@@ -740,7 +753,7 @@ class StudioApplication:
 
 
 class _StudioHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
+    daemon_threads = False
     block_on_close = True
     allow_reuse_address = False
     request_queue_size = 16
@@ -750,6 +763,7 @@ class _StudioHTTPServer(ThreadingHTTPServer):
         self.idle_timeout_seconds = idle_timeout_seconds
         self._last_activity = time.monotonic()
         self._activity_lock = threading.Lock()
+        self._active_requests = 0
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
         super().__init__(address, handler)
@@ -757,6 +771,23 @@ class _StudioHTTPServer(ThreadingHTTPServer):
     def mark_activity(self) -> None:
         with self._activity_lock:
             self._last_activity = time.monotonic()
+
+    def process_request(self, request, client_address) -> None:
+        with self._activity_lock:
+            self._active_requests += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._activity_lock:
+                self._active_requests -= 1
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._activity_lock:
+                self._active_requests -= 1
 
     def serve_forever(self, poll_interval: float = 0.1) -> None:
         super().serve_forever(poll_interval=poll_interval)
@@ -771,7 +802,8 @@ class _StudioHTTPServer(ThreadingHTTPServer):
     def service_actions(self) -> None:
         with self._activity_lock:
             idle_for = time.monotonic() - self._last_activity
-        if idle_for >= self.idle_timeout_seconds:
+            has_active_requests = self._active_requests > 0
+        if not has_active_requests and idle_for >= self.idle_timeout_seconds:
             self.request_shutdown()
 
 
