@@ -177,6 +177,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
         status, data, _ = self.request("GET", "/api/bootstrap")
         self.assertEqual(status, 200)
         self.assertEqual(data["data"]["mode"], "official")
+        self.assertIsNone(data["data"]["active_workflow"])
         self.assertEqual(data["data"]["csrf_token"], "c" * 64)
         self.assertEqual(data["data"]["max_json_body_bytes"], MAX_JSON_BODY)
 
@@ -279,12 +280,16 @@ class WorkflowStudioServerTests(unittest.TestCase):
 
         status, active, _ = self.request("GET", "/api/bootstrap")
         self.assertEqual((status, active["data"]["mode"]), (200, "custom"))
+        self.assertEqual(active["data"]["active_workflow"]["workflow_id"], workflow["workflow_id"])
+        self.assertEqual(active["data"]["active_workflow"]["semantic_sha256"], validation["data"]["semantic_sha256"])
+        self.assertEqual(active["data"]["active_workflow"]["run_id"], activated["data"]["run_id"])
         status, deactivated, _ = self.request(
             "POST", "/api/deactivate", body={}, headers=self.write_headers()
         )
         self.assertEqual(status, 200, deactivated)
         status, official, _ = self.request("GET", "/api/bootstrap")
         self.assertEqual((status, official["data"]["mode"]), (200, "official"))
+        self.assertIsNone(official["data"]["active_workflow"])
         self.assertTrue((self.project / ".research" / "custom-workflow" / "active-run" / "state.json").exists())
 
     def test_activation_rejects_client_supplied_workflow_data(self):
@@ -382,6 +387,58 @@ class WorkflowStudioServerTests(unittest.TestCase):
             .read_text(encoding="utf-8")
         )
         self.assertEqual(state["run_status"], "stopped")
+
+    def test_failed_selector_projection_write_restores_official_selection(self):
+        workflow = self.valid_workflow()
+        status, validation, _ = self.request(
+            "POST", "/api/validate", body={"workflow": workflow}, headers=self.write_headers()
+        )
+        self.assertEqual(status, 200)
+        status, saved, _ = self.request(
+            "PUT",
+            "/api/workflow",
+            body={"workflow": workflow, "expected_document_revision": 0},
+            headers=self.write_headers(),
+        )
+        self.assertEqual(status, 200)
+        activation_request = {
+            "workflow_id": workflow["workflow_id"],
+            "expected_document_revision": saved["data"]["document_revision"],
+            "semantic_sha256": validation["data"]["semantic_sha256"],
+            "acknowledged_warning_codes": sorted(
+                item["code"] for item in validation["warnings"]
+            ),
+        }
+        store = self.server.application.service.store
+        original_atomic_json = store._atomic_json
+        failure = {"pending": True}
+
+        def fail_selection_projection_once(path, value):
+            if path == store.paths.selection and failure["pending"]:
+                failure["pending"] = False
+                raise OSError("injected selector projection failure")
+            return original_atomic_json(path, value)
+
+        with mock.patch.object(store, "_atomic_json", side_effect=fail_selection_projection_once):
+            status, failed, _ = self.request(
+                "POST", "/api/activate", body=activation_request,
+                headers=self.write_headers(),
+            )
+
+        self.assertEqual(status, 500, failed)
+        self.assertEqual(failed["errors"][0]["code"], "activation.start_failed")
+        self.assertTrue(failed["wrote_files"])
+        self.assertIn("Official mode was restored", failed["errors"][0]["recovery"])
+        status, bootstrap, _ = self.request("GET", "/api/bootstrap")
+        self.assertEqual((status, bootstrap["data"]["mode"]), (200, "official"))
+        self.assertFalse(
+            (self.project / ".research" / "custom-workflow" / "active-run" / "state.json").exists()
+        )
+        audit_events = store.read_audit_events()
+        self.assertEqual(audit_events[-1].event_type, "selection_deactivated")
+        self.assertEqual(
+            audit_events[-1].payload["selection"]["mode"], "official"
+        )
 
     def test_state_change_requires_exact_origin_csrf_and_json(self):
         missing_origin = self.write_headers()
@@ -828,6 +885,132 @@ class WorkflowStudioServerTests(unittest.TestCase):
             if thread.is_alive():
                 server.shutdown()
             server.server_close()
+
+    def test_idle_timeout_closes_a_client_that_never_sends_a_request(self):
+        config = StudioConfig(
+            project_root=self.project,
+            asset_root=self.assets,
+            session_token="k" * 64,
+            csrf_token="f" * 64,
+            idle_timeout_seconds=0.25,
+            open_browser=False,
+            skill_roots=(self.skills,),
+        )
+        server, thread = self.start_server(config)
+        server.request_timeout_seconds = 0.12
+        connection = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=2)
+        try:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(), "stalled client prevented idle shutdown")
+            self.assertEqual(server._active_requests, 0)
+            connection.settimeout(1)
+            self.assertEqual(connection.recv(1), b"")
+        finally:
+            connection.close()
+            if thread.is_alive():
+                server.shutdown()
+            server.server_close()
+
+    def test_absolute_request_deadline_closes_slow_drip_headers_and_body(self):
+        config = StudioConfig(
+            project_root=self.project,
+            asset_root=self.assets,
+            session_token="l" * 64,
+            csrf_token="g" * 64,
+            idle_timeout_seconds=30,
+            open_browser=False,
+            skill_roots=(self.skills,),
+        )
+        server, thread = self.start_server(config)
+        server.request_timeout_seconds = 0.15
+        port = server.server_address[1]
+
+        def wait_for_active(expected):
+            deadline = time.monotonic() + 2
+            while server._active_requests != expected and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(server._active_requests, expected)
+
+        def wait_for_close():
+            deadline = time.monotonic() + 1
+            while server._active_requests and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(server._active_requests, 0, "slow-drip client exceeded the total request deadline")
+
+        def drip(connection, payload):
+            for byte in payload:
+                try:
+                    connection.sendall(bytes((byte,)))
+                except OSError:
+                    return
+                time.sleep(0.02)
+
+        try:
+            # An incomplete request line keeps producing data often enough to
+            # defeat an inactivity timeout, but must still hit the total limit.
+            headers_socket = socket.create_connection(("127.0.0.1", port), timeout=2)
+            wait_for_active(1)
+            header_writer = threading.Thread(
+                target=drip, args=(headers_socket, b"G" * 80)
+            )
+            header_writer.start()
+            wait_for_close()
+            header_writer.join(timeout=1)
+            headers_socket.close()
+
+            # The same absolute limit applies after headers, while a bounded
+            # JSON request body is arriving slowly.
+            body_socket = socket.create_connection(("127.0.0.1", port), timeout=2)
+            body = b"{" + b" " * 79 + b"}"
+            request_headers = (
+                "POST /api/shutdown HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Authorization: Bearer {'l' * 64}\r\n"
+                f"Origin: http://127.0.0.1:{port}\r\n"
+                f"X-Workflow-CSRF: {'g' * 64}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode("ascii")
+            body_socket.sendall(request_headers)
+            wait_for_active(1)
+            body_writer = threading.Thread(target=drip, args=(body_socket, body))
+            body_writer.start()
+            wait_for_close()
+            body_writer.join(timeout=1)
+            body_socket.close()
+        finally:
+            if thread.is_alive():
+                server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_server_close_finishes_after_a_stalled_client_times_out(self):
+        server, thread = self.start_server(self.config)
+        server.request_timeout_seconds = 0.12
+        connection = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=2)
+        close_finished = threading.Event()
+        close_thread = None
+        try:
+            deadline = time.monotonic() + 2
+            while server._active_requests == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(server._active_requests, 1, "test connection was not accepted")
+            server.shutdown()
+            close_thread = threading.Thread(
+                target=lambda: (server.server_close(), close_finished.set())
+            )
+            close_thread.start()
+            close_thread.join(timeout=2)
+            self.assertFalse(close_thread.is_alive(), "server_close waited on a stalled client")
+            self.assertTrue(close_finished.is_set())
+            self.assertEqual(server._active_requests, 0)
+        finally:
+            connection.close()
+            if thread.is_alive():
+                server.shutdown()
+            if close_thread is None:
+                server.server_close()
+            thread.join(timeout=2)
 
     def test_unauthenticated_static_requests_do_not_extend_idle_timeout(self):
         config = StudioConfig(

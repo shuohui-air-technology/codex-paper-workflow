@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import stat
 import threading
 import time
@@ -34,6 +35,7 @@ from scripts.workflow_engine.receipts import ReceiptError
 MAX_JSON_BODY = 2 * 1024 * 1024
 MAX_JSON_NESTING = 128
 _MAX_IDLE_TIMEOUT = 24 * 60 * 60
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 15.0
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 _CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -342,6 +344,16 @@ class StudioApplication:
         return {
             "project_label": self.project_root.name,
             "mode": summary["mode"],
+            "active_workflow": (
+                {
+                    "workflow_id": summary["workflow_id"],
+                    "semantic_revision": summary["semantic_revision"],
+                    "semantic_sha256": summary["semantic_sha256"],
+                    "run_id": summary["run_id"],
+                }
+                if summary["mode"] == "custom"
+                else None
+            ),
             "document_revision": 0 if draft is None else draft["document_revision"],
             "csrf_token": self.config.csrf_token,
             "max_json_body_bytes": MAX_JSON_BODY,
@@ -761,12 +773,51 @@ class _StudioHTTPServer(ThreadingHTTPServer):
     def __init__(self, address, handler, application: StudioApplication, idle_timeout_seconds: float):
         self.application = application
         self.idle_timeout_seconds = idle_timeout_seconds
+        self.request_timeout_seconds = _DEFAULT_REQUEST_TIMEOUT_SECONDS
         self._last_activity = time.monotonic()
         self._activity_lock = threading.Lock()
         self._active_requests = 0
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
+        self._request_timeout_lock = threading.Lock()
+        self._request_timeout_timers: dict[socket.socket, threading.Timer] = {}
         super().__init__(address, handler)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        # A client that connects but never sends an HTTP request must not pin
+        # an active-request slot or make server_close() wait forever.
+        request.settimeout(self.request_timeout_seconds)
+        timer = threading.Timer(
+            self.request_timeout_seconds,
+            self._expire_request,
+            args=(request,),
+        )
+        timer.daemon = True
+        with self._request_timeout_lock:
+            self._request_timeout_timers[request] = timer
+        timer.start()
+        return request, client_address
+
+    def _expire_request(self, request: socket.socket) -> None:
+        with self._request_timeout_lock:
+            timer = self._request_timeout_timers.pop(request, None)
+        if timer is None:
+            return
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish_request_input(self, request: socket.socket) -> None:
+        """Stop the absolute read deadline once this request's body is complete."""
+        with self._request_timeout_lock:
+            timer = self._request_timeout_timers.pop(request, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_request_timeout(self, request: socket.socket) -> None:
+        self.finish_request_input(request)
 
     def mark_activity(self) -> None:
         with self._activity_lock:
@@ -778,6 +829,7 @@ class _StudioHTTPServer(ThreadingHTTPServer):
         try:
             super().process_request(request, client_address)
         except BaseException:
+            self._cancel_request_timeout(request)
             with self._activity_lock:
                 self._active_requests -= 1
             raise
@@ -786,6 +838,7 @@ class _StudioHTTPServer(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            self._cancel_request_timeout(request)
             with self._activity_lock:
                 self._active_requests -= 1
 
@@ -819,6 +872,15 @@ class _StudioRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Request targets and headers can contain credentials; never log them.
         return
+
+    def handle(self):
+        try:
+            super().handle()
+        except (OSError, TimeoutError):
+            # Socket read timeouts and peer disconnects are ordinary local
+            # client failures. In particular, makefile.readline() may wrap a
+            # timeout as OSError("cannot read from timed out object").
+            return
 
     def do_GET(self):
         self._handle()
@@ -957,6 +1019,13 @@ class _StudioRequestHandler(BaseHTTPRequestHandler):
                 "http.invalid_json",
                 "Request body must be a UTF-8 JSON object without duplicate keys.", 400, operation,
             )[1]
+        except (OSError, TimeoutError):
+            return 408, self.studio_server.application.error(
+                "http.request_timeout",
+                "The request body was not received before the local request timeout.",
+                408,
+                operation,
+            )[1]
         return None, value
 
     def _handle(self, *, head_only: bool = False) -> None:
@@ -1014,11 +1083,13 @@ class _StudioRequestHandler(BaseHTTPRequestHandler):
                     )[:2])
                     return
                 status, body = self._read_json_body(path.rsplit("/", 1)[-1])
+                self.studio_server.finish_request_input(self.connection)
                 if status is not None:
                     self._write_json(status, body)
                     return
             else:
                 body = None
+                self.studio_server.finish_request_input(self.connection)
             status, result, shutdown = self.studio_server.application.dispatch(
                 self.command, path, body
             )
@@ -1028,10 +1099,12 @@ class _StudioRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.command not in {"GET", "HEAD"}:
+            self.studio_server.finish_request_input(self.connection)
             self._write_json(*self.studio_server.application.error(
                 "http.method_not_allowed", "Static resources are available only with GET.", 405, "static"
             )[:2])
             return
+        self.studio_server.finish_request_input(self.connection)
         result = self.studio_server.application.static_file(path)
         if result is None:
             self._write_json(*self.studio_server.application.error(

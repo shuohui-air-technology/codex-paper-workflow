@@ -2446,18 +2446,45 @@ class WorkflowStore:
         )
         prepared = self._prepare_run_start(plan, run_id)
         with self._lock() as lease:
-            selected, _normalized_plan = self._activate_custom_unlocked(
-                prepared[1], required
-            )
+            previous_history = self._journal_history_unlocked()
+            previous_revision = len(previous_history or ())
             try:
+                selected, _normalized_plan = self._activate_custom_unlocked(
+                    prepared[1], required
+                )
                 state = self._start_run_unlocked(prepared)
-            except Exception as start_error:
+            except Exception as activation_error:
+                # _activate_custom_unlocked() writes the authoritative journal
+                # before the selector projection. If that projection write
+                # fails, activation has still committed and must be rolled
+                # back just like a failed run start.
+                try:
+                    current_history = self._journal_history_unlocked()
+                except Exception as inspection_error:
+                    raise StoreError(
+                        "activation.rollback_failed",
+                        "custom workflow activation failed and its durable selection could not be inspected",
+                    ) from inspection_error
+                committed_selection = (
+                    current_history[-1]
+                    if current_history and len(current_history) > previous_revision
+                    else None
+                )
+                activation_was_committed = bool(
+                    committed_selection is not None
+                    and committed_selection.mode == "custom"
+                    and committed_selection.workflow_id == prepared[1].workflow_id
+                    and committed_selection.semantic_revision == prepared[1].semantic_revision
+                    and committed_selection.semantic_sha256 == prepared[1].semantic_sha256
+                )
+                if not activation_was_committed:
+                    raise
+
+                stop_error = None
                 try:
                     self._stop_active_run_unlocked(lease)
-                except Exception:
-                    # Preserve the original start failure; the fallback below
-                    # still restores the ordinary official-workflow selection.
-                    pass
+                except Exception as exc:
+                    stop_error = exc
                 try:
                     self._record_official_selection_unlocked()
                 except Exception as rollback_error:
@@ -2465,10 +2492,15 @@ class WorkflowStore:
                         "activation.rollback_failed",
                         "custom workflow startup failed and official mode could not be restored",
                     ) from rollback_error
+                if stop_error is not None:
+                    raise StoreError(
+                        "activation.rollback_failed",
+                        "official mode was restored, but partial custom-run state could not be stopped safely",
+                    ) from stop_error
                 raise StoreError(
                     "activation.start_failed",
                     "custom workflow startup failed; official mode was restored, but local run files should be reviewed before retrying",
-                ) from start_error
+                ) from activation_error
             return selected, state
 
     def _prepare_run_start(self, plan: CompiledPlan, run_id: str):
