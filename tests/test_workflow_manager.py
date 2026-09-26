@@ -4,10 +4,12 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import MappingProxyType
 from unittest import mock
 
 from scripts.workflow_engine.receipts import (
@@ -663,6 +665,276 @@ class TaskProtocolTests(unittest.TestCase):
                 recovered = store.recover()
                 self.assertEqual((recovered.status, recovered.code), ("blocked", "receipt.inspection_failed"))
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
+
+
+class ValidatorManagerTests(unittest.TestCase):
+    PAPER = (
+        "# A paper\n## Introduction\nBackground.\n## Methods\nProcedure.\n"
+        "## Results\nFindings.\n## Discussion\nThe mechanism explains scope and limitations.\n"
+        "## Conclusion\nConclusion.\n"
+    )
+    PAPER_OPTIONS = {
+        "phase": "body", "paper_type": "empirical", "language": "en",
+        "method_profile": "method-first", "validity_status": "clear",
+        "discussion_integrated": False,
+    }
+
+    def setUp(self):
+        from scripts.workflow_manager import WorkflowService
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.project = Path(self.temporary.name)
+        environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.project / "codex-home")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.skill_root = self.project / "skills"
+        skill = self.skill_root / "test-workflow-task"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: test-workflow-task\ndescription: Test task\n---\nRun the test task.\n", encoding="utf-8")
+        self.service = WorkflowService(self.project, skill_roots=(self.skill_root,))
+        (self.project / "paper.md").write_text(self.PAPER, encoding="utf-8")
+
+    def document(self, *, validity_status="clear", with_routes=False):
+        value = json.loads((Path(__file__).parent / "fixtures/workflow_valid_linear.json").read_text())
+        value.update(workflow_id="validator-manager-flow", external_inputs=["paper"])
+        check = {
+            "id": "check", "type": "validator", "display_name": "Check paper",
+            "entry": True, "enabled": True, "skill_ref": None,
+            "validator_ref": "paper-section",
+            "validator_config": {"input_roles": {"file": "paper"}, "options": {
+                **self.PAPER_OPTIONS, "validity_status": validity_status,
+            }},
+            "origin_projection_node_id": None, "inputs": ["paper"], "outputs": [],
+            "outcomes": ["pass", "fail", "blocked"], "write_scopes": [],
+            "failure_policy": "block", "condition_cases": [], "join_mode": "all_active",
+        }
+        nodes = [check]
+        edges = []
+        positions = {"check": {"x": 120, "y": 80}}
+        if with_routes:
+            for suffix, trigger in (("pass", "pass"), ("blocked", "blocked")):
+                node_id = "on_" + suffix
+                nodes.append({
+                    "id": node_id, "type": "task", "display_name": "On " + suffix,
+                    "entry": False, "enabled": True, "skill_ref": "test-workflow-task",
+                    "validator_ref": None, "validator_config": None,
+                    "origin_projection_node_id": None, "inputs": [], "outputs": [],
+                    "outcomes": ["succeeded"], "write_scopes": [], "failure_policy": "block",
+                    "condition_cases": [], "join_mode": "all_active",
+                })
+                positions[node_id] = {"x": 420, "y": 100 if suffix == "pass" else 260}
+                edges.append({"id": "check_" + suffix, "source": "check", "target": node_id,
+                              "trigger": trigger, "output_map": {}})
+        value["nodes"] = nodes
+        value["edges"] = edges
+        value["ui"] = {"positions": positions}
+        return value
+
+    def activate(self, *, validity_status="clear", with_routes=False):
+        document = self.document(validity_status=validity_status, with_routes=with_routes)
+        validation = self.service.validate_document(document)
+        self.assertEqual(validation["status"], "pass", validation["errors"])
+        self.service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+        self.register_paper()
+
+    def register_paper(self):
+        from scripts.workflow_engine.scheduler import ArtifactRuntime, refresh_ready
+        with self.service.store.locked_run() as transaction:
+            plan, state = transaction.load_active_run()
+            data = (self.project / "paper.md").read_bytes()
+            artifact = ArtifactRuntime("paper", "paper.md", hashlib.sha256(data).hexdigest(),
+                                       "verified", "external", 0)
+            artifacts = dict(state.artifacts)
+            artifacts["paper"] = artifact
+            updated = refresh_ready(plan, replace(state, artifacts=MappingProxyType(artifacts)))
+            transaction.commit_transition("artifact_registered", updated, {
+                "artifact_id": "paper", "path": "paper.md", "sha256": artifact.sha256,
+            })
+
+    def test_real_validator_pass_receipt_and_downstream_route(self):
+        self.activate(with_routes=True)
+        receipt = self.service.run_validator("check")
+        self.assertEqual((receipt["status"], receipt["outcome"], receipt["node_type"]),
+                         ("succeeded", "pass", "validator"))
+        self.assertEqual(receipt["output_artifacts"], [])
+        self.assertEqual(receipt["input_artifacts"][0]["path"], "paper.md")
+        self.assertEqual(receipt["input_artifacts"][0]["sha256"], hashlib.sha256((self.project / "paper.md").read_bytes()).hexdigest())
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            self.assertEqual(state.nodes["on_pass"].status.value, "ready")
+            self.assertEqual(state.nodes["on_blocked"].status.value, "skipped")
+        events = self.service.store.read_run_events()
+        self.assertEqual([event.event_type for event in events].count("validator_claimed"), 1)
+        self.assertEqual([event.event_type for event in events].count("validator_result_recorded"), 1)
+        claim = next(event.payload["claim_evidence"] for event in events if event.event_type == "validator_claimed")
+        self.assertEqual(claim["validator_config"]["input_roles"], {"file": "paper"})
+        self.assertEqual(claim["validator_config"]["options"]["language"], "en")
+        self.assertEqual(claim["input_artifacts"][0]["sha256"], receipt["input_artifacts"][0]["sha256"])
+        self.assertEqual(self.service.store.recover().status, "clean")
+
+    def test_domain_fail_and_blocked_are_successful_validator_completions(self):
+        (self.project / "paper.md").write_text("# A paper\n", encoding="utf-8")
+        self.activate()
+        receipt = self.service.run_validator("check")
+        self.assertEqual((receipt["status"], receipt["outcome"]), ("succeeded", "fail"))
+        self.assertEqual(self.service.store.recover().status, "clean")
+
+        with TemporaryDirectory() as second_temp:
+            project = Path(second_temp)
+            paper = project / "paper.md"
+            paper.write_text(self.PAPER, encoding="utf-8")
+            skill_root = project / "skills"
+            skill = skill_root / "test-workflow-task"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: test-workflow-task\ndescription: Test task\n---\nRun the test task.\n", encoding="utf-8")
+            from scripts.workflow_manager import WorkflowService
+            service = WorkflowService(project, skill_roots=(skill_root,))
+            document = self.document(validity_status="blocked")
+            validation = service.validate_document(document)
+            self.assertEqual(validation["status"], "pass", validation["errors"])
+            service.activate(document, acknowledged_warning_codes=validation["required_warning_codes"])
+            with service.store.locked_run() as transaction:
+                from scripts.workflow_engine.scheduler import ArtifactRuntime, refresh_ready
+                plan, state = transaction.load_active_run()
+                digest = hashlib.sha256(paper.read_bytes()).hexdigest()
+                artifacts = {"paper": ArtifactRuntime("paper", "paper.md", digest, "verified", "external", 0)}
+                transaction.commit_transition("artifact_registered", refresh_ready(plan, replace(state, artifacts=MappingProxyType(artifacts))))
+            blocked = service.run_validator("check")
+            self.assertEqual((blocked["status"], blocked["outcome"]), ("succeeded", "blocked"))
+            self.assertEqual(service.store.recover().status, "clean")
+
+    def test_process_failure_has_empty_outcome_and_structured_receipt(self):
+        from scripts.workflow_engine.validators import ValidatorResult
+        self.activate()
+        with mock.patch("scripts.workflow_manager.run_registered_validator",
+                        return_value=ValidatorResult(None, "Validator execution failed.",
+                                                     "validator.timeout", "Validator exceeded its time limit.")):
+            receipt = self.service.run_validator("check")
+        self.assertEqual((receipt["status"], receipt["outcome"]), ("failed", ""))
+        self.assertEqual(receipt["error"], {"code": "validator.timeout", "message": "Validator exceeded its time limit."})
+        self.assertEqual(receipt["output_artifacts"], [])
+        self.assertEqual(self.service.store.recover().status, "clean")
+
+    def test_store_lock_is_available_while_validator_runs(self):
+        from scripts.workflow_engine.validators import run_validator as real_runner
+        self.activate()
+        observed = []
+
+        def checking_runner(node, inputs, project_root, repository_root):
+            acquired = threading.Event()
+
+            def inspect_ready():
+                self.service.ready()
+                acquired.set()
+
+            thread = threading.Thread(target=inspect_ready)
+            thread.start()
+            thread.join(timeout=1.0)
+            observed.append(acquired.is_set())
+            return real_runner(node, inputs, project_root, repository_root)
+
+        with mock.patch("scripts.workflow_manager.run_registered_validator", side_effect=checking_runner):
+            self.service.run_validator("check")
+        self.assertEqual(observed, [True])
+
+    def test_changed_input_is_recovered_without_validator_result(self):
+        from scripts.workflow_engine.validators import ValidatorResult
+        self.activate()
+
+        def change_then_pass(node, inputs, project_root, repository_root):
+            (self.project / "paper.md").write_text("changed while validator ran", encoding="utf-8")
+            return ValidatorResult("pass", "Validator passed.")
+
+        with mock.patch("scripts.workflow_manager.run_registered_validator", side_effect=change_then_pass):
+            with self.assertRaises(Exception) as caught:
+                self.service.run_validator("check")
+        self.assertEqual(caught.exception.code, "runtime.recovery_required")
+        event_types = [event.event_type for event in self.service.store.read_run_events()]
+        self.assertNotIn("validator_result_recorded", event_types)
+        self.assertIn(self.service.store.recover().status, {"clean", "recovered"})
+
+    def test_superseded_attempt_result_is_rejected_without_another_write(self):
+        from scripts.workflow_engine.scheduler import validator_retry_transition
+        from scripts.workflow_engine.validators import ValidatorResult
+        self.activate()
+        event_bytes_after_retry = []
+
+        def recover_retry_then_pass(node, inputs, project_root, repository_root):
+            self.assertEqual(self.service.store.recover().status, "blocked")
+            with self.service.store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                retried = validator_retry_transition(plan, state, "check")
+                transaction.commit_transition("validator_retried", retried, {"node_id": "check"})
+            event_bytes_after_retry.append(self.service.store.paths.events.read_bytes())
+            return ValidatorResult("pass", "Validator passed.")
+
+        with mock.patch("scripts.workflow_manager.run_registered_validator", side_effect=recover_retry_then_pass):
+            with self.assertRaises(Exception) as caught:
+                self.service.run_validator("check")
+        self.assertEqual(caught.exception.code, "receipt.stale_attempt")
+        self.assertEqual(self.service.store.paths.events.read_bytes(), event_bytes_after_retry[0])
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            self.assertEqual((state.nodes["check"].attempt, state.nodes["check"].status.value), (1, "ready"))
+
+    def test_humanizer_legacy_call_has_no_process_or_event_write(self):
+        from scripts.workflow_engine.catalog import load_validator_registry
+        self.activate()
+        with self.service.store.locked_run() as transaction:
+            plan, state = transaction.load_active_run()
+        root = Path(__file__).resolve().parents[1]
+        registry = load_validator_registry(root / "references/workflows/validator-registry.v1.json", root)
+        nodes = dict(plan.nodes)
+        nodes["check"] = replace(nodes["check"], validator=registry["humanizer-preflight"])
+        legacy_plan = replace(plan, nodes=MappingProxyType(nodes))
+        before = self.service.store.paths.events.read_bytes()
+        with mock.patch.object(self.service, "_load", return_value=(legacy_plan, state)):
+            with mock.patch("scripts.workflow_manager.run_registered_validator") as runner:
+                with self.assertRaises(Exception) as caught:
+                    self.service.run_validator("check")
+        self.assertEqual(caught.exception.code, "validator.unavailable")
+        runner.assert_not_called()
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before)
+
+    def test_invalid_compiled_form_is_rejected_before_claim_event(self):
+        self.activate()
+        with self.service.store.locked_run() as transaction:
+            plan, state = transaction.load_active_run()
+        nodes = dict(plan.nodes)
+        node = nodes["check"]
+        invalid_config = {"input_roles": {"file": "paper"}, "options": {"unapproved": True}}
+        nodes["check"] = replace(node, validator_config=invalid_config)
+        forged_plan = replace(plan, nodes=MappingProxyType(nodes))
+        before = self.service.store.paths.events.read_bytes()
+        def load_then_forge(transaction):
+            transaction.load_active_run()
+            return forged_plan, state
+
+        with mock.patch.object(self.service, "_load", side_effect=load_then_forge):
+            with self.assertRaises(Exception) as caught:
+                self.service.run_validator("check")
+        self.assertEqual(caught.exception.code, "validator.invalid_form")
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before)
+
+    def test_identity_drift_is_recovered_without_domain_result(self):
+        from scripts.workflow_engine.validators import ValidatorError, ValidatorResult, validate_validator_identity
+        self.activate()
+        calls = []
+
+        def identity_once_then_drift(node, repository_root):
+            calls.append(1)
+            if len(calls) == 1:
+                return validate_validator_identity(node, repository_root)
+            raise ValidatorError("validator.identity_changed", "Validator identity changed.")
+
+        with mock.patch("scripts.workflow_manager.validate_validator_identity", side_effect=identity_once_then_drift):
+            with mock.patch("scripts.workflow_manager.run_registered_validator",
+                            return_value=ValidatorResult("pass", "Validator passed.")):
+                with self.assertRaises(Exception) as caught:
+                    self.service.run_validator("check")
+        self.assertEqual(caught.exception.code, "runtime.recovery_required")
+        self.assertNotIn("validator_result_recorded", [event.event_type for event in self.service.store.read_run_events()])
+        self.assertIn(self.service.store.recover().status, {"clean", "recovered"})
 
 
 class HistoricalInputEvidenceTests(unittest.TestCase):

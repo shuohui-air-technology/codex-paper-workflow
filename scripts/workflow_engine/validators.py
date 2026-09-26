@@ -190,6 +190,11 @@ def _checked_identity(node: CompiledNode, repository_root: Path) -> Path:
     return script
 
 
+def validate_validator_identity(node: CompiledNode, repository_root: Path) -> Path:
+    """Confirm one compiled validator still matches its fixed registry entry."""
+    return _checked_identity(node, repository_root)
+
+
 def _checked_roles(node: CompiledNode, claim_inputs: Sequence[Mapping[str, object]], project_root: Path) -> dict[str, Path]:
     identity = node.validator
     assert identity is not None
