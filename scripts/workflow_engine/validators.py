@@ -77,6 +77,9 @@ _EVIDENCE_LITERAL = frozenset({
     "semantic verifier receipt profile does not match",
     "semantic verifier receipt evidence_refs must be non-empty",
     "semantic verifier receipt must contain an independent checks object",
+    "semantic verifier receipt must be a non-empty relative path",
+    "semantic verifier receipt must be a safe relative path",
+    "semantic verifier receipt resolves outside its receipt directory",
     "semantic verifier receipt sections must be a list",
     "semantic verifier receipt sections do not cover the required paper sections",
     "semantic receipt paper_type/language does not match the validator invocation",
@@ -290,7 +293,10 @@ def _capture_bounded(argv: Sequence[str], cwd: Path, *, timeout: float = DEFAULT
     def drain(pipe, buffer: bytearray) -> None:
         try:
             while True:
-                chunk = pipe.read(65536)
+                # BufferedReader.read(n) waits for n bytes or EOF. A live child
+                # can exceed the cap by one byte yet stall here until timeout.
+                # os.read returns currently available pipe bytes promptly.
+                chunk = os.read(pipe.fileno(), 65536)
                 if not chunk:
                     break
                 remaining = MAX_STREAM_BYTES + 1 - len(buffer)

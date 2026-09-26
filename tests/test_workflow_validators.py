@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -266,6 +267,46 @@ class ValidatorAdapterTests(unittest.TestCase):
                         (2, json.dumps(normal).encode()), (1, b"")):
             self.assertIsNone(normalize_validator_output(node, rc, raw, paths).outcome)
 
+    def test_real_final_paper_nested_verifier_path_is_domain_blocked(self):
+        manuscript = (
+            "# A paper\n## Abstract\nSummary.\n## Introduction\nBackground.\n"
+            "## Methods\nProcedure.\n## Results\nFindings.\n"
+            "## Discussion\nThe mechanism explains scope and limitations.\n"
+            "## Conclusion\nConclusion.\n## References\nReference.\n"
+        )
+        (self.project / "paper.md").write_text(manuscript, encoding="utf-8")
+        receipt = {
+            "status": "pass", "schema_version": 1, "verifier_id": "independent-checker",
+            "verifier_receipt_path": "../outside.json", "verifier_receipt_sha256": "sha256:" + "0" * 64,
+            "paper_type": "empirical", "language": "en", "method_profile": "method-first",
+            "discussion_integrated": False, "validity_status": "clear",
+            "manuscript_sha256": "sha256:" + hashlib.sha256(manuscript.encode()).hexdigest(),
+            "discussion_function": "pass", "conclusion_function": "pass", "abstract_consistency": "pass",
+            "evidence_refs": ["source-1"],
+            "sections": ["introduction", "methods", "results", "discussion", "conclusion"],
+        }
+        encoded_receipt = json.dumps(receipt).replace("../outside.json", "\\u002e\\u002e/outside.json")
+        (self.project / "semantic.json").write_text(encoded_receipt, encoding="utf-8")
+        self.assertEqual(json.loads(encoded_receipt)["verifier_receipt_path"], "../outside.json")
+        options = {**PAPER_OPTIONS, "phase": "final"}
+        node = self.node("paper-section", {"file": "paper", "semantic_receipt": "semantic"}, options)
+        claims = self.claims(paper="paper.md", semantic="semantic.json")
+        argv = build_validator_argv(node, claims, self.project, ROOT)
+        rc, stdout, _stderr = _capture_bounded(argv, self.project)
+        self.assertEqual(rc, 1)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["errors"], ["semantic verifier receipt must be a safe relative path"])
+        self.assertEqual(run_validator(node, claims, self.project, ROOT).outcome, "blocked")
+        paths = {"file": self.project / "paper.md", "semantic_receipt": self.project / "semantic.json"}
+        for message in ("semantic verifier receipt must be a non-empty relative path",
+                        "semantic verifier receipt must be a safe relative path",
+                        "semantic verifier receipt resolves outside its receipt directory"):
+            payload["errors"] = ["missing required title heading", message]
+            self.assertEqual(normalize_validator_output(node, 1, json.dumps(payload).encode(), paths).outcome,
+                             "blocked")
+        payload["errors"] = ["new unrelated validator message"]
+        self.assertIsNone(normalize_validator_output(node, 1, json.dumps(payload).encode(), paths).outcome)
+
     def test_result_path_binding_and_status_contradiction(self):
         mappings = (
             ("experiment-contract", {"contract": "a"}, {"contract": str(self.project / "other.json"),
@@ -311,6 +352,29 @@ class ValidatorAdapterTests(unittest.TestCase):
         for process in started:
             self.assertIsNotNone(process.poll())
             self.assertTrue(process.stdout.closed and process.stderr.closed)
+
+    def test_one_byte_over_cap_stops_live_child_promptly_on_each_stream(self):
+        started = []
+        original_popen = subprocess.Popen
+
+        def tracked_popen(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            started.append(process)
+            return process
+
+        for fd in (1, 2):
+            with self.subTest(stream=fd):
+                command = [sys.executable, "-c",
+                           f"import os,time;os.write({fd},b'x'*1048577);time.sleep(5)"]
+                start = time.monotonic()
+                with patch("scripts.workflow_engine.validators.subprocess.Popen", side_effect=tracked_popen):
+                    with self.assertRaises(ValidatorError) as caught:
+                        _capture_bounded(command, self.project, timeout=3)
+                elapsed = time.monotonic() - start
+                self.assertEqual(caught.exception.code, "validator.output_limit")
+                self.assertLess(elapsed, 1.5, "output cap must stop a live child before the deadline")
+                self.assertIsNotNone(started[-1].poll())
+                self.assertTrue(started[-1].stdout.closed and started[-1].stderr.closed)
 
     def test_stderr_only_and_crash_are_execution_failures(self):
         figure = self.node("figure-contract", {"receipt": "a"})
