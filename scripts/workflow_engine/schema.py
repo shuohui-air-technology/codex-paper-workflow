@@ -639,6 +639,65 @@ def load_workflow(path: Path | str) -> WorkflowDocument:
     return parse_workflow(value)
 
 
+def document_data(document: WorkflowDocument) -> dict[str, object]:
+    """Serialize every document field for strict round-trip validation and storage."""
+    return {
+        "schema_version": document.schema_version,
+        "workflow_id": document.workflow_id,
+        "document_revision": document.document_revision,
+        "semantic_revision": document.semantic_revision,
+        "derived_from": _json_value(document.derived_from),
+        "max_parallelism": document.max_parallelism,
+        "external_inputs": _json_value(document.external_inputs),
+        "nodes": [
+            {
+                "id": node.id,
+                "type": node.type,
+                "display_name": node.display_name,
+                "entry": node.entry,
+                "enabled": node.enabled,
+                "skill_ref": node.skill_ref,
+                "validator_ref": node.validator_ref,
+                "validator_config": _json_value(node.validator_config),
+                "origin_projection_node_id": node.origin_projection_node_id,
+                "inputs": _json_value(node.inputs),
+                "outputs": _json_value(node.outputs),
+                "outcomes": [] if node.type in {"condition", "join"} else _json_value(node.outcomes),
+                "write_scopes": _json_value(node.write_scopes),
+                "failure_policy": node.failure_policy,
+                "condition_cases": _json_value(node.condition_cases),
+                "join_mode": node.join_mode,
+            }
+            for node in document.nodes
+        ],
+        "edges": [
+            {
+                "id": edge.id,
+                "source": edge.source,
+                "target": edge.target,
+                "trigger": edge.trigger,
+                "output_map": _json_value(edge.output_map),
+            }
+            for edge in document.edges
+        ],
+        "ui": _json_value(document.ui),
+    }
+
+
+def normalize_workflow_document(document: WorkflowDocument) -> WorkflowDocument:
+    """Reject constructed documents that would change meaning when reparsed."""
+    if not isinstance(document, WorkflowDocument):
+        _fail("schema.invalid_document", "compiled workflow must be a WorkflowDocument")
+    try:
+        serialized = document_data(document)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise WorkflowError("schema.invalid_constructed_document", "constructed workflow has invalid field types") from exc
+    normalized = parse_workflow(serialized)
+    if normalized != document:
+        _fail("schema.document_noncanonical", "constructed workflow differs from its parsed form")
+    return normalized
+
+
 def behavior_payload(document: WorkflowDocument) -> dict[str, object]:
     """Return behavior-bearing fields in deterministic, JSON-ready form."""
     return {

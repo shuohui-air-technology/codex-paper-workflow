@@ -20,6 +20,7 @@ from .schema import (
     WorkflowIssue,
     document_payload,
     document_sha256,
+    normalize_workflow_document,
 )
 
 
@@ -263,6 +264,11 @@ def compile_workflow(
     projection: Mapping[str, object],
 ) -> CompileResult:
     """Validate an immutable document and return a canonical plan or blocking issues."""
+    try:
+        document = normalize_workflow_document(document)
+    except WorkflowError as exc:
+        issue = _issue(exc.code, str(exc), node_id=exc.node_id, edge_id=exc.edge_id)
+        return CompileResult(None, (issue,), ())
     errors = list(catalog.errors)
     warnings = list(catalog.warnings)
 

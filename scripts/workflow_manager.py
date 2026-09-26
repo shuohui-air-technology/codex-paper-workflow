@@ -25,7 +25,9 @@ from scripts.workflow_engine.scheduler import (
     ArtifactRuntime, claim_transition, ready_node_ids, refresh_ready,
     result_transition, stabilize_control_nodes,
 )
-from scripts.workflow_engine.schema import WorkflowDocument, WorkflowError, document_sha256, parse_workflow
+from scripts.workflow_engine.schema import (
+    WorkflowDocument, WorkflowError, document_sha256, normalize_workflow_document, parse_workflow,
+)
 from scripts.workflow_engine.store import WorkflowStore, _document_data
 
 
@@ -47,7 +49,11 @@ class WorkflowService:
         self.skill_roots = resolve_skill_roots(skill_roots, None, dict(os.environ))
 
     def _compile(self, document):
-        parsed = document if isinstance(document, WorkflowDocument) else parse_workflow(document)
+        parsed = (
+            normalize_workflow_document(document)
+            if isinstance(document, WorkflowDocument)
+            else parse_workflow(document)
+        )
         catalog = discover_skills(self.skill_roots, {})
         validators = load_validator_registry(REPOSITORY_ROOT / "references/workflows/validator-registry.v1.json", REPOSITORY_ROOT)
         projection = json.loads((REPOSITORY_ROOT / "references/workflows/official-v1.0-studio-projection.json").read_text())

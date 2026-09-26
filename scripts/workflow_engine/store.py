@@ -61,6 +61,7 @@ from .schema import (
     WorkflowError,
     _validator_config,
     behavior_payload,
+    document_data,
     document_sha256,
     parse_workflow,
 )
@@ -541,47 +542,7 @@ class StorePaths:
 
 
 def _document_data(document: WorkflowDocument) -> dict[str, object]:
-    return {
-        "schema_version": document.schema_version,
-        "workflow_id": document.workflow_id,
-        "document_revision": document.document_revision,
-        "semantic_revision": document.semantic_revision,
-        "derived_from": _json_value(document.derived_from),
-        "max_parallelism": document.max_parallelism,
-        "external_inputs": list(document.external_inputs),
-        "nodes": [
-            {
-                "id": node.id,
-                "type": node.type,
-                "display_name": node.display_name,
-                "entry": node.entry,
-                "enabled": node.enabled,
-                "skill_ref": node.skill_ref,
-                "validator_ref": node.validator_ref,
-                "validator_config": _json_value(node.validator_config),
-                "origin_projection_node_id": node.origin_projection_node_id,
-                "inputs": list(node.inputs),
-                "outputs": list(node.outputs),
-                "outcomes": [] if node.type in {"condition", "join"} else list(node.outcomes),
-                "write_scopes": list(node.write_scopes),
-                "failure_policy": node.failure_policy,
-                "condition_cases": _json_value(node.condition_cases),
-                "join_mode": node.join_mode,
-            }
-            for node in document.nodes
-        ],
-        "edges": [
-            {
-                "id": edge.id,
-                "source": edge.source,
-                "target": edge.target,
-                "trigger": edge.trigger,
-                "output_map": dict(edge.output_map),
-            }
-            for edge in document.edges
-        ],
-        "ui": _json_value(document.ui),
-    }
+    return document_data(document)
 
 
 def _skill_data(value: SkillIdentity | None) -> object:

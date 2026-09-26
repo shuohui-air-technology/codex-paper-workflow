@@ -3,13 +3,16 @@
 import copy
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import MappingProxyType
+from unittest import mock
 
 from scripts.workflow_engine.catalog import CatalogResult, load_validator_registry
 from scripts.workflow_engine.compiler import compile_workflow
 from scripts.workflow_engine.schema import WorkflowError, document_sha256, parse_workflow
-from scripts.workflow_engine.store import StoreError, _document_data, _plan_data, _plan_from_data
+from scripts.workflow_engine.store import StoreError, WorkflowStore, _document_data, _plan_data, _plan_from_data
 from scripts.workflow_manager import WorkflowService
 
 
@@ -182,6 +185,11 @@ class ValidatorFormTests(unittest.TestCase):
         self.assertEqual(document_sha256(parse_workflow(_document_data(document))), document_sha256(document))
         plan = self.compile(value).plan
         self.assertEqual(_plan_from_data(_plan_data(plan)), plan)
+        with TemporaryDirectory() as temporary:
+            with mock.patch("scripts.workflow_manager.discover_skills", return_value=self.catalog):
+                validation = WorkflowService(Path(temporary), skill_roots=(Path(temporary),)).validate_document(document)
+        self.assertEqual(validation["status"], "pass")
+        self.assertEqual(validation["semantic_sha256"], plan.semantic_sha256)
         old_document = copy.deepcopy(value)
         old_document["nodes"][0].pop("validator_config")
         self.assert_invalid(old_document, "schema.missing_field")
@@ -190,6 +198,105 @@ class ValidatorFormTests(unittest.TestCase):
         with self.assertRaises(StoreError) as caught:
             _plan_from_data(old_plan)
         self.assertEqual(caught.exception.code, "plan.invalid")
+
+    def test_forged_documents_cannot_bypass_parse_at_compiler_or_service(self):
+        base = document_for("experiment-contract", {"contract": "contract_file"}, {})
+        cases = (
+            ("extra_option", {"input_roles": {"contract": "contract_file"},
+                              "options": {"script": "evil.py"}}, "schema.validator_options_invalid"),
+            ("missing_role", {"input_roles": {}, "options": {}}, "schema.validator_roles_invalid"),
+            ("role_input_mismatch", {"input_roles": {"contract": "other_file"},
+                                     "options": {}}, "schema.validator_inputs_mismatch"),
+            ("extra_config_field", {"input_roles": {"contract": "contract_file"},
+                                    "options": {}, "command": "python evil.py"},
+             "schema.unknown_validator_config_field"),
+            ("missing_options_member", {"input_roles": {"contract": "contract_file"}},
+             "schema.missing_field"),
+        )
+        with TemporaryDirectory() as temporary:
+            service = WorkflowService(Path(temporary), skill_roots=(Path(temporary),))
+            for name, config, code in cases:
+                with self.subTest(name=name):
+                    raw = copy.deepcopy(base)
+                    raw["nodes"][0]["validator_config"] = config
+                    forged = replace(
+                        parse_workflow(base),
+                        nodes=(replace(parse_workflow(base).nodes[0],
+                                       validator_config=MappingProxyType(config)),),
+                    )
+                    with self.assertRaises(WorkflowError) as raw_error:
+                        parse_workflow(raw)
+                    self.assertEqual(raw_error.exception.code, code)
+                    result = compile_workflow(forged, self.catalog, self.validators, self.projection)
+                    self.assertIsNone(result.plan)
+                    self.assertEqual(result.errors[0].code, code)
+                    self.assertEqual(result.errors[0].node_id, "check")
+                    for candidate in (raw, forged):
+                        with self.assertRaises(WorkflowError) as service_error:
+                            service.validate_document(candidate)
+                        self.assertEqual(service_error.exception.code, code)
+
+            raw = copy.deepcopy(base)
+            raw["nodes"][0]["validator_ref"] = "humanizer-preflight"
+            raw["nodes"][0]["validator_config"] = None
+            forged = replace(parse_workflow(base), nodes=(replace(
+                parse_workflow(base).nodes[0], validator_ref="humanizer-preflight",
+                validator_config=None,
+            ),))
+            for candidate in (raw, forged):
+                with self.assertRaises(WorkflowError) as error:
+                    service.validate_document(candidate)
+                self.assertEqual(error.exception.code, "validator.humanizer_unavailable")
+            result = compile_workflow(forged, self.catalog, self.validators, self.projection)
+            self.assertIsNone(result.plan)
+            self.assertEqual(result.errors[0].code, "validator.humanizer_unavailable")
+            self.assertFalse(service.store.paths.workflow.exists())
+            self.assertFalse(service.store.paths.selection.exists())
+
+    def test_forged_paper_option_and_store_still_fail_closed(self):
+        raw = document_for("paper-section", {"file": "section"}, PAPER_OPTIONS)
+        parsed = parse_workflow(raw)
+        config = copy.deepcopy(raw["nodes"][0]["validator_config"])
+        del config["options"]["language"]
+        raw["nodes"][0]["validator_config"] = config
+        forged = replace(parsed, nodes=(replace(
+            parsed.nodes[0], validator_config=MappingProxyType(config),
+        ),))
+        with self.assertRaises(WorkflowError) as caught:
+            parse_workflow(raw)
+        self.assertEqual(caught.exception.code, "schema.validator_options_invalid")
+        result = compile_workflow(forged, self.catalog, self.validators, self.projection)
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.errors[0].code, "schema.validator_options_invalid")
+        with TemporaryDirectory() as temporary:
+            service = WorkflowService(Path(temporary), skill_roots=(Path(temporary),))
+            for candidate in (raw, forged):
+                with self.assertRaises(WorkflowError) as service_error:
+                    service.validate_document(candidate)
+                self.assertEqual(service_error.exception.code, "schema.validator_options_invalid")
+            store = WorkflowStore(Path(temporary))
+            with self.assertRaises(StoreError) as store_error:
+                store.save_draft(forged, expected_document_revision=0)
+            self.assertEqual(store_error.exception.code, "store.draft_invalid")
+            self.assertFalse(store.paths.workflow.exists())
+            self.assertFalse(store.paths.selection.exists())
+
+    def test_constructed_control_outcomes_are_not_silently_normalized(self):
+        value = json.loads((ROOT / "tests/fixtures/workflow_valid_branch_join.json").read_text())
+        parsed = parse_workflow(value)
+        nodes = tuple(replace(node, outcomes=("forged",)) if node.type == "condition" else node
+                      for node in parsed.nodes)
+        forged = replace(parsed, nodes=nodes)
+        result = compile_workflow(forged, self.catalog, self.validators, self.projection)
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.errors[0].code, "schema.document_noncanonical")
+
+    def test_constructed_document_with_invalid_collection_type_has_stable_error(self):
+        parsed = parse_workflow(document_for("experiment-contract", {"contract": "contract_file"}, {}))
+        forged = replace(parsed, nodes=None)
+        result = compile_workflow(forged, self.catalog, self.validators, self.projection)
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.errors[0].code, "schema.invalid_constructed_document")
 
 
 if __name__ == "__main__":
