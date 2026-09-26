@@ -198,6 +198,40 @@ python -B -m unittest \
 
 跨平台代码尤其要避免把当前系统的字符串形式当作唯一事实。例如 macOS 上 `/var` 可能解析到 `/private/var`，Windows 路径分隔符和保留文件名也与 POSIX 系统不同。测试安全规则时，应保留规则本身，只调整测试夹具以使用平台真实路径。
 
+## 自定义工作流引擎
+
+引擎为希望自行编排阶段的高级用户提供独立的 DAG（有向无环图）执行路径。Official v1.0 仍是默认流程；仅在明确启用自定义流程后，项目才使用 `.research/custom-workflow/` 中的自定义状态。自定义流程不会把节点状态写进 Official v1.0 的 `progress.md`。
+
+### 组件职责
+
+| 组件 | 职责 |
+|---|---|
+| `scripts/workflow_engine/schema.py` | 解析版本化工作流文件，检查字段与类型，并计算稳定的语义哈希。 |
+| `catalog.py` | 识别本机已安装的 Skill，并读取仓库内固定注册的验证器；不执行 Skill 文件内容。 |
+| `compiler.py` | 检查节点、连接、条件、产物映射和并行写入范围，生成可执行计划。 |
+| `scheduler.py` | 以纯状态转换方式推进任务、条件分支、并行节点和 join 汇合。 |
+| `store.py` | 保存选择状态、草稿、运行快照与追加式事件，并在重启后验证和恢复一致状态。 |
+| `receipts.py`、`validators.py` | 构造并核对节点调用/结果回执；只运行代码中注册且哈希固定的验证器适配器。 |
+| `scripts/workflow_manager.py` | 提供 JSON 命令行接口，连接校验、激活、调度、结果登记和状态查询。 |
+
+一项自定义任务由用户在 Studio 中绑定一个本机 Skill。管理器验证绑定并生成带有输入、输出和尝试标识的调用凭据；Skill 的执行由 Codex 完成，管理器负责核对其提交的结果和实际文件哈希。条件节点与 join 节点由调度器自动推进，不作为 Skill 任务运行。验证器节点走独立的固定适配器，不生成论文文件。
+
+### 官方与自定义状态
+
+模式查询是执行入口。没有选择记录或显式选择 Official v1.0 时，管理器返回官方模式且不读取或创建自定义运行目录。自定义模式使用自己的选择记录、激活计划、`state.json`、`events.jsonl` 和回执。摘要读取不会修复选择投影；不一致或无法验证的记录会阻止继续，而不是切换到另一套状态。显式读取已保存的自定义草稿与激活流程分离，读取本身不会让它成为执行依据。
+
+Skill 目录采用安全校验：候选 Skill 文件树中发现符号链接或重解析点时，目录发现会报告错误，工作流校验将保持 blocked。开发环境中的 Skill 根目录应是完整、可核验的安装树；不要为了让校验通过而绕过这项检查。
+
+### 本地检查
+
+下面的验证示例引用 `tests/fixtures/workflow_valid_linear.json` 中的 `clarify-research-idea` 和 `research-design-helper`。运行前需确保这两个 Skill 已安装且 Skill 根目录通过目录完整性检查。`summary` 查询当前项目模式；在新建项目中，结果应为 `official`，且不会创建自定义运行状态。
+
+```bash
+python3 scripts/workflow_manager.py validate --project . --workflow tests/fixtures/workflow_valid_linear.json
+python3 scripts/workflow_manager.py summary --project .
+python3 -B -m unittest tests.test_custom_workflow_end_to_end -v
+```
+
 ## 7. 常见修改场景
 
 ### 7.1 增加一条验证规则
