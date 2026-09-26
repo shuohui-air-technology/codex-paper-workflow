@@ -1216,7 +1216,7 @@ def validate_node_evidence_delta(
             expected = validator_retry_transition(plan, before, node_id)
         except WorkflowError as exc:
             raise StoreError("events.invalid_retry", str(exc)) from exc
-        if _state_data(expected) != _state_data(after):
+        if expected == before or _state_data(expected) != _state_data(after):
             raise StoreError("events.invalid_retry", "validator retry differs from scheduler transition")
         return
     if event_type == "recovery_running_blocked":

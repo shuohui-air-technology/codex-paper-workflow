@@ -741,11 +741,10 @@ def validator_result_transition(
     else:
         if result["outcome"] != "" or type(result["outcome"]) is not str:
             _fail("runtime.invalid_failure", "execution failure has no domain outcome")
+        nodes[node_id] = replace(runtime, status=NodeStatus.FAILED, outcome="")
         if node.failure_policy == "skip_branch":
-            nodes[node_id] = replace(runtime, status=NodeStatus.SKIPPED, outcome="")
             _set_outgoing_status(plan, edges, node_id, EdgeStatus.INACTIVE)
         else:
-            nodes[node_id] = replace(runtime, status=NodeStatus.FAILED, outcome="")
             _set_outgoing_status(plan, edges, node_id, EdgeStatus.FAILED)
     _record_late_join_outputs(plan, nodes, edges)
     return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges))
@@ -797,7 +796,8 @@ def validator_retry_transition(plan: CompiledPlan, state: RunState, node_id: str
     if plan.nodes[node_id].type != "validator":
         _fail("runtime.node_type", "only validator nodes may be retried", node_id=node_id)
     runtime = state.nodes[node_id]
-    if runtime.status not in {NodeStatus.FAILED, NodeStatus.BLOCKED}:
+    if (runtime.status not in {NodeStatus.FAILED, NodeStatus.BLOCKED}
+            or runtime.attempt < 1 or not runtime.claim_token_hash):
         _fail("runtime.invalid_retry", "only failed or interrupted validators may be retried", node_id=node_id)
     nodes = dict(state.nodes)
     edges = dict(state.edges)
@@ -812,12 +812,15 @@ def validator_retry_transition(plan: CompiledPlan, state: RunState, node_id: str
             if target not in descendants:
                 descendants.add(target)
                 pending.append(target)
+    revived = {node_id}
     for current in descendants:
-        if nodes[current].status is NodeStatus.BLOCKED:
+        if (nodes[current].attempt == 0
+                and nodes[current].status in {NodeStatus.BLOCKED, NodeStatus.SKIPPED}):
             nodes[current] = replace(nodes[current], status=NodeStatus.PENDING)
-    for current in {node_id, *descendants}:
+            revived.add(current)
+    for current in revived:
         for edge_id in plan.outgoing[current]:
-            if edges[edge_id].status is EdgeStatus.FAILED:
+            if edges[edge_id].status in {EdgeStatus.FAILED, EdgeStatus.INACTIVE}:
                 edges[edge_id] = EdgeRuntime(EdgeStatus.WAITING)
     return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges))
 

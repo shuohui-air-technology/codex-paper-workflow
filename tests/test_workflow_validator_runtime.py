@@ -15,6 +15,7 @@ from scripts.workflow_engine.scheduler import (
     claim_transition, result_transition, validator_claim_transition, validator_result_transition,
     validator_retry_transition,
 )
+from scripts.workflow_engine.schema import WorkflowError
 from scripts.workflow_engine.store import StoreError, WorkflowEvent, WorkflowStore
 from tests import test_workflow_scheduler as scheduler_fixtures
 from tests import test_workflow_store as store_fixtures
@@ -198,6 +199,12 @@ class ValidatorRuntimeAuthorityTests(unittest.TestCase):
         recovered = WorkflowStore(self.root).recover()
         self.assertEqual((recovered.status, recovered.code), ("blocked", "recovery.running_work_uncertain"))
         self.assertEqual(recovered.state.nodes["check"].status, NodeStatus.BLOCKED)
+        with self.store.locked_run() as transaction:
+            _, interrupted = transaction.load_active_run()
+            retry = validator_retry_transition(self.plan, interrupted, "check")
+            transaction.commit_transition("validator_retried", retry, {"node_id": "check"})
+        running, _, _ = self.claim(token="after-interruption")
+        self.assertEqual(running.nodes["check"].attempt, 2)
 
     def test_validator_retry_has_dedicated_event_authority(self):
         self.register(); self.claim(); failed, _, _ = self.complete(status="failed")
@@ -407,6 +414,108 @@ class ValidatorRuntimeAuthorityTests(unittest.TestCase):
                 "path": "source.md", "sha256": hashlib.sha256(b"verified section").hexdigest()}])
             transaction.commit_transition("validator_claimed", validator_running, {"claim_evidence": claim})
         self.assertEqual(WorkflowStore(root).recover().code, "recovery.running_work_uncertain")
+
+    def test_skip_branch_execution_failure_receipt_can_be_retried_and_replayed(self):
+        check = scheduler_fixtures.validator("check", entry=True)
+        check["failure_policy"] = "skip_branch"
+        self.plan = scheduler_fixtures.WorkflowSchedulerTests().compile(
+            [check, scheduler_fixtures.task("accepted")],
+            [scheduler_fixtures.edge("gate", "check", "accepted", trigger="pass")],
+            external_inputs=("section",),
+        )
+        project = self.root / "skip-case"
+        project.mkdir()
+        self.root = project
+        self.store = WorkflowStore(project)
+        project.joinpath("section.md").write_text("verified section")
+        self.store.start_run(self.plan, "run-validator-skip")
+        self.register(); self.claim()
+        failed, receipt, _ = self.complete(status="failed")
+        self.assertEqual((failed.nodes["check"].status, receipt["status"], receipt["outcome"]),
+                         (NodeStatus.FAILED, "failed", ""))
+        self.assertEqual(failed.edges["gate"].status, EdgeStatus.INACTIVE)
+        self.assertEqual(failed.nodes["accepted"].status, NodeStatus.SKIPPED)
+        with self.store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+            retried = validator_retry_transition(self.plan, state, "check")
+            transaction.commit_transition("validator_retried", retried, {"node_id": "check"})
+        self.assertEqual(retried.edges["gate"].status, EdgeStatus.WAITING)
+        self.assertEqual(retried.nodes["accepted"].status, NodeStatus.PENDING)
+        retry_snapshot = self.store.paths.state.read_bytes()
+        running, _, _ = self.claim(token="second-token")
+        self.assertEqual(running.nodes["check"].attempt, 2)
+        passed, receipt2, _ = self.complete()
+        self.assertEqual(passed.nodes["accepted"].status, NodeStatus.READY)
+        self.assertEqual(receipt2["status"], "succeeded")
+        self.assertEqual(WorkflowStore(self.root).recover().status, "clean")
+        self.store.paths.state.write_bytes(retry_snapshot)
+        recovered = WorkflowStore(self.store.project_root).recover()
+        self.assertEqual((recovered.status, recovered.state.nodes["accepted"].status),
+                         ("recovered", NodeStatus.READY))
+
+    def test_unclaimed_dependency_blocked_validator_retry_has_zero_writes(self):
+        self.plan = scheduler_fixtures.WorkflowSchedulerTests().compile(
+            [scheduler_fixtures.task("source", entry=True), scheduler_fixtures.validator("check")],
+            [scheduler_fixtures.edge("source-check", "source", "check")],
+            external_inputs=("section",),
+        )
+        project = self.root / "unclaimed-case"
+        project.mkdir()
+        self.root = project
+        self.store = WorkflowStore(project)
+        project.joinpath("section.md").write_text("verified section")
+        self.store.start_run(self.plan, "run-unclaimed")
+        self.register()
+        with self.store.locked_run() as transaction:
+            _, ready = transaction.load_active_run()
+            running = claim_transition(self.plan, ready, "source", "source-token")
+            store_fixtures.commit_claim(transaction, running)
+            failed = result_transition(self.plan, running, {"node_id": "source", "attempt": 1,
+                "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+            store_fixtures.commit_result(transaction, failed)
+        self.assertEqual((failed.nodes["check"].status, failed.nodes["check"].attempt),
+                         (NodeStatus.BLOCKED, 0))
+        baseline = (self.store.paths.events.read_bytes(), self.store.paths.state.read_bytes())
+        with self.store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+            with self.assertRaises(WorkflowError):
+                candidate = validator_retry_transition(self.plan, state, "check")
+                transaction.commit_transition("validator_retried", candidate, {"node_id": "check"})
+            with self.assertRaises(StoreError):
+                transaction.commit_transition("validator_retried", state, {"node_id": "check"})
+        self.assertEqual((self.store.paths.events.read_bytes(), self.store.paths.state.read_bytes()), baseline)
+
+    def test_rehashed_unclaimed_validator_retry_blocks_full_chain_and_suffix(self):
+        for boundary in ("suffix", "full"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                self.root = Path(temporary)
+                self.root.joinpath("section.md").write_text("verified section")
+                self.plan = scheduler_fixtures.WorkflowSchedulerTests().compile(
+                    [scheduler_fixtures.task("source", entry=True), scheduler_fixtures.validator("check")],
+                    [scheduler_fixtures.edge("source-check", "source", "check")],
+                    external_inputs=("section",),
+                )
+                self.store = WorkflowStore(self.root)
+                self.store.start_run(self.plan, "run-unclaimed")
+                self.register()
+                with self.store.locked_run() as transaction:
+                    _, ready = transaction.load_active_run()
+                    running = claim_transition(self.plan, ready, "source", "source-token")
+                    store_fixtures.commit_claim(transaction, running)
+                    failed = result_transition(self.plan, running, {"node_id": "source", "attempt": 1,
+                        "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+                    store_fixtures.commit_result(transaction, failed)
+                self.assertEqual(failed.nodes["check"].status, NodeStatus.BLOCKED)
+                event = append_rehashed(self.store, failed, "validator_retried", {"node_id": "check"})
+                if boundary == "full":
+                    snapshot = json.loads(self.store.paths.state.read_text())
+                    snapshot["last_applied_event_seq"] = event.event_seq
+                    snapshot["last_applied_event_hash"] = event.event_hash
+                    self.store.paths.state.write_text(json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n")
+                evidence = (self.store.paths.events.read_bytes(), self.store.paths.state.read_bytes())
+                result = WorkflowStore(self.root).recover()
+                self.assertEqual(result.status, "blocked")
+                self.assertEqual((self.store.paths.events.read_bytes(), self.store.paths.state.read_bytes()), evidence)
 
 
 if __name__ == "__main__":

@@ -695,6 +695,11 @@ class WorkflowSchedulerTests(unittest.TestCase):
         resumed = validator_retry_transition(plan, interrupted, "check")
         self.assertEqual((resumed.nodes["check"].status, resumed.nodes["check"].attempt,
                           resumed.nodes["check"].claim_token_hash), (NodeStatus.READY, 1, ""))
+        tokenless_blocked = replace(interrupted, nodes={
+            **interrupted.nodes, "check": replace(interrupted.nodes["check"], claim_token_hash=""),
+        })
+        with self.assertRaises(WorkflowError):
+            validator_retry_transition(plan, tokenless_blocked, "check")
         for invalid in ({"node_id": "check", "attempt": 1, "status": "succeeded", "outcome": "pass",
                          "outputs": {"invented": "file"}, "artifacts": ()},
                         {"node_id": "check", "attempt": 1, "status": "failed", "outcome": "fail",
@@ -731,11 +736,36 @@ class WorkflowSchedulerTests(unittest.TestCase):
                             external_inputs=("section",))
         ready = refresh_ready(plan, self.register(initial_run(plan, "run-validator-skip"), self.artifact("section")))
         running = validator_claim_transition(plan, ready, "check", "token")
-        skipped = validator_result_transition(plan, running, {"node_id": "check", "attempt": 1,
+        failed = validator_result_transition(plan, running, {"node_id": "check", "attempt": 1,
             "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
-        self.assertEqual(skipped.nodes["check"].status, NodeStatus.SKIPPED)
-        self.assertEqual(skipped.edges["gate"].status, EdgeStatus.INACTIVE)
-        self.assertEqual(skipped.nodes["sink"].status, NodeStatus.SKIPPED)
+        self.assertEqual(failed.nodes["check"].status, NodeStatus.FAILED)
+        self.assertEqual(failed.nodes["check"].outcome, "")
+        self.assertEqual(failed.edges["gate"].status, EdgeStatus.INACTIVE)
+        self.assertEqual(failed.nodes["sink"].status, NodeStatus.SKIPPED)
+        retried = validator_retry_transition(plan, failed, "check")
+        self.assertEqual(retried.nodes["check"].status, NodeStatus.READY)
+        self.assertEqual(retried.edges["gate"].status, EdgeStatus.WAITING)
+        self.assertEqual(retried.nodes["sink"].status, NodeStatus.PENDING)
+        running_again = validator_claim_transition(plan, retried, "check", "second-token")
+        passed = validator_result_transition(plan, running_again, {"node_id": "check", "attempt": 2,
+            "status": "succeeded", "outcome": "pass", "outputs": {}, "artifacts": ()})
+        self.assertEqual(passed.edges["gate"].status, EdgeStatus.SATISFIED)
+        self.assertEqual(passed.nodes["sink"].status, NodeStatus.READY)
+
+    def test_unclaimed_dependency_blocked_validator_cannot_retry(self):
+        plan = self.compile([task("source", entry=True), validator("check")],
+                            [edge("source-check", "source", "check")],
+                            external_inputs=("section",))
+        ready = refresh_ready(plan, self.register(initial_run(plan, "run-never-claimed"),
+                                                  self.artifact("section")))
+        running = claim_transition(plan, ready, "source", "source-token")
+        failed = result_transition(plan, running, {"node_id": "source", "attempt": 1,
+            "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+        self.assertEqual((failed.nodes["check"].status, failed.nodes["check"].attempt),
+                         (NodeStatus.BLOCKED, 0))
+        with self.assertRaises(WorkflowError) as rejected:
+            validator_retry_transition(plan, failed, "check")
+        self.assertEqual(rejected.exception.code, "runtime.invalid_retry")
 
 
 if __name__ == "__main__":
