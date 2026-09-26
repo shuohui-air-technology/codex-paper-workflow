@@ -8,17 +8,20 @@ Paper Workflow Orchestrator 是一套面向 Codex 的研究到论文工作流。
 
 | 项目属性 | 当前值 |
 |---|---|
-| 发布版本 | `1.0.0` |
+| 发布版本 | `1.1.0` |
 | 工作流 schema | `paper-workflow-orchestrator-v1.0` |
 | Python | 3.10+ |
 | Python 运行时依赖 | 仅标准库 |
+| Studio 开发环境 | Node.js 22.12.0+、npm |
+| Studio 使用环境 | 无需 Node.js；安装包内含预构建界面 |
 | 支持平台 | macOS、Linux、Windows |
 | 仓库 | `https://github.com/shuohui-air-technology/codex-paper-workflow` |
 
-项目由两类内容组成：
+项目由三类内容组成：
 
 1. **声明式工作流**：Markdown 和 YAML 文件定义阶段、路由、输入输出合同与 Codex 接口。
 2. **可执行保障层**：Python 脚本验证合同、管理进度、检查回执，并以可回滚方式安装 Skills。
+3. **可视化编排器**：`studio/` 保存 Workflow Studio 前端源码；`assets/workflow-studio/` 是用户安装后直接运行的离线界面文件。
 
 理解这种分工很重要。修改文案不一定改变程序行为，修改 Python 校验器也不一定改变工作流语义；涉及同一能力时，两侧通常需要同步更新。
 
@@ -32,6 +35,8 @@ codex-paper-workflow/
 ├── references/                      # 阶段、章节、进度及集成合同
 ├── scripts/                         # 验证器、状态管理器和安装器
 ├── tests/                           # unittest 测试与历史版本夹具
+├── studio/                          # React 前端、单元测试和浏览器测试
+├── assets/workflow-studio/           # 预构建、可离线运行的界面文件
 ├── dependencies.lock.json           # 安装 profile、固定依赖版本和许可证信息
 ├── README.md                        # 英文用户文档
 ├── README.zh-CN.md                  # 中文用户文档
@@ -83,7 +88,33 @@ py -3.10 -m venv .venv
 python -B -m unittest discover -s tests -v
 ```
 
-`-B` 禁止生成 `__pycache__` 和 `.pyc`，可以让测试后的工作树保持整洁。当前基线是 49 项测试；GitHub Actions 还会在 macOS、Ubuntu 和 Windows 上分别使用 Python 3.10 与 3.13 执行同一测试命令。
+`-B` 禁止生成 `__pycache__` 和 `.pyc`，可以让测试后的工作树保持整洁。GitHub Actions 还会在 macOS、Ubuntu 和 Windows 上分别使用 Python 3.10 与 3.13 执行同一测试命令。
+
+### Workflow Studio 前端与浏览器测试
+
+Python 管理器可以独立运行；只有修改 Studio 界面或重建离线界面包时，才需要 Node.js。前端依赖固定在 lockfile 中，建议使用 Node.js 22.12.0 或更高版本：
+
+```bash
+cd studio
+npm ci --ignore-scripts
+npm run typecheck
+npm test -- --run
+npm run build
+cd ..
+python3 scripts/verify_workflow_studio_bundle.py assets/workflow-studio
+```
+
+浏览器测试使用 Playwright，第一次运行前需安装对应浏览器：
+
+```bash
+cd studio
+npx playwright install chromium
+npm run e2e -- --project=chromium
+```
+
+更新 README 截图时，在 `studio/` 目录运行 `npm run capture:screenshot`。它通过真实的本地 Python 服务打开 Studio，在 1440×900 Chromium 视口中保存 `assets/workflow-studio.png`。保存前请检查截图没有临时路径、令牌、个人资料或调试界面。
+
+Workflow Studio 用户使用的是仓库随附的 `assets/workflow-studio/` 预构建文件，不需要 Node.js 或 npm。安装器只复制用户运行所需的文件，不会把 React 源码、开发依赖或浏览器测试工具放进 Skill 安装目录。
 
 开始修改前建议记录当前状态：
 
@@ -109,6 +140,7 @@ python -B -m unittest discover -s tests -v
 | 修改终稿回执 | Final Editor Skill 与回执验证器 | final-editor integration、完整性测试 |
 | 修改实验合同 | `scripts/experiment_contract_validator.py` | 实验字段、授权与失败分支测试 |
 | 修改安装行为 | `scripts/install_workflow.py` | `dependencies.lock.json`、installer tests |
+| 修改可视化工作流编辑器 | `studio/src/` | `studio/src/**/*.test.tsx`、`studio/e2e/`、离线构建验证 |
 | 修改公开说明 | `README.md`、`README.zh-CN.md` | 链接、命令、版本一致性测试 |
 
 阅读一个 Python 模块时，可以按以下顺序进行：
@@ -164,7 +196,7 @@ JSON、Markdown、ZIP、DOCX 和 progress 文件都可能来自外部。解析�
 
 ## 6. 测试结构与运行方法
 
-本项目使用标准库 `unittest`。
+Python 测试使用标准库 `unittest`；Studio 前端使用 Vitest 和 React Testing Library，浏览器端到端测试使用 Playwright。
 
 ```bash
 # 全量测试
@@ -176,6 +208,15 @@ python -B -m unittest tests.test_install_workflow -v
 # 单个测试类或方法
 python -B -m unittest \
   tests.test_install_workflow.InstallerContractTests.test_install_rejects_user_controlled_symlink_parent -v
+
+# Studio 前端测试与构建（需先在 studio/ 执行 npm ci）
+cd studio
+npm run typecheck
+npm test -- --run
+npm run build
+npm run e2e -- --project=chromium
+cd ..
+python3 scripts/verify_workflow_studio_bundle.py assets/workflow-studio
 ```
 
 主要测试文件：
@@ -183,6 +224,9 @@ python -B -m unittest \
 - `tests/test_figure_workflow.py`：图件合同、哈希、来源、预览和视觉审查回执。
 - `tests/test_install_workflow.py`：安装 profile、路径安全、备份、回滚、许可证和幂等更新。
 - `tests/test_progress_version.py`：v1.0 元数据、旧 progress 迁移、README 约束和安装回执。
+- `studio/src/**/*.test.tsx`：表单、图形界面和编辑交互。
+- `studio/e2e/`：启动真实本地 Python 服务后的浏览器流程、修订冲突与只读界面检查。
+- `tests/test_workflow_studio_bundle.py`：离线包哈希、资源引用和安装包内容检查。
 
 历史 progress fixtures 是兼容性样本，不应随当前格式一起改写。需要支持新的旧版本时，应增加一份独立 fixture，并明确测试迁移前输入和迁移后输出。
 
@@ -201,6 +245,8 @@ python -B -m unittest \
 ## 自定义工作流引擎
 
 引擎为希望自行编排阶段的高级用户提供独立的 DAG（有向无环图）执行路径。Official v1.0 仍是默认流程；仅在明确启用自定义流程后，项目才使用 `.research/custom-workflow/` 中的自定义状态。自定义流程不会把节点状态写进 Official v1.0 的 `progress.md`。
+
+Studio 的前端通过随安装包提供的静态资源运行。Python 启动器只监听本机回环地址，为当前编辑会话生成随机访问凭据；状态变更还需通过来源和 CSRF 校验。前端不需要外部字体、脚本或 API；`scripts/verify_workflow_studio_bundle.py` 会检查清单哈希、文件完整性以及运行资源是否留在包内。这些限制使编辑器可以离线使用，并缩小本机服务的访问范围。
 
 ### 组件职责
 
@@ -334,10 +380,10 @@ Windows 开发者可以用 `$env:TEMP` 下的新目录替代 `mktemp`。不要�
 
 项目同时维护两个版本概念：
 
-- `release_version` 使用三段式版本，例如 `1.0.0`；
+- `release_version` 标记功能发布，使用三段式版本；当前版本为 `1.1.0`；
 - `workflow_version` 标识 progress 与工作流合同，例如 `paper-workflow-orchestrator-v1.0`。
 
-发布版本变化不一定要求 schema 变化；只有 progress 结构或阶段合同发生不兼容变化时，才需要提升 workflow version。
+这两个版本各自独立。v1.1.0 增加了可视化自定义工作流编辑器，但保留 `paper-workflow-orchestrator-v1.0` 作为官方流程标识，因此安装清单和回执会同时记录 `release_version: 1.1.0` 与 `workflow_version: paper-workflow-orchestrator-v1.0`。只有 progress 结构或官方工作流合同发生不兼容变化时，才需要提升 workflow version。
 
 版本升级时检查：
 

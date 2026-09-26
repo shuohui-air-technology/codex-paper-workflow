@@ -19,5 +19,5 @@
     "noImplicitOverride": true,
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "playwright.config.ts", "e2e/**/*.ts"]
+  "include": ["vite.config.ts", "playwright.config.ts", "playwright.screenshot.config.ts", "e2e/**/*.ts"]
 }

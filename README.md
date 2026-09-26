@@ -6,7 +6,8 @@
 
 [简体中文](README.zh-CN.md) | **English**
 
-![Release: v1.0 Stable](https://img.shields.io/badge/release-v1.0%20stable-2EA44F.svg)
+![Release: v1.1.0](https://img.shields.io/badge/release-v1.1.0-2EA44F.svg)
+![Default workflow: v1.0](https://img.shields.io/badge/default%20workflow-v1.0-5271C4.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
 ![Codex Skill](https://img.shields.io/badge/Codex-Skill-8A2BE2.svg)
@@ -176,6 +177,25 @@ The `core` profile supports offline installation. The `standard` and `full` prof
 
 The scientific-figure workflow uses Python 3.11+, `uv`, and the plotting libraries selected for the task. Configure that Python runtime after installing the skills.
 
+## Custom workflow editor
+
+The official v1.0 workflow remains the default and is ready to use after installation. Advanced users who want to arrange their own stages can open the visual editor from a paper-project directory. On macOS and Linux, run:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
+```
+
+If `CODEX_HOME` was set during installation, the command uses that location. On Windows PowerShell, run:
+
+```powershell
+$skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $HOME '.codex\skills' }
+py -3 (Join-Path $skillsHome 'paper-workflow-orchestrator\scripts\workflow_studio.py') --project .
+```
+
+Start from a copy of the official workflow or create a blank one. Arrange stages on the canvas, choose Skills that are already installed, connect steps, and add conditions, parallel branches, or joins. Review validation results and any risk notices before activating the custom workflow. The editor works without editing JSON. It does not install Skills, and its runtime needs Python but no Node.js.
+
+![Workflow Studio visual workflow editor](assets/workflow-studio.png)
+
 <details>
 <summary>Manual installation of bundled skills</summary>
 
@@ -249,7 +269,9 @@ paper-workflow-orchestrator/
 ├── SKILL.md                              # Orchestrator definition and stage routing
 ├── agents/
 │   └── openai.yaml                       # Agent interface declaration
-├── assets/                               # Logo and README banner
+├── assets/                               # Logo, README banner, screenshot, and offline Studio bundle
+│   ├── workflow-studio.png               # Workflow Studio screenshot
+│   └── workflow-studio/                  # Prebuilt runtime; no Node.js required by users
 ├── references/
 │   ├── paper-section-contract.md         # Paper-section contract
 │   ├── progress-schema.md                # Project progress and evidence format
@@ -266,6 +288,7 @@ paper-workflow-orchestrator/
 │   ├── final_edit_receipt_validator.py   # Final-edit result validation
 │   └── humanizer_preflight.py            # Prose-naturalization preflight
 ├── dependencies.lock.json                # External skill sources and version manifest
+├── studio/                               # Workflow Studio frontend source
 ├── tests/                                 # Workflow and installer tests
 └── companion-skills/
     ├── research-skill-router/             # Research-task routing entry point
@@ -289,6 +312,8 @@ Each upstream project's original license continues to apply after skill installa
 ## Contributing
 
 Issues and improvements are welcome. Code contributions should keep the orchestrator's core scripts within the Python standard library and describe the verification performed in the pull request.
+
+Contributors can start with the [Developer Guide](DEVELOPMENT_GUIDE.md), which explains the repository layout, local test commands, and how the Python runtime and Workflow Studio fit together.
 
 Keep personal papers, `.research/`, `.paper/`, experimental data, credentials, and machine-generated caches local and managed through `.gitignore`.
 

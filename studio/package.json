@@ -11,7 +11,8 @@
     "typecheck": "tsc -b --pretty false",
     "test": "vitest",
     "build": "vite build && node scripts/write-license-inventory.mjs && node scripts/write-bundle-manifest.mjs",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "capture:screenshot": "playwright test --config=playwright.screenshot.config.ts"
   },
   "dependencies": {
     "@xyflow/react": "12.11.5",

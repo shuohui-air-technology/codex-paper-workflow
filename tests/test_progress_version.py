@@ -20,7 +20,7 @@ class ProgressVersionTests(unittest.TestCase):
         self.assertTrue(progress.validate_text(document)["valid"])
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(
-            'metadata:\n  version: "1.0.0"\n  workflow_version: "paper-workflow-orchestrator-v1.0"',
+            'metadata:\n  version: "1.1.0"\n  workflow_version: "paper-workflow-orchestrator-v1.0"',
             skill,
         )
 
@@ -56,9 +56,10 @@ class ProgressVersionTests(unittest.TestCase):
                     projection["official_contract_sections"][projection_key],
                 )
 
-    def test_release_metadata_remains_v100_and_progress_schema_is_official_only(self):
+    def test_release_metadata_is_v110_and_progress_schema_remains_official_v10(self):
         manifest = json.loads((ROOT / "dependencies.lock.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["release_version"], "1.0.0")
+        self.assertEqual(manifest["release_version"], "1.1.0")
+        self.assertEqual(manifest["workflow_version"], "paper-workflow-orchestrator-v1.0")
         progress_schema = (ROOT / "references" / "progress-schema.md").read_text(
             encoding="utf-8"
         )
@@ -112,7 +113,7 @@ class ProgressVersionTests(unittest.TestCase):
         self.assertIn("v1.0.0", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
         self.assertIn("v1.0", (ROOT / "companion-skills" / "academic-manuscript-final-editor" / "README.md").read_text(encoding="utf-8"))
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn('version: "1.0.0"', skill)
+        self.assertIn('version: "1.1.0"', skill)
         self.assertIn('workflow_version: "paper-workflow-orchestrator-v1.0"', skill)
 
     def test_public_readmes_do_not_advertise_ai_handoff(self):
@@ -144,15 +145,48 @@ class ProgressVersionTests(unittest.TestCase):
                 self.assertIsNone(re.search(r"\bauthors?\b", text, re.IGNORECASE))
         self.assertFalse((skill_root / "references" / "author-style-rules.md").exists())
 
-    def test_public_readmes_use_v10_release_subtitles(self):
+    def test_public_readmes_distinguish_release_from_default_workflow(self):
+        english = (ROOT / "README.md").read_text(encoding="utf-8")
+        chinese = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
         self.assertIn(
             "**Helping you turn any vague idea into a paper built to top-journal standards.**",
-            (ROOT / "README.md").read_text(encoding="utf-8"),
+            english,
         )
         self.assertIn(
             "**帮助您将任何一个模糊的想法落地为顶刊级别的论文。**",
-            (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
+            chinese,
         )
+        for text in (english, chinese):
+            self.assertIn("Release: v1.1.0", text)
+            self.assertIn("Default workflow: v1.0", text)
+
+    def test_readmes_explain_one_advanced_workflow_studio_entry(self):
+        requirements = {
+            "README.md": (
+                "## Custom workflow editor",
+                "The official v1.0 workflow remains the default",
+                "paper-workflow-orchestrator/scripts/workflow_studio.py",
+                "--project .",
+                "without editing JSON",
+                "assets/workflow-studio.png",
+            ),
+            "README.zh-CN.md": (
+                "## 自定义工作流编排",
+                "官方 v1.0 流程仍是默认流程",
+                "paper-workflow-orchestrator/scripts/workflow_studio.py",
+                "--project .",
+                "无需编辑 JSON",
+                "assets/workflow-studio.png",
+            ),
+        }
+        for relative, required in requirements.items():
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            with self.subTest(relative=relative):
+                heading = required[0]
+                self.assertEqual(text.count(heading), 1)
+                for phrase in required[1:]:
+                    self.assertIn(phrase, text)
+        self.assertTrue((ROOT / "assets" / "workflow-studio.png").is_file())
 
     def test_development_guide_is_developer_focused_and_complete(self):
         guide = (ROOT / "DEVELOPMENT_GUIDE.md").read_text(encoding="utf-8")
@@ -177,6 +211,9 @@ class ProgressVersionTests(unittest.TestCase):
         self.assertNotIn("repository_read:", guide)
         self.assertNotIn("TBD", guide)
         self.assertNotIn("TODO", guide)
+        self.assertIn("Node.js 22.12.0", guide)
+        self.assertIn("npm ci --ignore-scripts", guide)
+        self.assertIn("python3 scripts/verify_workflow_studio_bundle.py", guide)
 
     def test_release_metadata_is_bound_to_the_installer_receipt(self):
         import json
@@ -184,13 +221,13 @@ class ProgressVersionTests(unittest.TestCase):
         from scripts.install_workflow import install, load_manifest, verify
 
         manifest = load_manifest(ROOT / "dependencies.lock.json")
-        self.assertEqual(manifest.get("release_version"), "1.0.0")
+        self.assertEqual(manifest.get("release_version"), "1.1.0")
         self.assertEqual(manifest.get("workflow_version"), "paper-workflow-orchestrator-v1.0")
         with TemporaryDirectory() as tmp:
             target = Path(tmp).resolve() / "skills"
             install(manifest, "core", target, ROOT)
             receipt = json.loads((target / ".paper-workflow-install.json").read_text(encoding="utf-8"))
-            self.assertEqual(receipt.get("release_version"), "1.0.0")
+            self.assertEqual(receipt.get("release_version"), "1.1.0")
             self.assertEqual(receipt.get("workflow_version"), "paper-workflow-orchestrator-v1.0")
             self.assertEqual(verify(target, "core", manifest)["status"], "pass")
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.1.0
+
+This release adds an optional visual editor for advanced users while retaining
+the official v1.0 workflow as the default.
+
+- Adds the local Workflow Studio for arranging task, condition, parallel, join,
+  and validator stages through a graphical interface.
+- Adds a durable custom DAG runtime with explicit validation, risk review,
+  activation, and state separate from the official progress workflow.
+- Packages the Studio as a deterministic offline bundle with a generated
+  third-party license inventory, file hashes, and an offline-resource verifier.
+- Keeps the normal Skill runtime on Python's standard library; Node.js is only
+  required when developing or rebuilding the Studio frontend.
+- Adds frontend unit tests, browser end-to-end coverage, and CI checks for the
+  reproducible runtime bundle.
+
 ## v1.0.0
 
 This is the first stable release of Paper Workflow Orchestrator.

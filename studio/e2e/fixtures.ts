@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -95,18 +95,14 @@ export const test = base.extend<{ studio: StudioSession }>({
     const projectRoot = join(tempRoot, 'paper-project');
     const skillsRoot = join(tempRoot, 'installed-skills');
     const codexHome = join(tempRoot, 'isolated-codex-home');
-    const testSkillId = 'paper-test-skill';
+    const testSkillId = 'research-skill-router';
     mkdirSync(projectRoot);
     mkdirSync(codexHome);
-    mkdirSync(join(skillsRoot, testSkillId), { recursive: true });
-    writeFileSync(join(skillsRoot, testSkillId, 'SKILL.md'), [
-      '---',
-      `name: ${testSkillId}`,
-      'description: A harmless test-only workflow task.',
-      '---',
-      'This fixture is used only for browser tests.',
-      '',
-    ].join('\n'), 'utf8');
+    cpSync(
+      join(REPOSITORY_ROOT, 'companion-skills', testSkillId),
+      join(skillsRoot, testSkillId),
+      { recursive: true },
+    );
 
     const launcher = join(REPOSITORY_ROOT, 'scripts', 'workflow_studio.py');
     const child = spawn(process.env.PYTHON ?? 'python3', [

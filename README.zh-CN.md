@@ -6,7 +6,8 @@
 
 **简体中文** | [English](README.md)
 
-![Release: v1.0 Stable](https://img.shields.io/badge/release-v1.0%20stable-2EA44F.svg)
+![Release: v1.1.0](https://img.shields.io/badge/release-v1.1.0-2EA44F.svg)
+![Default workflow: v1.0](https://img.shields.io/badge/default%20workflow-v1.0-5271C4.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
 ![Codex Skill](https://img.shields.io/badge/Codex-Skill-8A2BE2.svg)
@@ -176,6 +177,25 @@ python3 scripts/install_workflow.py --profile core --update --prune
 
 科研图件功能使用 Python 3.11+、`uv` 和所选绘图库。完成 skill 安装后，请根据绘图任务配置相应的 Python 运行环境。
 
+## 自定义工作流编排
+
+官方 v1.0 流程仍是默认流程，安装后即可直接使用。希望自行安排阶段的进阶用户，可以在论文项目目录中启动图形界面。macOS 和 Linux 使用以下命令；如果安装时设置了 `CODEX_HOME`，命令会使用该位置：
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
+```
+
+Windows PowerShell 用户可运行：
+
+```powershell
+$skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $HOME '.codex\skills' }
+py -3 (Join-Path $skillsHome 'paper-workflow-orchestrator\scripts\workflow_studio.py') --project .
+```
+
+你可以从官方流程创建副本，也可以新建空白流程；随后在画布上排列阶段、选择已安装的 Skill、连接阶段，并加入条件、并行和汇合步骤。检查流程并查看风险提示后，才可以启用自定义版本。整个过程无需编辑 JSON 文件。Studio 只读取本机已安装的 Skill，不负责安装 Skill；运行界面只需要 Python，不需要 Node.js。
+
+![Workflow Studio 图形化工作流编排界面](assets/workflow-studio.png)
+
 <details>
 <summary>手动安装仓库内置 skills</summary>
 
@@ -249,7 +269,9 @@ paper-workflow-orchestrator/
 ├── SKILL.md                              # Orchestrator 定义与阶段路由
 ├── agents/
 │   └── openai.yaml                       # Agent 接口声明
-├── assets/                               # Logo 与 README 横幅
+├── assets/                               # Logo、README 横幅、界面截图与离线 Studio 文件
+│   ├── workflow-studio.png               # Workflow Studio 界面截图
+│   └── workflow-studio/                  # 预构建运行文件，使用者无需安装 Node.js
 ├── references/
 │   ├── paper-section-contract.md         # 论文章节契约
 │   ├── progress-schema.md                # 项目进度与证据记录格式
@@ -266,6 +288,7 @@ paper-workflow-orchestrator/
 │   ├── final_edit_receipt_validator.py   # 终稿编辑结果验证
 │   └── humanizer_preflight.py            # 语言自然化预检
 ├── dependencies.lock.json                # 外部 skill 来源与版本清单
+├── studio/                               # Workflow Studio 前端源码
 ├── tests/                                 # 工作流与安装器测试
 └── companion-skills/
     ├── research-skill-router/             # 科研任务路由入口
@@ -289,6 +312,8 @@ paper-workflow-orchestrator/
 ## 贡献
 
 欢迎提交问题和改进建议。代码贡献应保持编排器核心脚本仅使用 Python 标准库，并在 Pull Request 中说明验证方式。
+
+准备参与代码贡献？可先阅读[开发指南](DEVELOPMENT_GUIDE.md)，了解仓库结构、测试方法，以及 Python 运行时与 Workflow Studio 前端之间的关系。
 
 个人论文、`.research/`、`.paper/`、实验数据、凭据和本机缓存应保留在本地，并由 `.gitignore` 管理。
 

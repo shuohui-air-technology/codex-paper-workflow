@@ -15,6 +15,24 @@ sys.path.insert(0, str(ROOT))
 
 
 class InstallerContractTests(unittest.TestCase):
+    def test_release_and_workflow_versions_are_validated_independently(self):
+        from scripts.install_workflow import InstallError, _validate_release_metadata
+
+        _validate_release_metadata(
+            {
+                "release_version": "1.1.0",
+                "workflow_version": "paper-workflow-orchestrator-v1.0",
+            },
+            "dependency manifest",
+        )
+        for metadata in (
+            {"release_version": "1.x.0", "workflow_version": "paper-workflow-orchestrator-v1.0"},
+            {"release_version": "1.1.0", "workflow_version": "paper-workflow-orchestrator-v1"},
+            {"release_version": "1.1.0"},
+        ):
+            with self.subTest(metadata=metadata), self.assertRaises(InstallError):
+                _validate_release_metadata(metadata, "dependency manifest")
+
     def test_standard_profile_contains_scientific_visualization_but_not_autoresearch(self):
         self.assertTrue((ROOT / "scripts" / "install_workflow.py").is_file(), "installer has not been implemented")
         self.assertTrue((ROOT / "dependencies.lock.json").is_file(), "dependency lock has not been implemented")

@@ -11,12 +11,12 @@ test('official preview, keyboard-authored workflow, validation, activation, and 
   await expect(page.getByText('只读预览')).toBeVisible();
   await page.getByRole('button', { name: '新建空白流程' }).click();
 
-  await page.getByLabel('主要 Skill').selectOption('paper-test-skill');
+  await page.getByLabel('主要 Skill').selectOption('research-skill-router');
   await page.getByRole('button', { name: /向右移动阶段/ }).click();
   await expect(page.getByText('最近编辑：仅画布位置')).toBeVisible();
 
   await page.getByRole('button', { name: /空白任务阶段/ }).click();
-  await page.getByLabel('主要 Skill').selectOption('paper-test-skill');
+  await page.getByLabel('主要 Skill').selectOption('research-skill-router');
   await page.getByLabel('从阶段').selectOption('step-1');
   await page.getByLabel('连接到').selectOption('stage-1');
   await page.getByRole('button', { name: '添加连接' }).click();
@@ -54,7 +54,7 @@ test('official preview, keyboard-authored workflow, validation, activation, and 
 test('two tabs cannot overwrite a newer saved revision', async ({ studio }) => {
   const { page, context, url } = studio;
   await page.getByRole('button', { name: '新建空白流程' }).click();
-  await page.getByLabel('主要 Skill').selectOption('paper-test-skill');
+  await page.getByLabel('主要 Skill').selectOption('research-skill-router');
   await page.getByRole('button', { name: '保存草稿' }).click();
   await expect(page.getByText('草稿已保存在当前项目中；流程仍未启用。')).toBeVisible();
 

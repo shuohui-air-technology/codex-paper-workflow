@@ -115,9 +115,6 @@ def _validate_release_metadata(value: dict[str, Any], label: str) -> None:
         raise InstallError(f"{label} has an invalid release_version")
     if not isinstance(workflow_version, str) or not WORKFLOW_VERSION_RE.fullmatch(workflow_version):
         raise InstallError(f"{label} has an invalid workflow_version")
-    expected_workflow = "paper-workflow-orchestrator-v" + ".".join(release_version.split(".")[:2])
-    if workflow_version != expected_workflow:
-        raise InstallError(f"{label} release/workflow version mismatch")
 
 
 def _safe_relative_source(root: Path, raw: Any, field: str) -> Path:

@@ -2,7 +2,7 @@
 name: paper-workflow-orchestrator
 description: Orchestrate an explicitly requested, gated, evidence-tracked end-to-end research-to-paper workflow for AI, machine-learning, and other academic projects, including multi-stage routing, Codex-internal subagents, progress memory, citation/integrity gates, peer-review simulation, revision, and AI handoff. Use for a full paper pipeline or workflow design, not for a single obvious task that belongs to a narrower research skill. This skill is the workflow controller; it routes one primary downstream research skill per stage and never auto-starts autonomous experiments.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   workflow_version: "paper-workflow-orchestrator-v1.0"
 ---
 
