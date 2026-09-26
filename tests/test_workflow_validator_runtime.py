@@ -453,6 +453,45 @@ class ValidatorRuntimeAuthorityTests(unittest.TestCase):
         self.assertEqual((recovered.status, recovered.state.nodes["accepted"].status),
                          ("recovered", NodeStatus.READY))
 
+    def test_validator_retry_preserves_unrelated_interrupted_task_attempt(self):
+        check = scheduler_fixtures.validator("check", entry=True)
+        check["failure_policy"] = "skip_branch"
+        self.plan = scheduler_fixtures.WorkflowSchedulerTests().compile(
+            [check, scheduler_fixtures.task("accepted"),
+             scheduler_fixtures.task("independent", entry=True)],
+            [scheduler_fixtures.edge("gate", "check", "accepted", trigger="pass")],
+            external_inputs=("section",),
+        )
+        project = self.root / "parallel-interruption"
+        project.mkdir()
+        self.root = project
+        self.store = WorkflowStore(project)
+        project.joinpath("section.md").write_text("verified section")
+        self.store.start_run(self.plan, "run-parallel-interruption")
+        self.register(); self.claim(); self.complete(status="failed")
+        with self.store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+            running = claim_transition(self.plan, state, "independent", "independent-token")
+            store_fixtures.commit_claim(transaction, running)
+        recovered = WorkflowStore(project).recover()
+        self.assertEqual((recovered.state.nodes["independent"].status,
+                          recovered.state.nodes["independent"].attempt),
+                         (NodeStatus.BLOCKED, 1))
+        blocked_snapshot = self.store.paths.state.read_bytes()
+        with self.store.locked_run() as transaction:
+            _, state = transaction.load_active_run()
+            retried = validator_retry_transition(self.plan, state, "check")
+            self.assertEqual((retried.nodes["independent"].status,
+                              retried.nodes["independent"].attempt),
+                             (NodeStatus.BLOCKED, 1))
+            transaction.commit_transition("validator_retried", retried, {"node_id": "check"})
+        self.assertEqual(WorkflowStore(project).recover().status, "clean")
+        self.store.paths.state.write_bytes(blocked_snapshot)
+        replayed = WorkflowStore(project).recover()
+        self.assertEqual((replayed.status, replayed.state.nodes["check"].status,
+                          replayed.state.nodes["independent"].status),
+                         ("recovered", NodeStatus.READY, NodeStatus.BLOCKED))
+
     def test_unclaimed_dependency_blocked_validator_retry_has_zero_writes(self):
         self.plan = scheduler_fixtures.WorkflowSchedulerTests().compile(
             [scheduler_fixtures.task("source", entry=True), scheduler_fixtures.validator("check")],

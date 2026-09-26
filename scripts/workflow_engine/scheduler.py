@@ -320,13 +320,15 @@ def refresh_ready(plan: CompiledPlan, state: RunState) -> RunState:
         snapshot = _replace_state(state, nodes=nodes, edges=edges)
         for node_id in plan.topological_order:
             runtime = nodes[node_id]
+            # A claimed attempt blocked by recovery needs its own explicit retry.
+            # Refreshing another branch must not silently reopen that attempt.
             if runtime.status in {
                 NodeStatus.RUNNING,
                 NodeStatus.SUCCEEDED,
                 NodeStatus.FAILED,
                 NodeStatus.SKIPPED,
                 NodeStatus.STALE,
-            }:
+            } or (runtime.status is NodeStatus.BLOCKED and runtime.attempt > 0):
                 continue
             node = plan.nodes[node_id]
             incoming_ids = plan.incoming[node_id]
