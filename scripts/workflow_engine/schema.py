@@ -44,6 +44,7 @@ _NODE_FIELDS = frozenset(
         "enabled",
         "skill_ref",
         "validator_ref",
+        "validator_config",
         "origin_projection_node_id",
         "inputs",
         "outputs",
@@ -59,6 +60,28 @@ _DERIVED_FROM_FIELDS = frozenset({"projection_id", "projection_sha256"})
 _UI_FIELDS = frozenset({"positions"})
 _POSITION_FIELDS = frozenset({"x", "y"})
 _CONDITION_CASE_FIELDS = frozenset({"outcome", "when"})
+_VALIDATOR_CONFIG_FIELDS = frozenset({"input_roles", "options"})
+_PAPER_OPTIONS = {
+    "phase": ("body", "abstract", "final"),
+    "paper_type": ("empirical", "theoretical", "review", "protocol"),
+    "language": ("en", "zh"),
+    "method_profile": ("method-first", "data-first"),
+    "validity_status": ("pending", "clear", "blocked"),
+    "discussion_integrated": (False, True),
+}
+_VALIDATOR_FORMS = {
+    "experiment-contract": ({"contract": "Experiment contract"}, {}),
+    "figure-contract": ({"receipt": "Figure contract receipt"}, {}),
+    "final-edit-receipt": ({"receipt": "Final edit receipt"}, {}),
+    "paper-section": (
+        {"file": "Paper section", "semantic_receipt": "Semantic receipt (final only)"},
+        _PAPER_OPTIONS,
+    ),
+}
+_HUMANIZER_UNAVAILABLE = (
+    "Custom humanizer is unavailable in the first release because its input "
+    "contract can select executable Python."
+)
 
 _MAX_SCALAR = 4_000
 _MAX_ITEMS = 1_000
@@ -93,6 +116,7 @@ class NodeSpec:
     enabled: bool
     skill_ref: str | None
     validator_ref: str | None
+    validator_config: Mapping[str, Any] | None
     origin_projection_node_id: str | None
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
@@ -306,6 +330,81 @@ def _condition_cases(value: object, node_id: str) -> tuple[Mapping[str, Any], ..
     return tuple(cases)
 
 
+def validator_form_metadata() -> dict[str, object]:
+    """Return the fixed role selectors and option choices for Studio."""
+    metadata = {
+        validator_id: {
+            "available": True,
+            "input_roles": {
+                role: {"label": label, "required": role != "semantic_receipt",
+                       "required_when": "phase=final" if role == "semantic_receipt" else None}
+                for role, label in roles.items()
+            },
+            "options": {
+                name: {"label": name.replace("_", " ").capitalize(), "choices": list(choices)}
+                for name, choices in options.items()
+            },
+        }
+        for validator_id, (roles, options) in _VALIDATOR_FORMS.items()
+    }
+    metadata["humanizer-preflight"] = {
+        "available": False, "unavailable_reason": _HUMANIZER_UNAVAILABLE,
+        "input_roles": {}, "options": {},
+    }
+    return metadata
+
+
+def _validator_config(
+    value: object,
+    validator_ref: str | None,
+    inputs: tuple[str, ...],
+    node_id: str,
+    enabled: bool,
+) -> Mapping[str, Any] | None:
+    if validator_ref == "humanizer-preflight":
+        if enabled:
+            _fail("validator.humanizer_unavailable", _HUMANIZER_UNAVAILABLE, node_id=node_id)
+        if value is not None:
+            _fail("schema.validator_config_unavailable", "disabled custom humanizer has no runnable configuration", node_id=node_id)
+        return None
+    if validator_ref is None:
+        if value is not None:
+            _fail("schema.validator_config_unbound", "unbound validator has no configuration", node_id=node_id)
+        return None
+    form = _VALIDATOR_FORMS.get(validator_ref)
+    if form is None:
+        _fail("schema.validator_form_unknown", "validator has no code-owned form", node_id=node_id)
+    if value is None:
+        _fail("schema.validator_config_required", "bound validator requires a configuration", node_id=node_id)
+    config = _exact_fields(value, _VALIDATOR_CONFIG_FIELDS, "validator_config",
+                           unknown_code="schema.unknown_validator_config_field", node_id=node_id)
+    raw_roles = _object(config["input_roles"], "validator_config.input_roles", node_id=node_id)
+    allowed_roles, allowed_options = form
+    raw_options = _object(config["options"], "validator_config.options", node_id=node_id)
+    if set(raw_options) != set(allowed_options):
+        _fail("schema.validator_options_invalid", "validator options must match its exact form", node_id=node_id)
+    options: dict[str, object] = {}
+    for name, choices in allowed_options.items():
+        selected = raw_options[name]
+        if type(selected) is not type(choices[0]) or selected not in choices:
+            _fail("schema.validator_option_value_invalid", f"invalid validator option: {name}", node_id=node_id)
+        options[name] = selected
+    if validator_ref == "paper-section":
+        required_roles = {"file", "semantic_receipt"} if options["phase"] == "final" else {"file"}
+    else:
+        required_roles = set(allowed_roles)
+    if set(raw_roles) != required_roles:
+        _fail("schema.validator_roles_invalid", "validator roles must match its form and phase", node_id=node_id)
+    roles = {role: _identifier(raw_roles[role], f"validator role {role}", node_id=node_id)
+             for role in sorted(raw_roles)}
+    if len(set(roles.values())) != len(roles):
+        _fail("schema.validator_role_duplicate", "validator role artifact IDs must be distinct", node_id=node_id)
+    if set(roles.values()) != set(inputs):
+        _fail("schema.validator_inputs_mismatch", "validator role IDs must exactly match node.inputs", node_id=node_id)
+    return MappingProxyType({"input_roles": MappingProxyType(roles),
+                             "options": MappingProxyType(options)})
+
+
 def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
     preliminary = _object(value, "node")
     node_id = _identifier(preliminary.get("id"), "node.id") if "id" in preliminary else ""
@@ -347,6 +446,8 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
         _fail("schema.invalid_join_mode", "node.join_mode is not supported", node_id=node_id)
 
     if node_type == "task":
+        if item["validator_config"] is not None:
+            _fail("schema.nonvalidator_config_forbidden", "non-validator nodes cannot carry validator configuration", node_id=node_id)
         if validator_ref is not None:
             _fail("schema.task_validator_forbidden", "task nodes cannot bind a validator", node_id=node_id)
         if "succeeded" not in declared_outcomes:
@@ -357,6 +458,7 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
             _fail("schema.task_join_mode_forbidden", "task nodes cannot select a join mode", node_id=node_id)
         outcomes = declared_outcomes
     elif node_type == "validator":
+        validator_config = _validator_config(item["validator_config"], validator_ref, inputs, node_id, enabled)
         if skill_ref is not None:
             _fail("schema.validator_skill_forbidden", "validator nodes cannot bind a Skill", node_id=node_id)
         if set(declared_outcomes) != _VALIDATOR_OUTCOMES:
@@ -365,8 +467,12 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
             _fail("schema.validator_condition_cases_forbidden", "validator nodes cannot declare condition cases", node_id=node_id)
         if join_mode != "all_active":
             _fail("schema.validator_join_mode_forbidden", "validator nodes cannot select a join mode", node_id=node_id)
+        if outputs:
+            _fail("schema.validator_outputs_forbidden", "validator nodes are gate-only and cannot produce artifacts", node_id=node_id)
         outcomes = declared_outcomes
     elif node_type == "condition":
+        if item["validator_config"] is not None:
+            _fail("schema.nonvalidator_config_forbidden", "non-validator nodes cannot carry validator configuration", node_id=node_id)
         if skill_ref is not None:
             _fail("schema.control_skill_forbidden", "control nodes cannot bind a Skill", node_id=node_id)
         if validator_ref is not None:
@@ -379,6 +485,8 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
             _fail("schema.condition_join_mode_forbidden", "condition nodes cannot select a join mode", node_id=node_id)
         outcomes = tuple(case["outcome"] for case in condition_cases) + ("default",)
     else:
+        if item["validator_config"] is not None:
+            _fail("schema.nonvalidator_config_forbidden", "non-validator nodes cannot carry validator configuration", node_id=node_id)
         if skill_ref is not None:
             _fail("schema.control_skill_forbidden", "control nodes cannot bind a Skill", node_id=node_id)
         if validator_ref is not None:
@@ -397,6 +505,7 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
         enabled=enabled,
         skill_ref=skill_ref,
         validator_ref=validator_ref,
+        validator_config=validator_config if node_type == "validator" else None,
         origin_projection_node_id=origin_projection_node_id,
         inputs=inputs,
         outputs=outputs,
@@ -546,6 +655,7 @@ def behavior_payload(document: WorkflowDocument) -> dict[str, object]:
                 "enabled": node.enabled,
                 "skill_ref": node.skill_ref,
                 "validator_ref": node.validator_ref,
+                "validator_config": _json_value(node.validator_config),
                 "origin_projection_node_id": node.origin_projection_node_id,
                 "inputs": list(node.inputs),
                 "outputs": list(node.outputs),

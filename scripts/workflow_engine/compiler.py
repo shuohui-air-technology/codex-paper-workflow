@@ -34,6 +34,7 @@ class CompiledNode:
     entry: bool
     skill: SkillIdentity | None
     validator: ValidatorIdentity | None
+    validator_config: Mapping[str, object] | None
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     outcomes: tuple[str, ...]
@@ -413,6 +414,9 @@ def compile_workflow(
                     )
                 )
         elif node.type == "validator":
+            if node.validator_ref == "humanizer-preflight":
+                errors.append(_issue("validator.humanizer_unavailable",
+                                     "custom humanizer is unavailable in the first release", node_id=node_id))
             if node.validator_ref is None:
                 errors.append(
                     _issue(
@@ -562,6 +566,7 @@ def compile_workflow(
             entry=node.entry,
             skill=catalog.skills.get(node.skill_ref) if node.skill_ref is not None else None,
             validator=validators.get(node.validator_ref) if node.validator_ref is not None else None,
+            validator_config=node.validator_config,
             inputs=node.inputs,
             outputs=node.outputs,
             outcomes=node.outcomes,

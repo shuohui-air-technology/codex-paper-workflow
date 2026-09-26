@@ -15,6 +15,7 @@
       "enabled": true,
       "skill_ref": "paper-workflow-orchestrator",
       "validator_ref": null,
+      "validator_config": null,
       "origin_projection_node_id": null,
       "inputs": [],
       "outputs": [],

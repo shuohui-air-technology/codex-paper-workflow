@@ -38,7 +38,7 @@ def task(node_id, *, entry=False, inputs=(), outputs=(), failure_policy="block")
         "entry": entry,
         "enabled": True,
         "skill_ref": f"skill-{node_id}",
-        "validator_ref": None,
+        "validator_ref": None, "validator_config": None,
         "origin_projection_node_id": None,
         "inputs": list(inputs),
         "outputs": list(outputs),
@@ -58,7 +58,7 @@ def condition(node_id, *, entry=False, cases=()):
         "entry": entry,
         "enabled": True,
         "skill_ref": None,
-        "validator_ref": None,
+        "validator_ref": None, "validator_config": None,
         "origin_projection_node_id": None,
         "inputs": [],
         "outputs": [],
@@ -78,7 +78,7 @@ def join(node_id, *, outputs=(), mode="all_active"):
         "entry": False,
         "enabled": True,
         "skill_ref": None,
-        "validator_ref": None,
+        "validator_ref": None, "validator_config": None,
         "origin_projection_node_id": None,
         "inputs": [],
         "outputs": list(outputs),
@@ -99,8 +99,13 @@ def validator(node_id, *, entry=False):
         "enabled": True,
         "skill_ref": None,
         "validator_ref": "paper-section",
+        "validator_config": {"input_roles": {"file": "section"}, "options": {
+            "phase": "body", "paper_type": "empirical", "language": "en",
+            "method_profile": "method-first", "validity_status": "pending",
+            "discussion_integrated": False,
+        }},
         "origin_projection_node_id": None,
-        "inputs": [],
+        "inputs": ["section"],
         "outputs": [],
         "outcomes": ["pass", "fail", "blocked"],
         "write_scopes": [],
@@ -451,9 +456,10 @@ class WorkflowSchedulerTests(unittest.TestCase):
         plan = self.compile(
             [task("a", entry=True), task("b", entry=True), validator("check", entry=True)],
             [],
+            external_inputs=("section",),
             max_parallelism=1,
         )
-        state = initial_run(plan, "run-claim")
+        state = refresh_ready(plan, self.register(initial_run(plan, "run-claim"), self.artifact("section")))
         self.assertEqual(ready_node_ids(plan, state), ("a", "b", "check"))
         claimed = claim_transition(plan, state, "a", "secret-token")
         self.assertEqual(claimed.nodes["a"].status, NodeStatus.RUNNING)

@@ -82,7 +82,7 @@ class WorkflowCompilerTests(unittest.TestCase):
             {
                 "id": node_id, "type": "task", "display_name": node_id,
                 "entry": node_id == "directions", "enabled": True,
-                "skill_ref": bindings[node_id], "validator_ref": None,
+                "skill_ref": bindings[node_id], "validator_ref": None, "validator_config": None,
                 "origin_projection_node_id": node_id,
                 "inputs": list(projected[node_id]["inputs"]),
                 "outputs": list(projected[node_id]["outputs"]),
@@ -136,14 +136,15 @@ class WorkflowCompilerTests(unittest.TestCase):
                     else "paper-memory-builder"
                 ),
                 "validator_ref": "final-edit-receipt" if is_validator else None,
+                "validator_config": {"input_roles": {"receipt": "final_edit_receipt"}, "options": {}} if is_validator else None,
                 "origin_projection_node_id": node_id,
-                "inputs": list(projected[node_id]["inputs"]),
-                "outputs": outputs,
+                "inputs": ["final_edit_receipt"] if is_validator else list(projected[node_id]["inputs"]),
+                "outputs": [] if is_validator else outputs,
                 "outcomes": ["pass", "fail", "blocked"] if is_validator else ["succeeded"],
-                "write_scopes": outputs + [
+                "write_scopes": ([] if is_validator else outputs + [
                     scope for scope in projected[node_id]["write_scopes"]
                     if scope == "canonical_manuscript" and scope not in outputs
-                ],
+                ]),
                 "failure_policy": "block",
                 "condition_cases": [],
                 "join_mode": "all_active",
@@ -439,7 +440,7 @@ class WorkflowCompilerTests(unittest.TestCase):
             {
                 "id": "source-a", "type": "task", "display_name": "Source A",
                 "entry": True, "enabled": True, "skill_ref": "research-hub",
-                "validator_ref": None, "origin_projection_node_id": None,
+                "validator_ref": None, "validator_config": None, "origin_projection_node_id": None,
                 "inputs": [], "outputs": ["shared"], "outcomes": ["succeeded"],
                 "write_scopes": [], "failure_policy": "block", "condition_cases": [],
                 "join_mode": "all_active",
@@ -447,7 +448,7 @@ class WorkflowCompilerTests(unittest.TestCase):
             {
                 "id": "source-b", "type": "task", "display_name": "Source B",
                 "entry": True, "enabled": True, "skill_ref": "paper-memory-builder",
-                "validator_ref": None, "origin_projection_node_id": None,
+                "validator_ref": None, "validator_config": None, "origin_projection_node_id": None,
                 "inputs": [], "outputs": ["shared"], "outcomes": ["succeeded"],
                 "write_scopes": [], "failure_policy": "block", "condition_cases": [],
                 "join_mode": "all_active",
@@ -455,7 +456,7 @@ class WorkflowCompilerTests(unittest.TestCase):
             {
                 "id": "sink", "type": "task", "display_name": "Sink",
                 "entry": False, "enabled": True, "skill_ref": "research-hub",
-                "validator_ref": None, "origin_projection_node_id": None,
+                "validator_ref": None, "validator_config": None, "origin_projection_node_id": None,
                 "inputs": ["shared"], "outputs": [], "outcomes": ["succeeded"],
                 "write_scopes": [], "failure_policy": "block", "condition_cases": [],
                 "join_mode": "all_active",
@@ -483,7 +484,7 @@ class WorkflowCompilerTests(unittest.TestCase):
             {
                 "id": "source", "type": "task", "display_name": "Source",
                 "entry": True, "enabled": True, "skill_ref": "research-hub",
-                "validator_ref": None, "origin_projection_node_id": None,
+                "validator_ref": None, "validator_config": None, "origin_projection_node_id": None,
                 "inputs": [], "outputs": ["left", "right"], "outcomes": ["succeeded"],
                 "write_scopes": [], "failure_policy": "block", "condition_cases": [],
                 "join_mode": "all_active",
@@ -491,7 +492,7 @@ class WorkflowCompilerTests(unittest.TestCase):
             {
                 "id": "sink", "type": "task", "display_name": "Sink",
                 "entry": False, "enabled": True, "skill_ref": "paper-memory-builder",
-                "validator_ref": None, "origin_projection_node_id": None,
+                "validator_ref": None, "validator_config": None, "origin_projection_node_id": None,
                 "inputs": ["right"], "outputs": [], "outcomes": ["succeeded"],
                 "write_scopes": [], "failure_policy": "block", "condition_cases": [],
                 "join_mode": "all_active",
@@ -715,12 +716,14 @@ class WorkflowCompilerTests(unittest.TestCase):
         value["nodes"] = [{
             "id": "figure-check", "type": "validator", "display_name": "Figure check",
             "entry": True, "enabled": True, "skill_ref": None,
-            "validator_ref": "figure-contract", "origin_projection_node_id": None,
-            "inputs": [], "outputs": [], "outcomes": ["pass", "fail", "blocked"],
+            "validator_ref": "figure-contract", "validator_config": {"input_roles": {"receipt": "figure_receipt"}, "options": {}},
+            "origin_projection_node_id": None,
+            "inputs": ["figure_receipt"], "outputs": [], "outcomes": ["pass", "fail", "blocked"],
             "write_scopes": [], "failure_policy": "block", "condition_cases": [],
             "join_mode": "all_active",
         }]
         value["edges"] = []
+        value["external_inputs"] = ["figure_receipt"]
         result = self.compile(value)
         self.assertIsNotNone(result.plan)
         self.assertNotIn("risk.control_removed.figure", {issue.code for issue in result.warnings})
@@ -748,14 +751,14 @@ class WorkflowCompilerTests(unittest.TestCase):
         self.assertIsNone(result.plan)
         self.assertIn("artifact.input_ambiguous", self.issue_codes(result))
 
-    def test_projected_validator_fail_edge_replaces_control_coverage(self):
-        """Catches delivery following a failed gate while retaining final-audit coverage."""
+    def test_projected_validator_gate_shape_reports_changed_control(self):
+        """Gate-only validator cannot claim the projection's generated audit artifact."""
         value, catalog = self.projected_final_audit_chain()
         safe = compile_workflow(
             parse_workflow(value), catalog, self.validators, self.projection
         )
         self.assertIsNotNone(safe.plan)
-        self.assertNotIn(
+        self.assertIn(
             "risk.control_replaced.final_audit", {i.code for i in safe.warnings}
         )
 
@@ -795,7 +798,7 @@ class WorkflowCompilerTests(unittest.TestCase):
         value["nodes"] = [{
             "id": "literature", "type": "task", "display_name": "Literature",
             "entry": True, "enabled": True, "skill_ref": "research-hub",
-            "validator_ref": None, "origin_projection_node_id": "literature",
+            "validator_ref": None, "validator_config": None, "origin_projection_node_id": "literature",
             "inputs": list(projected["inputs"]), "outputs": list(projected["outputs"]),
             "outcomes": ["succeeded"], "write_scopes": list(projected["write_scopes"]),
             "failure_policy": "block", "condition_cases": [], "join_mode": "all_active",
@@ -815,14 +818,14 @@ class WorkflowCompilerTests(unittest.TestCase):
             {
                 "id": "literature", "type": "task", "display_name": "Literature",
                 "entry": True, "enabled": True, "skill_ref": "research-hub",
-                "validator_ref": None, "origin_projection_node_id": "literature",
+                "validator_ref": None, "validator_config": None, "origin_projection_node_id": "literature",
                 "inputs": list(projected["inputs"]), "outputs": list(projected["outputs"]),
                 "outcomes": ["succeeded"], "write_scopes": list(projected["write_scopes"]),
                 "failure_policy": "block", "condition_cases": [], "join_mode": "all_active",
             },
             {
                 "id": "sink", "type": "task", "display_name": "Sink", "entry": False,
-                "enabled": True, "skill_ref": "paper-memory-builder", "validator_ref": None,
+                "enabled": True, "skill_ref": "paper-memory-builder", "validator_ref": None, "validator_config": None,
                 "origin_projection_node_id": None, "inputs": ["sources"], "outputs": [],
                 "outcomes": ["succeeded"], "write_scopes": [], "failure_policy": "block",
                 "condition_cases": [], "join_mode": "all_active",
@@ -841,7 +844,7 @@ class WorkflowCompilerTests(unittest.TestCase):
         value = copy.deepcopy(self.value)
         value["nodes"] = [{
             "id": "check", "type": "validator", "display_name": "Check", "entry": True,
-            "enabled": True, "skill_ref": None, "validator_ref": None,
+            "enabled": True, "skill_ref": None, "validator_ref": None, "validator_config": None,
             "origin_projection_node_id": None, "inputs": [], "outputs": [],
             "outcomes": ["pass", "fail", "blocked"], "write_scopes": [],
             "failure_policy": "block", "condition_cases": [], "join_mode": "all_active",
@@ -850,9 +853,18 @@ class WorkflowCompilerTests(unittest.TestCase):
         self.assertIn("validator.identity_required", self.issue_codes(self.compile(value)))
 
         value["nodes"][0]["validator_ref"] = "missing-validator"
-        self.assertIn("validator.identity_not_found", self.issue_codes(self.compile(value)))
+        with self.assertRaises(WorkflowError) as caught:
+            self.compile(value)
+        self.assertEqual(caught.exception.code, "schema.validator_form_unknown")
 
         value["nodes"][0]["validator_ref"] = "paper-section"
+        value["nodes"][0]["inputs"] = ["section"]
+        value["external_inputs"] = ["section"]
+        value["nodes"][0]["validator_config"] = {"input_roles": {"file": "section"}, "options": {
+            "phase": "body", "paper_type": "empirical", "language": "en",
+            "method_profile": "method-first", "validity_status": "pending",
+            "discussion_integrated": False,
+        }}
         mismatched = dict(self.validators)
         mismatched["paper-section"] = replace(
             mismatched["paper-section"], outcomes=("pass", "blocked")
@@ -927,11 +939,17 @@ class WorkflowCompilerTests(unittest.TestCase):
         value["nodes"] = [{
             "id": "check", "type": "validator", "display_name": "Check", "entry": True,
             "enabled": True, "skill_ref": None, "validator_ref": "paper-section",
-            "origin_projection_node_id": None, "inputs": [], "outputs": [],
+            "validator_config": {"input_roles": {"file": "section"}, "options": {
+                "phase": "body", "paper_type": "empirical", "language": "en",
+                "method_profile": "method-first", "validity_status": "pending",
+                "discussion_integrated": False,
+            }},
+            "origin_projection_node_id": None, "inputs": ["section"], "outputs": [],
             "outcomes": ["pass", "fail", "blocked"], "write_scopes": [],
             "failure_policy": "block", "condition_cases": [], "join_mode": "all_active",
         }]
         value["edges"] = []
+        value["external_inputs"] = ["section"]
         document = parse_workflow(value)
         first = compile_workflow(document, self.catalog, self.validators, self.projection)
         mutations = (

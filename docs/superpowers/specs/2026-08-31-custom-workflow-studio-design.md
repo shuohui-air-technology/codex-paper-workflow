@@ -360,6 +360,18 @@ validator bindings, inputs, outputs, conditions, failure policies, edges, join
 settings, and execution settings. It excludes coordinates and other visual-only
 state.
 
+In first-release custom documents every node explicitly carries
+`validator_config`: `null` for non-validator nodes, or the code-owned form with
+exact `input_roles` and `options` members for a runnable validator. Role values
+are distinct node-local input artifact IDs and exactly match its declared
+inputs. Validator outputs are empty because these nodes check evidence and
+produce only an outcome. `paper-section` saves all six options explicitly and
+requires the `semantic_receipt` input role only for `phase=final`. The form is
+part of document and compiled semantic identity; old pre-release documents or
+plans without the field are invalid. Disabled `humanizer-preflight` cards may be
+represented with `validator_config: null`, while enabled custom humanizer nodes
+are blocked until a separately reviewed trusted execution protocol exists.
+
 ## 9. Node and edge semantics
 
 ### 9.1 Task node

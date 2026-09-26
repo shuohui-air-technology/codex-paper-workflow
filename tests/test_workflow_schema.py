@@ -147,6 +147,8 @@ class WorkflowSchemaTests(unittest.TestCase):
                 node["outcomes"] = ["succeeded"]
             elif node_type == "validator":
                 node["outcomes"] = ["pass", "fail", "blocked"]
+                node["outputs"] = []
+                node["inputs"] = []
             elif node_type == "condition":
                 node["condition_cases"] = [
                     {"outcome": "chosen", "when": {"op": "fact_is", "name": "ready", "value": True}}
@@ -167,6 +169,13 @@ class WorkflowSchemaTests(unittest.TestCase):
                 node = node_for(node_type)
                 if field is not None:
                     node[field] = binding
+                if node_type == "validator" and binding == "paper-section":
+                    node["inputs"] = ["section"]
+                    node["validator_config"] = {"input_roles": {"file": "section"}, "options": {
+                        "phase": "body", "paper_type": "empirical", "language": "en",
+                        "method_profile": "method-first", "validity_status": "pending",
+                        "discussion_integrated": False,
+                    }}
                 document["nodes"] = [node]
                 document["edges"] = []
                 parsed = parse_workflow(document).nodes[0]
@@ -233,11 +242,11 @@ class WorkflowSchemaTests(unittest.TestCase):
             '"failure_policy":"block","id":"orchestrate","inputs":[],'
             '"join_mode":"all_active","origin_projection_node_id":null,'
             '"outcomes":["succeeded"],"outputs":[],"skill_ref":"paper-workflow-orchestrator",'
-            '"type":"task","validator_ref":null,"write_scopes":[]}],'
+            '"type":"task","validator_config":null,"validator_ref":null,"write_scopes":[]}],'
             '"schema_version":"paper-workflow-custom-v1","semantic_revision":1,'
             '"workflow_id":"installed-core-paper-flow"}'
         )
-        expected_sha256 = "67965ec32bdaa23b959fcf7cf58eb7c50b76425489011e3f4b8eeff2009f229d"
+        expected_sha256 = "6e95145857c854f7cfc56fe4ae55ee1d4f233c1411fc77610aed69b6c0463eef"
         actual_json = json.dumps(
             document_payload(document), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )

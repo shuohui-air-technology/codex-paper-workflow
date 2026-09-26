@@ -102,6 +102,7 @@ def compiled_node(
         entry=entry,
         skill=skill,
         validator=None,
+        validator_config=None,
         inputs=tuple(inputs),
         outputs=tuple(outputs),
         outcomes=tuple(outcomes),
@@ -534,7 +535,7 @@ def append_rehashed_state_event(store, state, event_type="artifact_registered"):
 
 def validator_plan():
     validator = ValidatorIdentity(
-        validator_id="validator",
+        validator_id="experiment-contract",
         script=Path("/installed/validators/validator.py"),
         sha256=sha256_bytes(b"validator"),
         adapter="json",
@@ -543,8 +544,10 @@ def validator_plan():
         outcomes=("pass", "fail", "blocked"),
     )
     node = replace(
-        compiled_node("validate", node_type="validator", entry=True),
+        compiled_node("validate", node_type="validator", entry=True, inputs=("contract",)),
         validator=validator,
+        validator_config=MappingProxyType({"input_roles": MappingProxyType({"contract": "contract"}),
+                                           "options": MappingProxyType({})}),
         outcomes=("pass", "fail", "blocked"),
     )
     return CompiledPlan(
@@ -552,7 +555,7 @@ def validator_plan():
         semantic_revision=1,
         document_sha256=sha256_bytes(b"validator-document"),
         semantic_sha256=sha256_bytes(b"validator-semantic"),
-        external_inputs=(),
+        external_inputs=("contract",),
         nodes=MappingProxyType({"validate": node}),
         edges=MappingProxyType({}),
         incoming=MappingProxyType({"validate": ()}),
@@ -875,10 +878,18 @@ class WorkflowStoreTests(unittest.TestCase):
                 "type": "validator",
                 "skill_ref": None,
                 "validator_ref": "paper-section",
+                "validator_config": {"input_roles": {"file": "section"}, "options": {
+                    "phase": "body", "paper_type": "empirical", "language": "en",
+                    "method_profile": "method-first", "validity_status": "pending",
+                    "discussion_integrated": False,
+                }},
+                "inputs": ["section"],
+                "outputs": [],
                 "outcomes": ["pass", "fail", "blocked"],
             }
         )
         validator["nodes"] = [validator_node]
+        validator["external_inputs"] = ["section"]
         validator["edges"] = []
         validator["ui"]["positions"] = {validator_node["id"]: {"x": 0, "y": 0}}
         with TemporaryDirectory() as temporary:

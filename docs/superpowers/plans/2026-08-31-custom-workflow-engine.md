@@ -1225,6 +1225,13 @@ adds the approved validator form/adapter contract; **7C** adds stale-rerun,
 remaining service operations, and the full JSON CLI. The command examples below
 describe the integrated Task 7 target, not the availability of the 7A slice.
 
+Task **7B1** adds the strict GUI-form schema, code-owned property metadata,
+canonical document/compiled identity, store codecs, and activation block for an
+enabled custom `humanizer-preflight`. Task **7B2** adds the four runnable
+adapters, receipt normalization, and an independent direct-run humanizer guard
+before subprocess or event writes. The first-release form contract is recorded
+in the Task 7 validator-form design supplement.
+
 **Files:**
 - Create: `scripts/workflow_engine/receipts.py`
 - Create: `scripts/workflow_engine/validators.py`

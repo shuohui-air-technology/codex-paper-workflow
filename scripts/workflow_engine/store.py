@@ -59,6 +59,7 @@ from .receipts import (
 from .schema import (
     WorkflowDocument,
     WorkflowError,
+    _validator_config,
     behavior_payload,
     document_sha256,
     parse_workflow,
@@ -557,6 +558,7 @@ def _document_data(document: WorkflowDocument) -> dict[str, object]:
                 "enabled": node.enabled,
                 "skill_ref": node.skill_ref,
                 "validator_ref": node.validator_ref,
+                "validator_config": _json_value(node.validator_config),
                 "origin_projection_node_id": node.origin_projection_node_id,
                 "inputs": list(node.inputs),
                 "outputs": list(node.outputs),
@@ -624,6 +626,7 @@ def _plan_data(plan: CompiledPlan) -> dict[str, object]:
                 "entry": node.entry,
                 "skill": _skill_data(node.skill),
                 "validator": _validator_data(node.validator),
+                "validator_config": _json_value(node.validator_config),
                 "inputs": list(node.inputs),
                 "outputs": list(node.outputs),
                 "outcomes": list(node.outcomes),
@@ -718,7 +721,7 @@ def _plan_from_data(value: object) -> CompiledPlan:
         raise StoreError("plan.invalid", "compiled plan topology is invalid")
     node_fields = frozenset(
         {
-            "id", "type", "entry", "skill", "validator", "inputs", "outputs", "outcomes",
+            "id", "type", "entry", "skill", "validator", "validator_config", "inputs", "outputs", "outcomes",
             "write_scopes", "failure_policy", "condition_cases", "join_mode",
         }
     )
@@ -730,13 +733,32 @@ def _plan_from_data(value: object) -> CompiledPlan:
         cases = node["condition_cases"]
         if not isinstance(cases, list) or not all(isinstance(case, Mapping) for case in cases):
             raise StoreError("plan.invalid", "compiled condition cases are invalid")
+        validator = _validator_from_data(node["validator"])
+        skill = _skill_from_data(node["skill"])
+        node_type = _plain_string(node["type"], "plan.invalid")
+        inputs = _string_list(node["inputs"], "plan.invalid")
+        if node_type == "validator":
+            if validator is None or skill is not None:
+                raise StoreError("plan.invalid", "compiled validator binding is invalid")
+            try:
+                config = _validator_config(node["validator_config"], validator.validator_id,
+                                           inputs, str(node_id), True)
+            except WorkflowError as exc:
+                raise StoreError("plan.invalid", "compiled validator configuration is invalid") from exc
+            if _string_list(node["outputs"], "plan.invalid"):
+                raise StoreError("plan.invalid", "compiled validator cannot declare outputs")
+        else:
+            if node["validator_config"] is not None or validator is not None:
+                raise StoreError("plan.invalid", "non-validator compiled node has validator authority")
+            config = None
         nodes[str(node_id)] = CompiledNode(
             str(node["id"]),
-            _plain_string(node["type"], "plan.invalid"),
+            node_type,
             node["entry"],
-            _skill_from_data(node["skill"]),
-            _validator_from_data(node["validator"]),
-            _string_list(node["inputs"], "plan.invalid"),
+            skill,
+            validator,
+            config,
+            inputs,
             _string_list(node["outputs"], "plan.invalid"),
             _string_list(node["outcomes"], "plan.invalid"),
             _string_list(node["write_scopes"], "plan.invalid"),
