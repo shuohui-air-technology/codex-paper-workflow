@@ -6,6 +6,21 @@ metadata:
   workflow_version: "paper-workflow-orchestrator-v1.0"
 ---
 
+## Resolve workflow mode before reading project progress
+
+At the start of a project session, use the installed Orchestrator's
+`scripts/workflow_manager.py summary --project <project-root> --json` and check
+its `mode` before opening `progress.md` or any workflow state. A `mode: official`
+result, including the default when no selection has been recorded, selects
+Official v1.0: follow only the official contract marked below; do not inspect
+custom drafts or run files. If it reports
+`custom`, follow the [custom workflow contract](references/custom-workflow-contract.md).
+In custom mode, the custom state is the only runtime authority. Do not update
+`.research/progress.md` or `current_stage`. If selection or its activation
+journal is invalid or conflicting, or the selected custom plan/run/evidence
+cannot be verified, stop and report the issue; never fall back silently.
+
+<!-- OFFICIAL-V1-CONTRACT:BEGIN -->
 # Paper Workflow Orchestrator
 
 Use this skill as the top-level controller for a research project that must remain auditable across long sessions and future AI handoffs. Keep the main model as editor-in-chief and prompt architect; use Codex-internal subagents only for bounded, independently reviewable work.
@@ -294,3 +309,4 @@ Use `scripts/paper_section_validator.py` at the body, abstract, and final gates
 to check structural order and required sections. It validates structure only;
 scientific claims, evidence, and semantic interpretation still require the
 main model and the integrity audit.
+<!-- OFFICIAL-V1-CONTRACT:END -->

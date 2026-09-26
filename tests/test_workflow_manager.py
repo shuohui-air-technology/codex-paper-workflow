@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -728,6 +729,22 @@ class TaskProtocolTests(unittest.TestCase):
         snapshot = json.loads(self.service.store.paths.state.read_text(encoding="utf-8"))
         self.assertEqual(snapshot["run_status"], "stopped")
 
+    def test_custom_summary_reports_mode_without_touching_official_progress(self):
+        summary = self.service.summary()
+        self.assertEqual(summary["mode"], "custom")
+        self.assertEqual(summary["run_status"], "active")
+        self.assertFalse((self.project / ".research" / "progress.md").exists())
+
+    def test_custom_selection_with_missing_run_blocks_without_official_fallback(self):
+        from scripts.workflow_engine.store import StoreError
+
+        store = self.service.store
+        shutil.rmtree(store.paths.run_dir)
+        with self.assertRaises(StoreError) as caught:
+            self.service.summary()
+        self.assertEqual(caught.exception.code, "run.not_found")
+        self.assertFalse((self.project / ".research" / "progress.md").exists())
+
     def test_summary_does_not_repair_a_lagging_selection_projection(self):
         from scripts.workflow_engine.store import Selection
 
@@ -752,6 +769,80 @@ class TaskProtocolTests(unittest.TestCase):
             before,
         )
 
+    def test_summary_resolves_missing_selector_from_journal_without_repairing_it(self):
+        store = self.service.store
+        store.paths.selection.unlink()
+        events_before = store.paths.audit_events.read_bytes()
+        run_before = store.paths.events.read_bytes()
+
+        summary = self.service.summary()
+
+        self.assertEqual(summary["mode"], "custom")
+        self.assertFalse(store.paths.selection.exists())
+        self.assertEqual(store.paths.audit_events.read_bytes(), events_before)
+        self.assertEqual(store.paths.events.read_bytes(), run_before)
+        self.assertFalse((self.project / ".research" / "progress.md").exists())
+
+
+class WorkflowModeSummaryTests(unittest.TestCase):
+    def test_absent_selection_with_orphaned_draft_reports_official_without_reading_it(self):
+        from scripts.workflow_manager import WorkflowService
+
+        with TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            research = project / ".research"
+            progress = research / "progress.md"
+            progress.parent.mkdir(parents=True)
+            progress.write_text("keep official progress bytes", encoding="utf-8")
+            custom_base = research / "custom-workflow"
+            custom_base.mkdir()
+            draft = custom_base / "workflow.json"
+            draft.write_bytes(b"not a workflow and must remain unread")
+            draft_before = draft.read_bytes()
+            progress_before = progress.read_bytes()
+
+            summary = WorkflowService(project).summary()
+
+            self.assertEqual(summary["mode"], "official")
+            self.assertEqual(draft.read_bytes(), draft_before)
+            self.assertEqual(progress.read_bytes(), progress_before)
+            self.assertFalse((custom_base / "active-run").exists())
+
+    def test_explicit_official_selection_ignores_custom_draft_and_reports_mode(self):
+        from scripts.workflow_engine.store import WorkflowStore
+        from scripts.workflow_manager import WorkflowService
+
+        with TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            store = WorkflowStore(project)
+            store.deactivate_custom()
+            store.paths.workflow.write_bytes(b"corrupt dormant draft")
+            store.paths.run_dir.mkdir()
+            corrupt_state = store.paths.state
+            corrupt_state.write_bytes(b"corrupt dormant run state")
+            draft_before = store.paths.workflow.read_bytes()
+            state_before = corrupt_state.read_bytes()
+
+            summary = WorkflowService(project).summary()
+
+            self.assertEqual(summary["mode"], "official")
+            self.assertEqual(store.paths.workflow.read_bytes(), draft_before)
+            self.assertEqual(corrupt_state.read_bytes(), state_before)
+            self.assertFalse((project / ".research" / "progress.md").exists())
+
+    def test_corrupt_selection_blocks_instead_of_reporting_official(self):
+        from scripts.workflow_engine.store import StoreError, WorkflowStore
+        from scripts.workflow_manager import WorkflowService
+
+        with TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            store = WorkflowStore(project)
+            store.paths.base.mkdir(parents=True)
+            store.paths.selection.write_text('{"mode":"custom"}\n', encoding="utf-8")
+
+            with self.assertRaises(StoreError):
+                WorkflowService(project).summary()
+            self.assertFalse((project / ".research" / "progress.md").exists())
 
 class ValidatorManagerTests(unittest.TestCase):
     PAPER = (
@@ -1366,6 +1457,73 @@ class WorkflowManagerCLITests(unittest.TestCase):
                 self.assertEqual(result["status"], "pass")
                 self.assertEqual(result["errors"], [])
 
+    def test_summary_reports_official_default_without_reading_or_creating_custom_run(self):
+        custom_base = self.project / ".research" / "custom-workflow"
+        custom_base.mkdir(parents=True)
+        draft = custom_base / "workflow.json"
+        draft.write_bytes(b"dormant malformed draft")
+        draft_before = draft.read_bytes()
+
+        code, summary = self._run("direct", "summary", *self._common())
+
+        self.assertEqual((code, summary["status"], summary["mode"]), (0, "pass", "official"))
+        self.assertEqual(draft.read_bytes(), draft_before)
+        self.assertFalse((custom_base / "active-run").exists())
+
+    def test_summary_on_fresh_project_does_not_create_custom_state(self):
+        code, summary = self._run("module", "summary", *self._common())
+        self.assertEqual((code, summary["status"], summary["mode"]), (0, "pass", "official"))
+        self.assertFalse((self.project / ".research" / "custom-workflow").exists())
+
+    def test_corrupt_selection_cli_fails_closed_with_json_error(self):
+        custom_base = self.project / ".research" / "custom-workflow"
+        custom_base.mkdir(parents=True)
+        (custom_base / "selection.json").write_text('{"mode":"custom"}\n', encoding="utf-8")
+
+        code, result = self._run("direct", "summary", *self._common())
+
+        self.assertEqual(code, 2)
+        self.assertEqual(result["error"]["code"], "selection.invalid")
+
+    def test_corrupt_activation_journal_cli_fails_closed_with_json_error(self):
+        code, validation = self._run(
+            "direct", "validate", *self._common(), "--workflow", self.workflow_path
+        )
+        self.assertEqual(code, 0, validation)
+        activation = ["activate", *self._common(), "--workflow", self.workflow_path]
+        for warning in validation["required_warning_codes"]:
+            activation += ["--ack-warning-code", warning]
+        code, _activated = self._run("direct", *activation)
+        self.assertEqual(code, 0)
+        journal = self.project / ".research" / "custom-workflow" / "activation-events.jsonl"
+        journal.write_bytes(b"{\"event_seq\":not-valid}\n")
+
+        code, result = self._run("direct", "summary", *self._common())
+
+        self.assertEqual(code, 2, result)
+        self.assertIn(result["error"]["code"], {
+            "selection.journal_invalid", "events.invalid_event", "events.invalid_json",
+        })
+        self.assertFalse((self.project / ".research" / "progress.md").exists())
+
+    def test_selected_custom_mode_with_missing_run_cli_fails_closed(self):
+        code, validation = self._run(
+            "direct", "validate", *self._common(), "--workflow", self.workflow_path
+        )
+        self.assertEqual(code, 0, validation)
+        activation = ["activate", *self._common(), "--workflow", self.workflow_path]
+        for warning in validation["required_warning_codes"]:
+            activation += ["--ack-warning-code", warning]
+        code, _activated = self._run("direct", *activation)
+        self.assertEqual(code, 0)
+
+        shutil.rmtree(self.project / ".research" / "custom-workflow" / "active-run")
+        code, result = self._run("module", "summary", *self._common())
+
+        self.assertEqual(code, 2)
+        self.assertEqual(result["error"]["code"], "run.not_found")
+        self.assertFalse((self.project / ".research" / "progress.md").exists())
+
     def test_runtime_commands_emit_json_for_summary_ready_claim_and_submit(self):
         code, validation = self._run(
             "direct", "validate", *self._common(), "--workflow", self.workflow_path
@@ -1464,6 +1622,7 @@ class WorkflowManagerCLITests(unittest.TestCase):
             "runtime.parallelism_exceeded",
             "run.already_active",
             "run.not_active",
+            "events.invalid_json",
             "selection.journal_invalid",
             "receipt.invalid_projection",
         ):

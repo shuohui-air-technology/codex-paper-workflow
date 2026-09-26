@@ -176,6 +176,7 @@ def _cli_error_exit_code(code):
     blocked_runtime_codes = {
         "activation.validation_blocked",
         "artifact.verification_failed",
+        "events.invalid_json",
         "receipt.claim_missing",
         "receipt.conflict",
         "receipt.inspection_failed",
@@ -803,11 +804,23 @@ class WorkflowService:
             }
 
     def summary(self):
-        """Return a deterministic, read-only summary of the active custom run."""
+        """Resolve mode without repairing its projection, then return a summary."""
+        selection = self.store.read_selection(repair_projection=False)
+        if selection.mode == "official":
+            return {
+                "status": "pass",
+                "mode": "official",
+                "run_status": "inactive",
+                "nodes": [],
+                "artifacts": [],
+                "decisions": {},
+                "project_booleans": {},
+            }
         with self.store.locked_run() as transaction:
             plan, state = self._load(transaction, repair_selection=False)
             return {
                 "status": "pass",
+                "mode": "custom",
                 "workflow_id": plan.workflow_id,
                 "semantic_revision": plan.semantic_revision,
                 "semantic_sha256": plan.semantic_sha256,

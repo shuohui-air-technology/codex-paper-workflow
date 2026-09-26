@@ -1,3 +1,5 @@
+import hashlib
+import json
 import re
 import types
 import unittest
@@ -16,6 +18,51 @@ class ProgressVersionTests(unittest.TestCase):
         document = progress.template("version-test")
         self.assertIn("workflow_version: paper-workflow-orchestrator-v1.0", document)
         self.assertTrue(progress.validate_text(document)["valid"])
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            'metadata:\n  version: "1.0.0"\n  workflow_version: "paper-workflow-orchestrator-v1.0"',
+            skill,
+        )
+
+    def test_official_contract_markers_preserve_v10_bodies(self):
+        projection = json.loads(
+            (ROOT / "references" / "workflows" / "official-v1.0-studio-projection.json")
+            .read_text(encoding="utf-8")
+        )
+        begin_marker = b"<!-- OFFICIAL-V1-CONTRACT:BEGIN -->\n"
+        end_marker = b"<!-- OFFICIAL-V1-CONTRACT:END -->"
+        paths = {
+            "SKILL.md": (ROOT / "SKILL.md", "SKILL.md#body"),
+            "references/stage-contracts.md": (
+                ROOT / "references" / "stage-contracts.md",
+                "references/stage-contracts.md#body",
+            ),
+            "references/progress-schema.md": (
+                ROOT / "references" / "progress-schema.md",
+                "references/progress-schema.md#body",
+            ),
+        }
+        for display_path, (path, projection_key) in paths.items():
+            with self.subTest(path=display_path):
+                contents = path.read_bytes()
+                self.assertEqual(contents.count(begin_marker), 1)
+                self.assertEqual(contents.count(end_marker), 1)
+                body_start = contents.index(begin_marker) + len(begin_marker)
+                body_end = contents.index(end_marker)
+                self.assertLess(body_start, body_end)
+                body = contents[body_start:body_end]
+                self.assertEqual(
+                    hashlib.sha256(body).hexdigest(),
+                    projection["official_contract_sections"][projection_key],
+                )
+
+    def test_release_metadata_remains_v100_and_progress_schema_is_official_only(self):
+        manifest = json.loads((ROOT / "dependencies.lock.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["release_version"], "1.0.0")
+        progress_schema = (ROOT / "references" / "progress-schema.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("authoritative only in Official v1.0 mode", progress_schema)
 
     def test_migrate_legacy_versions_to_v10_keeps_legacy_backups(self):
         from scripts import progress_manager as progress

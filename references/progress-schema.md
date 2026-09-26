@@ -1,3 +1,10 @@
+## Scope
+
+The marked schema below is authoritative only in Official v1.0 mode. In custom
+mode, the workflow manager's validated custom state is authoritative; do not
+read or update `.research/progress.md` or `current_stage` for custom execution.
+
+<!-- OFFICIAL-V1-CONTRACT:BEGIN -->
 # Progress Schema and Reliability Rules
 
 Use `.research/progress.md` as the canonical, append-aware project memory. Keep the headings stable so another AI can parse the file without the full conversation.
@@ -191,3 +198,4 @@ migration preserves that evidence and sets `validity_status: blocked`; otherwise
 it uses `pending`. It creates a validated v1.0 `.bak` recovery point and appends
 a migration event; it never silently guesses the project mode or resolves a
 possible blocker.
+<!-- OFFICIAL-V1-CONTRACT:END -->

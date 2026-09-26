@@ -2125,7 +2125,7 @@ class WorkflowStore:
             )
         return projected
 
-    def read_selection(self) -> Selection:
+    def read_selection(self, *, repair_projection: bool = True) -> Selection:
         self._checked(self.paths.selection)
         if (
             not self.paths.selection.exists()
@@ -2135,7 +2135,7 @@ class WorkflowStore:
         ):
             return Selection("official")
         with self._lock():
-            return self._selection_unlocked()
+            return self._selection_unlocked(repair_projection=repair_projection)
 
     def _validate_revision_snapshots(self) -> None:
         if not self.paths.revisions.exists():

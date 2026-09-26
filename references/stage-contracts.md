@@ -1,3 +1,11 @@
+## Scope
+
+The marked content below is the unchanged Official v1.0 stage contract. It is
+authoritative only when mode resolution selects Official v1.0. For a selected
+custom workflow, use [custom-workflow-contract.md](custom-workflow-contract.md)
+and its manager-mediated transitions instead.
+
+<!-- OFFICIAL-V1-CONTRACT:BEGIN -->
 # Stage Contracts and Delegation Boundaries
 
 The orchestrator owns stage transitions and user gates. Downstream skills perform bounded work and return artifacts; they do not decide the global workflow.
@@ -174,3 +182,4 @@ At each gate, show:
 5. the exact user confirmation needed.
 
 Rejected options and their rationale are recorded in `Decisions` and are not silently reintroduced.
+<!-- OFFICIAL-V1-CONTRACT:END -->
