@@ -569,17 +569,24 @@ class TaskProtocolTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "events.invalid_evidence")
         self.assertEqual((self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()), before)
 
-    def test_stale_attempt_retains_its_claim_evidence(self):
+    def test_stale_attempt_quarantines_live_claim_but_preserves_history(self):
         from scripts.workflow_engine.store import StoreError
         invocation = self.service.claim("directions")
         self.service.submit_result(self.result(invocation))
         (self.project / "idea.md").write_text("drift")
         recovered = self.service.store.recover()
         self.assertEqual(recovered.state.nodes["directions"].status.value, "stale")
+        self.assertEqual(recovered.state.nodes["directions"].claim_token_hash, "")
+        self.assertEqual(recovered.state.nodes["directions"].outcome, "")
+        historical = self.service.store.read_run_events()
+        claim = next(event for event in historical if event.event_type == "node_claimed")
+        completion = next(event for event in historical if event.event_type == "node_result_recorded")
+        self.assertEqual(claim.payload["claim_evidence"]["attempt"], 1)
+        self.assertEqual(completion.payload["receipt"]["attempt"], 1)
         before = self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()
         with self.service.store.locked_run() as transaction:
             _, state = transaction.load_active_run()
-            forged = replace(state, nodes={"directions": replace(state.nodes["directions"], claim_token_hash="")})
+            forged = replace(state, nodes={"directions": replace(state.nodes["directions"], claim_token_hash="f" * 64)})
             with self.assertRaises(StoreError) as caught:
                 transaction.commit_transition("fact_recorded", forged)
             self.assertEqual(caught.exception.code, "events.invalid_evidence")

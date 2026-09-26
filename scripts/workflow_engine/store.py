@@ -1249,10 +1249,15 @@ def validate_node_evidence_delta(
                 code = "artifact.authority_invalid" if event_type == "artifact_registered" else "events.invalid_evidence"
                 raise StoreError(code, "attempt reset requires an authorized lifecycle transition")
             if invalidation and (
-                current.claim_token_hash != earlier.claim_token_hash or current.outputs != earlier.outputs
-                or current.outcome != earlier.outcome
+                current.attempt != earlier.attempt
+                or current.claim_token_hash
+                or current.outputs != earlier.outputs
+                or current.outcome
+                or current.selected_inputs
+                or current.auxiliary_outputs
+                or current.winner_edge_id != earlier.winner_edge_id
             ):
-                raise StoreError("artifact.authority_invalid", "invalidation cannot rewrite the attempt's historical evidence")
+                raise StoreError("artifact.authority_invalid", "invalidation must quarantine only live attempt evidence")
         if current.status is NodeStatus.SKIPPED and earlier.status not in {NodeStatus.RUNNING, NodeStatus.SKIPPED}:
             if event_type not in {"node_result_recorded", "validator_result_recorded", "condition_selected", "join_succeeded"}:
                 if event_type not in {"readiness_refreshed", "artifact_registered", "fact_recorded", "decision_recorded"}:
@@ -2429,11 +2434,11 @@ class WorkflowStore:
             except PathSafetyError as exc:
                 raise StoreError("events.unreplayable", "event artifact path is unsafe") from exc
         _validate_artifact_authority(plan, state)
-        validate_node_evidence_delta(plan, previous_state, state, event.event_type, event.payload, prior_events, witnesses)
-        self._validate_drift_transition(plan, previous_state, state, event.event_type, event.payload, witnesses, prior_events)
         _validate_edge_and_winner_transition(
             plan, previous_state, state, event.event_type, event.payload
         )
+        validate_node_evidence_delta(plan, previous_state, state, event.event_type, event.payload, prior_events, witnesses)
+        self._validate_drift_transition(plan, previous_state, state, event.event_type, event.payload, witnesses, prior_events)
         self._validate_artifact_source_transition(
             plan, previous_state, state, event.event_type
         )
@@ -2760,6 +2765,20 @@ class WorkflowStore:
                         "artifact.authority_invalid",
                         f"external re-registration must invalidate completed evidence: {node_id}",
                     )
+                if after.status is NodeStatus.STALE and plan.nodes[node_id].type in {"condition", "join"}:
+                    if (
+                        after.attempt != before.attempt
+                        or after.outcome
+                        or after.selected_inputs
+                        or after.auxiliary_outputs
+                        or after.claim_token_hash
+                        or after.outputs != before.outputs
+                        or after.winner_edge_id != before.winner_edge_id
+                    ):
+                        raise StoreError(
+                            "artifact.authority_invalid",
+                            f"stale control node retains or rewrites live decision evidence: {node_id}",
+                        )
                 for edge_id in plan.outgoing[node_id]:
                     edge = current.edges[edge_id]
                     if unchanged_exclusion:
@@ -2839,6 +2858,11 @@ class WorkflowStore:
     def _validate_drift_transition(self, plan, before, after, event_type, payload, witnesses, events):
         if event_type != "artifacts_marked_stale":
             return
+        if any(runtime.status is NodeStatus.RUNNING for runtime in before.nodes.values()):
+            raise StoreError(
+                "events.invalid_invalidation",
+                "uncertain running attempts must be blocked before stale lineage is invalidated",
+            )
         artifact_ids = payload.get("artifact_ids")
         producer_ids = payload.get("witness_producer_ids")
         receipt_ids = payload.get("receipt_node_ids", ())
@@ -2898,13 +2922,21 @@ class WorkflowStore:
         if producers:
             nodes = dict(updated.nodes)
             for node_id in producers:
-                nodes[node_id] = replace(nodes[node_id], status=NodeStatus.STALE)
+                nodes[node_id] = replace(
+                    nodes[node_id], status=NodeStatus.STALE, outcome="",
+                    selected_inputs=MappingProxyType({}), auxiliary_outputs=MappingProxyType({}),
+                    claim_token_hash="",
+                )
             updated = replace(updated, nodes=MappingProxyType(nodes))
             updated = mark_descendants_stale(plan, updated, tuple(sorted(producers)))
         if direct:
             nodes = dict(updated.nodes)
             for node_id in direct:
-                nodes[node_id] = replace(nodes[node_id], status=NodeStatus.STALE)
+                nodes[node_id] = replace(
+                    nodes[node_id], status=NodeStatus.STALE, outcome="",
+                    selected_inputs=MappingProxyType({}), auxiliary_outputs=MappingProxyType({}),
+                    claim_token_hash="",
+                )
             updated = replace(updated, nodes=MappingProxyType(nodes))
             updated = mark_descendants_stale(plan, updated, tuple(sorted(direct)))
         return updated
@@ -3040,8 +3072,41 @@ class WorkflowStore:
             drifted = list(self._artifact_drift_ids(state))
             historical_producers = self._witness_drift_producers(witnesses)
             receipt_nodes = self._current_receipt_drift_nodes(state, events)
+            running = [
+                node_id for node_id, runtime in state.nodes.items()
+                if runtime.status is NodeStatus.RUNNING
+            ]
+            if running:
+                nodes = dict(state.nodes)
+                for node_id in running:
+                    nodes[node_id] = replace(nodes[node_id], status=NodeStatus.BLOCKED)
+                blocked = replace(state, nodes=MappingProxyType(nodes))
+                transaction = self._transaction(lease)
+                transaction._set_loaded(plan, state, sequence, event_hash, run_status, events, witnesses)
+                transaction._commit_event(
+                    "recovery_running_blocked",
+                    blocked,
+                    {"node_ids": sorted(running)},
+                    run_status=run_status,
+                )
+                state = blocked
+                sequence = transaction._event_seq
+                event_hash = transaction._event_hash
+                witnesses = transaction._witnesses
+                changed = True
+                if not (drifted or historical_producers or receipt_nodes):
+                    return RecoveryResult(
+                        "blocked",
+                        "recovery.running_work_uncertain",
+                        blocked,
+                        archived,
+                    )
+
             if drifted or historical_producers or receipt_nodes:
-                stale = self._mark_drift(plan, state, drifted, sorted(set(historical_producers) | set(receipt_nodes)))
+                stale = self._mark_drift(
+                    plan, state, drifted,
+                    sorted(set(historical_producers) | set(receipt_nodes)),
+                )
                 transaction = self._transaction(lease)
                 transaction._set_loaded(plan, state, sequence, event_hash, run_status, events, witnesses)
                 transaction._commit_event(
@@ -3059,27 +3124,11 @@ class WorkflowStore:
                 event_hash = transaction._event_hash
                 witnesses = transaction._witnesses
                 changed = True
-
-            running = [
-                node_id for node_id, runtime in state.nodes.items() if runtime.status is NodeStatus.RUNNING
-            ]
             if running:
-                nodes = dict(state.nodes)
-                for node_id in running:
-                    nodes[node_id] = replace(nodes[node_id], status=NodeStatus.BLOCKED)
-                blocked = replace(state, nodes=MappingProxyType(nodes))
-                transaction = self._transaction(lease)
-                transaction._set_loaded(plan, state, sequence, event_hash, run_status, events, witnesses)
-                transaction._commit_event(
-                    "recovery_running_blocked",
-                    blocked,
-                    {"node_ids": sorted(running)},
-                    run_status=run_status,
-                )
                 return RecoveryResult(
                     "blocked",
                     "recovery.running_work_uncertain",
-                    blocked,
+                    state,
                     archived,
                 )
             try:
@@ -3207,18 +3256,31 @@ class WorkflowTransaction:
         current = loaded_current if previous_state is None else previous_state
         self._validate_binding(plan, updated_state)
         state_data, updated_state = _validated_state_data(updated_state)
-        self.store._require_verified_artifact_bytes(updated_state)
+        witnesses_before = self._witnesses if witnesses is None else witnesses
+        # Recovery must first persist that an in-flight attempt became
+        # uncertain, even when the bytes proving its inputs have just drifted.
+        # The following artifacts_marked_stale event records the observed
+        # drift; until then ordinary mutations still fail closed on the same
+        # byte checks.
+        recovery_drift_boundary = event_type == "recovery_running_blocked" and bool(
+            self.store._artifact_drift_ids(current)
+            or self.store._witness_drift_producers(witnesses_before)
+            or self.store._current_receipt_drift_nodes(current, self._events)
+        )
+        if not recovery_drift_boundary:
+            self.store._require_verified_artifact_bytes(updated_state)
         self.store._require_artifact_paths_contained(updated_state)
         _validate_artifact_authority(plan, updated_state)
+        _validate_edge_and_winner_transition(
+            plan, current, updated_state, event_type, payload
+        )
         validate_node_evidence_delta(plan, current, updated_state, event_type, payload,
                                      self._events, self._witnesses if witnesses is None else witnesses)
         self.store._validate_drift_transition(plan, current, updated_state, event_type, payload,
                                               self._witnesses if witnesses is None else witnesses, self._events)
-        if self.store._current_receipt_drift_nodes(updated_state, self._events):
+        if (not recovery_drift_boundary
+                and self.store._current_receipt_drift_nodes(updated_state, self._events)):
             raise StoreError("artifact.verification_failed", "current attempt receipt bytes have changed")
-        _validate_edge_and_winner_transition(
-            plan, current, updated_state, event_type, payload
-        )
         self.store._validate_artifact_source_transition(
             plan, current, updated_state, event_type
         )
@@ -3228,7 +3290,7 @@ class WorkflowTransaction:
             updated_state,
             self._witnesses if witnesses is None else witnesses,
         )
-        if self.store._witness_drift_producers(next_witnesses):
+        if not recovery_drift_boundary and self.store._witness_drift_producers(next_witnesses):
             raise StoreError("artifact.verification_failed", "live edge witness bytes have changed")
         if updated_state.run_id != current.run_id:
             raise StoreError(

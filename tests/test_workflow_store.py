@@ -61,6 +61,17 @@ def sha256_bytes(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def stale_runtime(runtime):
+    return replace(
+        runtime,
+        status=NodeStatus.STALE,
+        outcome="",
+        selected_inputs=MappingProxyType({}),
+        auxiliary_outputs=MappingProxyType({}),
+        claim_token_hash="",
+    )
+
+
 def commit_claim(transaction, running):
     plan, before = transaction._require_loaded()
     node_id, = [key for key in plan.nodes if running.nodes[key].status is NodeStatus.RUNNING
@@ -518,14 +529,14 @@ def complete_external_consumer(store, plan):
         return complete
 
 
-def append_rehashed_state_event(store, state, event_type="artifact_registered"):
+def append_rehashed_state_event(store, state, event_type="artifact_registered", extra_payload=None):
     prior = json.loads(store.paths.events.read_text(encoding="utf-8").splitlines()[-1])
     forged = WorkflowEvent.create(
         event_seq=prior["event_seq"] + 1,
         run_id=prior["run_id"],
         semantic_sha256=prior["semantic_sha256"],
         event_type=event_type,
-        payload={"state": state, "run_status": "active"},
+        payload={**(extra_payload or {}), "state": state, "run_status": "active"},
         previous_event_hash=prior["event_hash"],
     )
     with store.paths.events.open("a", encoding="utf-8") as handle:
@@ -1899,6 +1910,106 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(recovered.state.nodes["use-source"].status, NodeStatus.STALE)
             self.assertEqual(json.loads(store.paths.artifacts.read_text())["artifacts"][0]["state"], "stale")
 
+    def test_input_drift_blocks_running_attempt_before_stale_invalidation(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "old.txt"
+            source_path.write_bytes(b"verified input")
+            plan = external_consumer_plan()
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-running-input-drift")
+            source = ArtifactRuntime(
+                "source", "old.txt", sha256_bytes(b"verified input"), "verified", "external", 0
+            )
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                ready = refresh_ready(plan, replace(state, artifacts=MappingProxyType({"source": source})))
+                transaction.commit_transition("artifact_registered", ready)
+                running = claim_transition(plan, ready, "consumer", "running-consumer-token")
+                claim_event = commit_claim(transaction, running)
+                self.assertEqual(running.nodes["consumer"].status, NodeStatus.RUNNING)
+
+            source_path.write_bytes(b"changed while running")
+            with mock.patch.object(
+                store, "_mark_drift", side_effect=StoreError("test.interrupted", "stop after uncertainty event")
+            ):
+                with self.assertRaises(StoreError):
+                    store.recover()
+            first_recovery_events = store.read_run_events()
+            self.assertEqual(first_recovery_events[-1].event_type, "recovery_running_blocked")
+            self.assertEqual(first_recovery_events[-1].payload["node_ids"], ("consumer",))
+
+            # A restart after the uncertainty event must still detect the
+            # unchanged byte drift and append the lineage invalidation.
+            recovered = WorkflowStore(root).recover()
+            events = store.read_run_events()
+            event_types = [event.event_type for event in events]
+            blocked_index = event_types.index("recovery_running_blocked")
+            stale_index = event_types.index("artifacts_marked_stale")
+
+            self.assertLess(blocked_index, stale_index)
+            self.assertEqual(recovered.state.nodes["consumer"].status, NodeStatus.STALE)
+            stale_runtime = recovered.state.nodes["consumer"]
+            self.assertEqual(stale_runtime.attempt, 1)
+            self.assertEqual(stale_runtime.claim_token_hash, "")
+            self.assertEqual(stale_runtime.outcome, "")
+            self.assertEqual(stale_runtime.selected_inputs, {})
+            self.assertEqual(stale_runtime.auxiliary_outputs, {})
+            self.assertEqual(stale_runtime.outputs, {})
+            self.assertEqual(events[claim_event.event_seq - 1].event_type, "node_claimed")
+            self.assertEqual(recovered.state.artifacts["source"].state, "stale")
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+
+    def test_stale_event_cannot_skip_running_block_on_commit_or_replay(self):
+        payload = {
+            "artifact_ids": ["source"],
+            "witness_producer_ids": [],
+            "receipt_node_ids": [],
+        }
+        for boundary in ("direct", "replay"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source_path = root / "old.txt"
+                source_path.write_bytes(b"verified input")
+                plan = external_consumer_plan()
+                store = WorkflowStore(root)
+                store.start_run(plan, f"run-forged-running-stale-{boundary}")
+                source = ArtifactRuntime(
+                    "source", "old.txt", sha256_bytes(b"verified input"), "verified", "external", 0
+                )
+                replay_before = None
+                with store.locked_run() as transaction:
+                    _, state = transaction.load_active_run()
+                    ready = refresh_ready(plan, replace(state, artifacts=MappingProxyType({"source": source})))
+                    transaction.commit_transition("artifact_registered", ready)
+                    running = claim_transition(plan, ready, "consumer", "running-token")
+                    commit_claim(transaction, running)
+                    source_path.write_bytes(b"drifted input")
+                    stale = store._mark_drift(plan, running, ("source",))
+                    if boundary == "direct":
+                        before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                        with self.assertRaises(StoreError) as caught:
+                            transaction.commit_transition("artifacts_marked_stale", stale, payload)
+                        self.assertEqual(caught.exception.code, "events.invalid_invalidation")
+                        self.assertEqual(
+                            (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                        )
+                    else:
+                        append_rehashed_state_event(
+                            store, workflow_store._state_data(stale),
+                            "artifacts_marked_stale", payload,
+                        )
+                        replay_before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                if boundary == "replay":
+                    recovered = store.recover()
+                    self.assertEqual(
+                        (recovered.status, recovered.code),
+                        ("blocked", "events.invalid_invalidation"),
+                    )
+                    self.assertEqual(
+                        (store.paths.events.read_bytes(), store.paths.state.read_bytes()), replay_before
+                    )
+
     def test_produced_artifact_drift_stales_producer_attempt_siblings_and_descendants(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1935,6 +2046,13 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(recovered.code, "recovery.artifact_drift")
             self.assertEqual(recovered.state.nodes["producer"].status, NodeStatus.STALE)
             self.assertEqual(recovered.state.nodes["consumer"].status, NodeStatus.STALE)
+            self.assertEqual(recovered.state.nodes["producer"].outcome, "")
+            self.assertEqual(recovered.state.nodes["producer"].claim_token_hash, "")
+            self.assertEqual(recovered.state.nodes["producer"].outputs, {
+                "first": "first.txt", "second": "second.txt",
+            })
+            self.assertEqual(recovered.state.nodes["consumer"].selected_inputs, {})
+            self.assertEqual(recovered.state.nodes["consumer"].claim_token_hash, "")
             self.assertEqual(recovered.state.artifacts["first"].state, "stale")
             self.assertEqual(recovered.state.artifacts["second"].state, "stale")
 
@@ -2636,7 +2754,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 self.assertEqual(produced.nodes["consumer"].status, NodeStatus.READY)
                 self.assertEqual(produced.nodes["consumer"].selected_inputs["first"], "first.txt")
                 reset_nodes = dict(produced.nodes)
-                reset_nodes["producer"] = replace(reset_nodes["producer"], status=NodeStatus.STALE)
+                reset_nodes["producer"] = stale_runtime(reset_nodes["producer"])
                 reset_nodes["consumer"] = replace(
                     reset_nodes["consumer"], status=NodeStatus.PENDING,
                     selected_inputs=MappingProxyType({}),
@@ -2784,11 +2902,8 @@ class WorkflowStoreTests(unittest.TestCase):
             store.start_run(plan, "run-any-success-valid")
             complete, external = complete_any_success_refinement(store, plan)
             nodes = dict(complete.nodes)
-            nodes["first-task"] = replace(nodes["first-task"], status=NodeStatus.STALE)
-            nodes["join"] = replace(
-                nodes["join"], status=NodeStatus.STALE,
-                selected_inputs=MappingProxyType({}),
-            )
+            nodes["first-task"] = stale_runtime(nodes["first-task"])
+            nodes["join"] = stale_runtime(nodes["join"])
             replacement = replace(
                 complete,
                 nodes=MappingProxyType(nodes),
@@ -3347,7 +3462,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
             )
             nodes = dict(selected.nodes)
-            nodes["choose"] = replace(nodes["choose"], status=NodeStatus.STALE)
+            nodes["choose"] = stale_runtime(nodes["choose"])
             for node_id in ("main", "fallback", "sink"):
                 nodes[node_id] = replace(
                     nodes[node_id], status=NodeStatus.PENDING,
@@ -3377,6 +3492,61 @@ class WorkflowStoreTests(unittest.TestCase):
             for node_id in ("fallback", "sink"):
                 self.assertEqual(recovered.state.nodes[node_id].status, NodeStatus.PENDING)
                 self.assertEqual(recovered.state.nodes[node_id].attempt, 0)
+
+    def test_external_replacement_cannot_retain_stale_condition_outcome_on_commit_or_replay(self):
+        for boundary in ("direct", "replay"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                root.joinpath("old.txt").write_bytes(b"old")
+                root.joinpath("new.txt").write_bytes(b"new")
+                plan = excluded_branch_plan(artifact_condition=True)
+                store = WorkflowStore(root)
+                store.start_run(plan, f"run-stale-condition-{boundary}")
+                selected = complete_excluded_branch(store, plan, artifact_condition=True)
+                changed = ArtifactRuntime(
+                    "source", "new.txt", sha256_bytes(b"new"), "verified", "external", 0
+                )
+                nodes = dict(selected.nodes)
+                nodes["choose"] = replace(
+                    stale_runtime(selected.nodes["choose"]),
+                    outcome=selected.nodes["choose"].outcome,
+                )
+                for node_id in ("main", "fallback", "sink"):
+                    nodes[node_id] = replace(
+                        nodes[node_id], status=NodeStatus.PENDING,
+                        selected_inputs=MappingProxyType({}),
+                    )
+                unsafe = replace(
+                    selected,
+                    nodes=MappingProxyType(nodes),
+                    edges=MappingProxyType({
+                        edge_id: EdgeRuntime(EdgeStatus.WAITING) for edge_id in plan.edges
+                    }),
+                    artifacts=MappingProxyType({"source": changed}),
+                )
+                if boundary == "direct":
+                    with store.locked_run() as transaction:
+                        transaction.load_active_run()
+                        before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                        with self.assertRaises(StoreError) as caught:
+                            transaction.commit_transition("artifact_registered", unsafe)
+                        self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+                        self.assertEqual(
+                            (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                        )
+                else:
+                    append_rehashed_state_event(
+                        store, workflow_store._state_data(unsafe), "artifact_registered"
+                    )
+                    before = (store.paths.events.read_bytes(), store.paths.state.read_bytes())
+                    recovered = store.recover()
+                    self.assertEqual(
+                        (recovered.status, recovered.code),
+                        ("blocked", "artifact.authority_invalid"),
+                    )
+                    self.assertEqual(
+                        (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before
+                    )
 
     def test_attempted_skip_still_requires_stale_evidence_on_source_change(self):
         with TemporaryDirectory() as temporary:
@@ -3418,9 +3588,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "artifact.authority_invalid")
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
                 stale = replace(candidate, nodes=MappingProxyType({
-                    "consumer": replace(
-                        skipped.nodes["consumer"], status=NodeStatus.STALE
-                    ),
+                    "consumer": stale_runtime(skipped.nodes["consumer"]),
                 }))
                 transaction.commit_transition("artifact_registered", stale)
             self.assertEqual(WorkflowStore(root).recover().status, "clean")
@@ -3450,7 +3618,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 valid = replace(
                     complete,
                     nodes=MappingProxyType({
-                        "consumer": replace(complete.nodes["consumer"], status=NodeStatus.STALE),
+                        "consumer": stale_runtime(complete.nodes["consumer"]),
                     }),
                     artifacts=MappingProxyType({
                         "source": changed,
@@ -3458,6 +3626,10 @@ class WorkflowStoreTests(unittest.TestCase):
                     }),
                 )
                 transaction.commit_transition("artifact_registered", valid)
+                current_stale = transaction.load_active_run()[1].nodes["consumer"]
+                self.assertEqual(current_stale.outcome, "")
+                self.assertEqual(current_stale.claim_token_hash, "")
+                self.assertEqual(current_stale.outputs, {"draft": "draft.txt"})
             self.assertEqual(WorkflowStore(root).recover().status, "clean")
 
     def test_changed_external_registration_cannot_silently_continue_running_work(self):
@@ -3638,7 +3810,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
 
                 stale_nodes = {
-                    node_id: replace(runtime, status=NodeStatus.STALE)
+                    node_id: stale_runtime(runtime)
                     for node_id, runtime in complete.nodes.items()
                 }
                 legitimate = replace(

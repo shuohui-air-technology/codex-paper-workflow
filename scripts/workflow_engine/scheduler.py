@@ -857,7 +857,14 @@ def mark_descendants_stale(
     edges = dict(state.edges)
     artifacts = dict(state.artifacts)
     for node_id in descendants:
-        nodes[node_id] = replace(nodes[node_id], status=NodeStatus.STALE, selected_inputs=_string_map())
+        nodes[node_id] = replace(
+            nodes[node_id],
+            status=NodeStatus.STALE,
+            outcome="",
+            selected_inputs=_string_map(),
+            auxiliary_outputs=_aux_map(),
+            claim_token_hash="",
+        )
     for node_id in set(changed_node_ids) | descendants:
         _set_outgoing_status(plan, edges, node_id, EdgeStatus.WAITING)
     for artifact_id, artifact in state.artifacts.items():
