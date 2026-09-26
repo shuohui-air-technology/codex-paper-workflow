@@ -2275,6 +2275,18 @@ class WorkflowStore:
         high_risk_warning_codes: Sequence[str],
         acknowledged_warning_codes: Sequence[str],
     ) -> Selection:
+        required = self._activation_warning_codes(
+            high_risk_warning_codes, acknowledged_warning_codes
+        )
+        with self._lock():
+            selected, _normalized_plan = self._activate_custom_unlocked(plan, required)
+            return selected
+
+    @staticmethod
+    def _activation_warning_codes(
+        high_risk_warning_codes: Sequence[str],
+        acknowledged_warning_codes: Sequence[str],
+    ) -> tuple[str, ...]:
         try:
             required = _warning_codes(
                 high_risk_warning_codes,
@@ -2298,45 +2310,50 @@ class WorkflowStore:
                 "activation.acknowledgement_mismatch",
                 "activation requires the exact current high-risk warning-code set",
             )
-        with self._lock():
-            self._reject_active_run()
-            _raw_plan, plan, _plan_sha256 = _validated_plan_data(plan)
-            self._validate_revision_snapshots()
-            if not self.paths.workflow.exists() and not self.paths.workflow.is_symlink():
-                raise StoreError("activation.draft_mismatch", "activation requires a saved workflow draft")
-            try:
-                latest = parse_workflow(
-                    self._read_json(self.paths.workflow, "store.draft_invalid")
-                )
-            except WorkflowError as exc:
-                raise StoreError("store.draft_invalid", str(exc)) from exc
-            latest_hash = document_sha256(latest)
-            revision_path = self.paths.revisions / f"{latest.semantic_revision}-{latest_hash}.json"
-            if (
-                plan.workflow_id != latest.workflow_id
-                or plan.semantic_revision != latest.semantic_revision
-                or plan.document_sha256 != latest_hash
-                or not revision_path.exists()
-                or revision_path.is_symlink()
-            ):
-                raise StoreError(
-                    "activation.draft_mismatch",
-                    "compiled plan does not name the latest saved behavior revision",
-                )
-            previous = self._selection_unlocked()
-            selected = Selection(
-                "custom",
-                previous.selection_revision + 1,
-                plan.workflow_id,
-                plan.semantic_revision,
-                plan.semantic_sha256,
-                required,
-                plan.semantic_sha256,
-                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        return required
+
+    def _activate_custom_unlocked(
+        self, plan: CompiledPlan, required: tuple[str, ...]
+    ) -> tuple[Selection, CompiledPlan]:
+        self._assert_active_lease()
+        self._reject_active_run()
+        _raw_plan, plan, _plan_sha256 = _validated_plan_data(plan)
+        self._validate_revision_snapshots()
+        if not self.paths.workflow.exists() and not self.paths.workflow.is_symlink():
+            raise StoreError("activation.draft_mismatch", "activation requires a saved workflow draft")
+        try:
+            latest = parse_workflow(
+                self._read_json(self.paths.workflow, "store.draft_invalid")
             )
-            self._audit_append("selection_activated", plan.semantic_sha256, {"selection": selected.to_payload()})
-            self._atomic_json(self.paths.selection, selected.to_payload())
-            return selected
+        except WorkflowError as exc:
+            raise StoreError("store.draft_invalid", str(exc)) from exc
+        latest_hash = document_sha256(latest)
+        revision_path = self.paths.revisions / f"{latest.semantic_revision}-{latest_hash}.json"
+        if (
+            plan.workflow_id != latest.workflow_id
+            or plan.semantic_revision != latest.semantic_revision
+            or plan.document_sha256 != latest_hash
+            or not revision_path.exists()
+            or revision_path.is_symlink()
+        ):
+            raise StoreError(
+                "activation.draft_mismatch",
+                "compiled plan does not name the latest saved behavior revision",
+            )
+        previous = self._selection_unlocked()
+        selected = Selection(
+            "custom",
+            previous.selection_revision + 1,
+            plan.workflow_id,
+            plan.semantic_revision,
+            plan.semantic_sha256,
+            required,
+            plan.semantic_sha256,
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        self._audit_append("selection_activated", plan.semantic_sha256, {"selection": selected.to_payload()})
+        self._atomic_json(self.paths.selection, selected.to_payload())
+        return selected, plan
 
     def deactivate_custom(self) -> Selection:
         with self._lock() as lease:
@@ -2402,6 +2419,31 @@ class WorkflowStore:
         self._assert_active_lease()
 
     def start_run(self, plan: CompiledPlan, run_id: str) -> RunState:
+        prepared = self._prepare_run_start(plan, run_id)
+        with self._lock():
+            return self._start_run_unlocked(prepared)
+
+    def activate_and_start_run(
+        self,
+        plan: CompiledPlan,
+        *,
+        high_risk_warning_codes: Sequence[str],
+        acknowledged_warning_codes: Sequence[str],
+        run_id: str,
+    ) -> tuple[Selection, RunState]:
+        """Activate a saved plan and start its run under one cross-process lock."""
+        required = self._activation_warning_codes(
+            high_risk_warning_codes, acknowledged_warning_codes
+        )
+        prepared = self._prepare_run_start(plan, run_id)
+        with self._lock():
+            selected, _normalized_plan = self._activate_custom_unlocked(
+                prepared[1], required
+            )
+            state = self._start_run_unlocked(prepared)
+            return selected, state
+
+    def _prepare_run_start(self, plan: CompiledPlan, run_id: str):
         normalized_run_id = _run_id(run_id, "run.invalid_id")
         raw_plan, plan, plan_sha256 = _validated_plan_data(plan)
         raw_plan = _preflight_json_output(raw_plan, "plan.invalid")
@@ -2431,27 +2473,31 @@ class WorkflowStore:
         )
         snapshot = _preflight_json_output(snapshot, "snapshot.input_too_large")
         projections = _projection_material(state, "active")
-        with self._lock():
-            run_material_exists = self.paths.run_dir.exists() or self.paths.run_dir.is_symlink()
-            if run_material_exists and not (
-                self.paths.state.exists() or self.paths.state.is_symlink()
-            ):
-                raise StoreError("run.recovery_required", "partial active-run material requires recovery")
-            if self.paths.state.exists() or self.paths.state.is_symlink():
-                material = self._validated_run_material(
-                    allow_truncated=False,
-                    require_no_suffix=True,
-                )
-                _old_plan, old_state, _seq, _hash, run_status, _events, _tail, _prefix, _witnesses = material
-                if run_status == "active":
-                    raise StoreError("run.already_active", "a custom workflow run is already active")
-                self._archive_old_run(old_state)
-            self._ensure_locked_directory(self.paths.run_dir)
-            self._atomic_json(self.paths.plan, raw_plan)
-            self._append_event(self.paths.events, event)
-            self._atomic_json(self.paths.state, snapshot)
-            self._write_projections(state, "active", prepared=projections)
-            return state
+        return raw_plan, plan, state, event, snapshot, projections
+
+    def _start_run_unlocked(self, prepared) -> RunState:
+        self._assert_active_lease()
+        raw_plan, _plan, state, event, snapshot, projections = prepared
+        run_material_exists = self.paths.run_dir.exists() or self.paths.run_dir.is_symlink()
+        if run_material_exists and not (
+            self.paths.state.exists() or self.paths.state.is_symlink()
+        ):
+            raise StoreError("run.recovery_required", "partial active-run material requires recovery")
+        if self.paths.state.exists() or self.paths.state.is_symlink():
+            material = self._validated_run_material(
+                allow_truncated=False,
+                require_no_suffix=True,
+            )
+            _old_plan, old_state, _seq, _hash, run_status, _events, _tail, _prefix, _witnesses = material
+            if run_status == "active":
+                raise StoreError("run.already_active", "a custom workflow run is already active")
+            self._archive_old_run(old_state)
+        self._ensure_locked_directory(self.paths.run_dir)
+        self._atomic_json(self.paths.plan, raw_plan)
+        self._append_event(self.paths.events, event)
+        self._atomic_json(self.paths.state, snapshot)
+        self._write_projections(state, "active", prepared=projections)
+        return state
 
     @contextmanager
     def locked_run(self) -> Iterator["WorkflowTransaction"]:

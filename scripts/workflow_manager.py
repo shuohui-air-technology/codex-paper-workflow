@@ -331,7 +331,13 @@ class WorkflowService:
         )
         return _document_data(self.store.save_draft(parsed, expected_document_revision=expected_document_revision))
 
-    def activate(self, document, *, acknowledged_warning_codes=()):
+    def activate(
+        self,
+        document,
+        *,
+        acknowledged_warning_codes=(),
+        expected_document_revision=None,
+    ):
         parsed, compiled = self._compile(document)
         if compiled.errors:
             raise WorkflowManagerError("activation.validation_blocked", "workflow has blocking validation errors")
@@ -344,11 +350,29 @@ class WorkflowService:
             if getattr(exc, "code", "") != "store.draft_missing":
                 raise
             previous = None
-        saved = self.store.save_draft(parsed, expected_document_revision=0 if previous is None else previous.document_revision)
+        if expected_document_revision is None:
+            current_revision = 0 if previous is None else previous.document_revision
+            saved = self.store.save_draft(
+                parsed, expected_document_revision=current_revision
+            )
+        else:
+            if type(expected_document_revision) is not int or expected_document_revision < 0:
+                raise StoreError("store.invalid_revision", "draft document revision is invalid")
+            if previous is None or previous.document_revision != expected_document_revision:
+                raise StoreError("store.revision_conflict", "draft document revision is stale")
+            if document_sha256(parsed) != document_sha256(previous):
+                raise StoreError(
+                    "activation.draft_mismatch",
+                    "activation must use the exact saved workflow draft",
+                )
+            saved = previous
         _, compiled = self._compile(saved)
-        selection = self.store.activate_custom(compiled.plan, high_risk_warning_codes=required,
-                                               acknowledged_warning_codes=acknowledged_warning_codes)
-        state = self.store.start_run(compiled.plan, "run-" + secrets.token_hex(16))
+        selection, state = self.store.activate_and_start_run(
+            compiled.plan,
+            high_risk_warning_codes=required,
+            acknowledged_warning_codes=acknowledged_warning_codes,
+            run_id="run-" + secrets.token_hex(16),
+        )
         return {"status": "pass", "selection": selection.to_payload(), "run_id": state.run_id}
 
     def _load(self, transaction, *, repair_selection=True):
