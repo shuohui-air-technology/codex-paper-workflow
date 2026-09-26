@@ -833,9 +833,66 @@ class ValidatorManagerTests(unittest.TestCase):
             artifacts = dict(state.artifacts)
             artifacts["paper"] = artifact
             updated = refresh_ready(plan, replace(state, artifacts=MappingProxyType(artifacts)))
-            transaction.commit_transition("artifact_registered", updated, {
-                "artifact_id": "paper", "path": "paper.md", "sha256": artifact.sha256,
-            })
+            transaction.commit_transition(
+                "artifact_registered", updated, {
+                    "artifact_ids": ["paper"],
+                    "provenance": {"paper": "Test fixture input."},
+                }
+            )
+
+    def test_service_registers_declared_input_and_replaces_changed_bytes(self):
+        document = self.document()
+        validation = self.service.validate_document(document)
+        self.assertEqual(validation["status"], "pass", validation["errors"])
+        self.service.activate(
+            document,
+            acknowledged_warning_codes=validation["required_warning_codes"],
+        )
+        first = self.service.register_artifact(
+            "paper", "paper.md", "User-selected manuscript for validation."
+        )
+        self.assertEqual(first["registration_status"], "registered")
+        self.assertEqual(first["sha256"], hashlib.sha256(self.PAPER.encode()).hexdigest())
+        events = self.service.store.read_run_events()
+        registration = next(event for event in events if event.event_type == "artifact_registered")
+        self.assertEqual(
+            registration.payload["provenance"],
+            {"paper": "User-selected manuscript for validation."},
+        )
+        count = len(events)
+        repeated = self.service.register_artifact(
+            "paper", "paper.md", "User-selected manuscript for validation."
+        )
+        self.assertEqual(repeated["registration_status"], "unchanged")
+        self.assertEqual(len(self.service.store.read_run_events()), count)
+
+        (self.project / "paper.md").write_text(self.PAPER + "\nChange.\n", encoding="utf-8")
+        replaced = self.service.register_artifact(
+            "paper", "paper.md", "Revised manuscript supplied by the user."
+        )
+        self.assertEqual(replaced["registration_status"], "registered")
+        self.assertTrue(replaced["recovered_before_registration"])
+        self.assertEqual(self.service.store.recover().status, "clean")
+
+    def test_service_registration_rejects_unsafe_and_undeclared_inputs_without_event(self):
+        document = self.document()
+        validation = self.service.validate_document(document)
+        self.service.activate(
+            document,
+            acknowledged_warning_codes=validation["required_warning_codes"],
+        )
+        before = self.service.store.paths.events.read_bytes()
+        for artifact_id, path in (
+            ("unknown", "paper.md"),
+            ("paper", "../paper.md"),
+            ("paper", "paper.md/../paper.md"),
+        ):
+            with self.subTest(artifact_id=artifact_id, path=path):
+                with self.assertRaises(Exception):
+                    self.service.register_artifact(
+                        artifact_id, path, "Selected input."
+                    )
+                self.assertEqual(self.service.store.paths.events.read_bytes(), before)
 
     def test_real_validator_pass_receipt_and_downstream_route(self):
         self.activate(with_routes=True)

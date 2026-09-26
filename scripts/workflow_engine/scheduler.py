@@ -883,6 +883,193 @@ def _predicate_mentions_any_artifact(value: object, artifact_ids: set[str]) -> b
     return False
 
 
+def register_external_artifacts_transition(
+    plan: CompiledPlan,
+    state: RunState,
+    registrations: Mapping[str, ArtifactRuntime],
+) -> RunState:
+    """Register verified external inputs and deterministically invalidate old lineage.
+
+    A newly registered artifact is just as capable of changing a condition as a
+    replacement is.  The transition therefore derives its invalidation closure
+    from both direct consumers and condition predicates that name every changed
+    logical artifact ID.
+    """
+    _validate_binding(plan, state)
+    if not isinstance(registrations, Mapping):
+        _fail("runtime.invalid_artifact_registration", "external registrations must be a mapping")
+
+    changed: dict[str, ArtifactRuntime] = {}
+    for artifact_id, artifact in registrations.items():
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(artifact, ArtifactRuntime)
+            or artifact.artifact_id != artifact_id
+            or artifact_id not in plan.external_inputs
+            or artifact.producer_node_id != "external"
+            or artifact.producer_attempt != 0
+            or artifact.state != "verified"
+        ):
+            _fail(
+                "runtime.invalid_artifact_registration",
+                "registration must name a declared, verified external input",
+            )
+        if state.artifacts.get(artifact_id) != artifact:
+            changed[artifact_id] = artifact
+
+    if not changed:
+        return state
+
+    affected: set[str] = set()
+    changed_ids = set(changed)
+    for artifact_id in changed_ids:
+        earlier = state.artifacts.get(artifact_id)
+        if earlier is not None and earlier.producer_node_id != "external":
+            affected.add(earlier.producer_node_id)
+
+    def reads_registry_input(node_id: str, artifact_ids: set[str]) -> bool:
+        return any(
+            artifact_id in plan.nodes[node_id].inputs
+            and not _producer_edges_for_input(plan, node_id, artifact_id)
+            for artifact_id in artifact_ids
+        )
+
+    for node_id, node in plan.nodes.items():
+        if reads_registry_input(node_id, changed_ids):
+            affected.add(node_id)
+        if node.type == "condition" and any(
+            _predicate_mentions_any_artifact(case, changed_ids)
+            for case in node.condition_cases
+        ):
+            affected.add(node_id)
+
+    pending = list(affected)
+    while pending:
+        current = pending.pop()
+        stale_outputs = {
+            artifact_id
+            for artifact_id, artifact in state.artifacts.items()
+            if artifact_id not in changed_ids
+            and artifact.producer_node_id == current
+            and artifact.state != "stale"
+        }
+        if stale_outputs:
+            for target, node in plan.nodes.items():
+                if target in affected:
+                    continue
+                if reads_registry_input(target, stale_outputs) or (
+                    node.type == "condition"
+                    and any(
+                        _predicate_mentions_any_artifact(case, stale_outputs)
+                        for case in node.condition_cases
+                    )
+                ):
+                    affected.add(target)
+                    pending.append(target)
+        for edge_id in plan.outgoing[current]:
+            target = plan.edges[edge_id].target
+            target_node = plan.nodes[target]
+            if (
+                target_node.type == "join"
+                and target_node.join_mode == "any_success"
+                and state.nodes[target].winner_edge_id
+                and state.nodes[target].winner_edge_id != edge_id
+            ):
+                continue
+            if target not in affected:
+                affected.add(target)
+                pending.append(target)
+
+    running = sorted(
+        node_id for node_id in affected
+        if state.nodes[node_id].status is NodeStatus.RUNNING
+    )
+    if running:
+        _fail(
+            "runtime.artifact_registration_running",
+            f"external registration cannot invalidate running work: {running[0]}",
+            node_id=running[0],
+        )
+
+    # Keep a skipped zero-attempt branch only when every inactive incoming
+    # route is still controlled by an unaffected predecessor.
+    unchanged_exclusions = {
+        node_id
+        for node_id in affected
+        if state.nodes[node_id].status is NodeStatus.SKIPPED
+        and state.nodes[node_id].attempt == 0
+        and bool(plan.incoming[node_id])
+        and all(
+            state.edges[edge_id].status is EdgeStatus.INACTIVE
+            and plan.edges[edge_id].source not in affected
+            for edge_id in plan.incoming[node_id]
+        )
+    }
+
+    nodes = dict(state.nodes)
+    edges = dict(state.edges)
+    artifacts = dict(state.artifacts)
+    artifacts.update(changed)
+
+    for node_id in affected:
+        if node_id in unchanged_exclusions:
+            continue
+        runtime = state.nodes[node_id]
+        node = plan.nodes[node_id]
+        frozen_any_success = (
+            node.type == "join"
+            and node.join_mode == "any_success"
+            and bool(runtime.winner_edge_id)
+        )
+        if runtime.status in {
+            NodeStatus.SUCCEEDED,
+            NodeStatus.FAILED,
+            NodeStatus.BLOCKED,
+            NodeStatus.STALE,
+        } or (runtime.status is NodeStatus.SKIPPED and runtime.attempt > 0) or frozen_any_success:
+            nodes[node_id] = replace(
+                runtime,
+                status=NodeStatus.STALE,
+                outcome="",
+                selected_inputs=_string_map(),
+                auxiliary_outputs=_aux_map(),
+                claim_token_hash="",
+            )
+        elif runtime.status is NodeStatus.SKIPPED:
+            nodes[node_id] = replace(
+                runtime,
+                status=NodeStatus.PENDING,
+                selected_inputs=_string_map(),
+            )
+        else:
+            nodes[node_id] = replace(
+                runtime,
+                status=NodeStatus.PENDING,
+                selected_inputs=_string_map(),
+            )
+        if node_id not in unchanged_exclusions:
+            _set_outgoing_status(plan, edges, node_id, EdgeStatus.WAITING)
+
+    # Outputs from invalidated producers are no longer current evidence.  Do
+    # not stale unrelated external inputs: they share the same synthetic
+    # producer identity but are independent registrations.
+    for artifact_id, artifact in state.artifacts.items():
+        if (
+            artifact_id not in changed_ids
+            and artifact.producer_node_id in affected
+            and artifact.state != "stale"
+        ):
+            artifacts[artifact_id] = replace(artifact, state="stale")
+
+    updated = _replace_state(
+        state,
+        nodes=nodes,
+        edges=edges,
+        artifacts=artifacts,
+    )
+    return refresh_ready(plan, updated)
+
+
 def rerun_stale_transition(
     plan: CompiledPlan,
     state: RunState,

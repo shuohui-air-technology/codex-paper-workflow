@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Mapping
 
+from .fs import hash_regular_file
+
 
 INVOCATION_SCHEMA = "node-invocation-v1"
 RESULT_SCHEMA = "node-result-v1"
@@ -293,11 +295,7 @@ def build_invocation(claim: Mapping[str, object], token: str, project_root: Path
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hash_regular_file(path)
 
 
 def resolved_identity(node) -> dict[str, object]:

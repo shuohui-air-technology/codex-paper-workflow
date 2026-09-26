@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import errno
+import hashlib
+import ntpath
 import os
 import stat
 import time
@@ -71,7 +73,421 @@ def _relative_parts(relative: str | os.PathLike[str]) -> tuple[str, ...]:
         raise PathSafetyError("absolute project paths are forbidden")
     if any(part in {"", ".", ".."} for part in posix.parts):
         raise PathSafetyError("ambiguous or traversing project path is forbidden")
+    if raw != "/".join(posix.parts):
+        raise PathSafetyError("project path must use canonical relative spelling")
     return tuple(posix.parts)
+
+
+def hash_regular_file(path: Path) -> str:
+    """Hash a stable, singly linked regular file without following a leaf link."""
+    try:
+        before = path.lstat()
+        attributes = getattr(before, "st_file_attributes", 0)
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or attributes & reparse:
+            raise PathSafetyError("artifact is not a plain regular file")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise PathSafetyError("artifact changed while opening")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            named = path.lstat()
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                (after.st_dev, after.st_ino) != identity
+                or (named.st_dev, named.st_ino) != identity
+                or after.st_nlink != 1
+                or named.st_nlink != 1
+                or not stat.S_ISREG(named.st_mode)
+                or (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise PathSafetyError("artifact changed while hashing")
+            return digest.hexdigest()
+        finally:
+            os.close(descriptor)
+    except PathSafetyError:
+        raise
+    except (OSError, NotImplementedError) as exc:
+        raise PathSafetyError("artifact cannot be hashed safely") from exc
+
+
+def _windows_path_key(path: str | os.PathLike[str]) -> str:
+    value = os.fspath(path)
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return ntpath.normcase(ntpath.normpath(value))
+
+
+def _windows_path_is_within(root: str, candidate: str) -> bool:
+    try:
+        return ntpath.commonpath((root, candidate)) == root and candidate != root
+    except ValueError:
+        return False
+
+
+def _validate_windows_project_parts(parts: tuple[str, ...]) -> None:
+    reserved = {
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+        *(f"COM{number}" for number in "¹²³"),
+        *(f"LPT{number}" for number in "¹²³"),
+    }
+    for part in parts:
+        stem = part.split(".", 1)[0].rstrip(" .").upper()
+        if (
+            not part
+            or part.endswith((".", " "))
+            or stem in reserved
+            or any(ord(char) < 32 or char in '<>:"|?*' for char in part)
+        ):
+            raise PathSafetyError("project path contains a Windows-reserved name")
+
+
+def _windows_extended_path(path: Path) -> str:
+    value = str(path)
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _hash_project_file_windows(
+    root: Path,
+    parts: tuple[str, ...],
+) -> str:
+    """Hash a Windows project file using pinned handles and final-path checks."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", wintypes.DWORD),
+            ("creation_time", FileTime),
+            ("last_access_time", FileTime),
+            ("last_write_time", FileTime),
+            ("volume_serial", wintypes.DWORD),
+            ("size_high", wintypes.DWORD),
+            ("size_low", wintypes.DWORD),
+            ("link_count", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation)]
+    get_information.restype = wintypes.BOOL
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    get_final_path.restype = wintypes.DWORD
+    get_file_type = kernel32.GetFileType
+    get_file_type.argtypes = [wintypes.HANDLE]
+    get_file_type.restype = wintypes.DWORD
+    read_file = kernel32.ReadFile
+    read_file.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+    ]
+    read_file.restype = wintypes.BOOL
+
+    invalid_handle = ctypes.c_void_p(-1).value
+    file_read_attributes = 0x0080
+    generic_read = 0x80000000
+    share_read = 0x00000001
+    share_write = 0x00000002
+    open_existing = 3
+    flag_backup_semantics = 0x02000000
+    flag_open_reparse_point = 0x00200000
+    flag_sequential_scan = 0x08000000
+    attr_directory = 0x00000010
+    attr_device = 0x00000040
+    attr_reparse_point = 0x00000400
+    file_type_disk = 1
+    _validate_windows_project_parts(parts)
+    requested_root = Path(root).expanduser().absolute()
+    root_path: Path
+    root_key: str
+    candidate: Path
+    candidate_key: str
+    handles: list[object] = []
+
+    def win_error(action: str) -> PathSafetyError:
+        code = ctypes.get_last_error()
+        return PathSafetyError(f"{action} failed safely (Windows error {code})")
+
+    def open_path(path: Path, access: int, share: int, flags: int):
+        handle = create_file(
+            _windows_extended_path(path), access, share, None,
+            open_existing, flags, None,
+        )
+        value = handle if isinstance(handle, int) else getattr(handle, "value", None)
+        if value is None or value == invalid_handle:
+            raise win_error("project file open")
+        handles.append(handle)
+        return handle
+
+    def information(handle) -> tuple[int, ...]:
+        value = ByHandleFileInformation()
+        if not get_information(handle, ctypes.byref(value)):
+            raise win_error("project file inspection")
+        filetime = lambda item: (item.high << 32) | item.low
+        return (
+            value.attributes,
+            value.link_count,
+            (value.size_high << 32) | value.size_low,
+            value.volume_serial,
+            (value.file_index_high << 32) | value.file_index_low,
+            filetime(value.creation_time),
+            filetime(value.last_write_time),
+        )
+
+    def final_path(handle) -> str:
+        needed = get_final_path(handle, None, 0, 0)
+        if not needed:
+            raise win_error("project file final-path lookup")
+        buffer = ctypes.create_unicode_buffer(needed + 1)
+        written = get_final_path(handle, buffer, len(buffer), 0)
+        if not written or written >= len(buffer):
+            raise win_error("project file final-path lookup")
+        return buffer.value
+
+    def path_from_final_path(value: str) -> Path:
+        if value.startswith("\\\\?\\UNC\\"):
+            value = "\\\\" + value[8:]
+        elif value.startswith("\\\\?\\"):
+            value = value[4:]
+        return Path(value)
+
+    def require_expected_path(actual: str, expected: str) -> None:
+        actual_key = _windows_path_key(actual)
+        if not _windows_path_is_within(root_key, actual_key) or actual_key != expected:
+            raise PathSafetyError("project file handle resolved outside its declared path")
+
+    try:
+        root_handle = open_path(
+            requested_root,
+            file_read_attributes,
+            share_read | share_write,
+            flag_backup_semantics | flag_open_reparse_point,
+        )
+        root_info = information(root_handle)
+        if not root_info[0] & attr_directory or root_info[0] & attr_reparse_point:
+            raise PathSafetyError("project root is not a plain directory")
+        root_final_path = final_path(root_handle)
+        root_path = path_from_final_path(root_final_path)
+        root_key = _windows_path_key(root_final_path)
+        if not root_path.is_absolute() or _windows_path_key(root_path) != root_key:
+            raise PathSafetyError("project root handle has an invalid final path")
+        candidate = root_path.joinpath(*parts)
+        candidate_key = _windows_path_key(candidate)
+        validated_candidate = resolve_project_path(root_path, "/".join(parts))
+        if _windows_path_key(validated_candidate) != candidate_key:
+            raise PathSafetyError("project path changed while resolving the artifact")
+
+        parent = root_path
+        for part in parts[:-1]:
+            parent = parent / part
+            expected_parent = _windows_path_key(parent)
+            parent_handle = open_path(
+                parent,
+                file_read_attributes,
+                share_read | share_write,
+                flag_backup_semantics | flag_open_reparse_point,
+            )
+            parent_info = information(parent_handle)
+            if (
+                not parent_info[0] & attr_directory
+                or parent_info[0] & attr_reparse_point
+            ):
+                raise PathSafetyError("project path contains a reparse point")
+            require_expected_path(final_path(parent_handle), expected_parent)
+
+        file_handle = open_path(
+            candidate,
+            generic_read,
+            share_read,
+            flag_open_reparse_point | flag_sequential_scan,
+        )
+        before = information(file_handle)
+        if (
+            before[0] & (attr_directory | attr_device | attr_reparse_point)
+            or before[1] != 1
+            or get_file_type(file_handle) != file_type_disk
+        ):
+            raise PathSafetyError("artifact is not a plain regular file")
+        require_expected_path(final_path(file_handle), candidate_key)
+
+        digest = hashlib.sha256()
+        buffer = ctypes.create_string_buffer(1024 * 1024)
+        while True:
+            byte_count = wintypes.DWORD()
+            if not read_file(
+                file_handle, buffer, len(buffer), ctypes.byref(byte_count), None
+            ):
+                raise win_error("project file read")
+            if not byte_count.value:
+                break
+            digest.update(buffer.raw[:byte_count.value])
+
+        after = information(file_handle)
+        if (
+            after != before
+            or _windows_path_key(final_path(file_handle)) != candidate_key
+            or _windows_path_key(final_path(root_handle)) != root_key
+        ):
+            raise PathSafetyError("artifact changed while hashing")
+        return digest.hexdigest()
+    except PathSafetyError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise PathSafetyError("artifact cannot be hashed safely") from exc
+    finally:
+        for handle in reversed(handles):
+            close_handle(handle)
+
+
+def hash_project_file(root: Path | str, relative: str | os.PathLike[str]) -> str:
+    """Hash a project file through no-follow directory descriptors.
+
+    The directory handles bind every component to the selected project root,
+    even if another process replaces a named parent while hashing.
+    """
+    parts = _relative_parts(relative)
+    if os.name == "nt":
+        return _hash_project_file_windows(Path(root), parts)
+
+    supplied_root = Path(root).expanduser()
+    try:
+        root_before = supplied_root.lstat()
+    except OSError as exc:
+        raise PathSafetyError("project root must be an existing directory") from exc
+    attributes = getattr(root_before, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISDIR(root_before.st_mode)
+        or stat.S_ISLNK(root_before.st_mode)
+        or attributes & reparse
+    ):
+        raise PathSafetyError("project root must be a plain directory")
+
+    resolved = resolve_project_path(supplied_root, relative)
+    try:
+        root_after = supplied_root.lstat()
+    except OSError as exc:
+        raise PathSafetyError("project root changed while resolving the artifact") from exc
+    root_identity = (root_before.st_dev, root_before.st_ino)
+    if (
+        (root_after.st_dev, root_after.st_ino) != root_identity
+        or not stat.S_ISDIR(root_after.st_mode)
+        or getattr(root_after, "st_file_attributes", 0) & reparse
+    ):
+        raise PathSafetyError("project root changed while resolving the artifact")
+
+    resolved_root = resolved
+    for _part in parts:
+        resolved_root = resolved_root.parent
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+    ):
+        raise PathSafetyError("platform cannot hash project artifacts with safe handles")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory = -1
+    file_descriptor = -1
+    try:
+        directory = os.open(resolved_root, directory_flags)
+        opened_root = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino) != root_identity
+        ):
+            raise PathSafetyError("project root is not a directory")
+        for part in parts[:-1]:
+            next_directory = os.open(part, directory_flags, dir_fd=directory)
+            if not stat.S_ISDIR(os.fstat(next_directory).st_mode):
+                os.close(next_directory)
+                raise PathSafetyError("artifact parent is not a directory")
+            os.close(directory)
+            directory = next_directory
+        before = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise PathSafetyError("artifact is not a plain regular file")
+        file_descriptor = os.open(parts[-1], file_flags, dir_fd=directory)
+        opened = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise PathSafetyError("artifact changed while opening")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(file_descriptor)
+        named = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+        if (
+            (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+            or after.st_nlink != 1
+            or named.st_nlink != 1
+            or not stat.S_ISREG(named.st_mode)
+            or (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+            != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise PathSafetyError("artifact changed while hashing")
+        # Confirm the path still names the same file through the root as well.
+        if resolved != resolve_project_path(supplied_root, relative):
+            raise PathSafetyError("artifact path changed while hashing")
+        final_named = resolved.lstat()
+        if (final_named.st_dev, final_named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise PathSafetyError("artifact path changed while hashing")
+        return digest.hexdigest()
+    except PathSafetyError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise PathSafetyError("artifact cannot be hashed safely") from exc
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if directory >= 0:
+            os.close(directory)
 
 
 def resolve_project_path(

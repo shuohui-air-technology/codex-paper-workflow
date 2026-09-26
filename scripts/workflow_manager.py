@@ -17,10 +17,10 @@ if __package__ in {None, ""}:
 
 from scripts.workflow_engine.catalog import discover_skills, load_validator_registry, resolve_skill_roots
 from scripts.workflow_engine.compiler import compile_workflow
-from scripts.workflow_engine.fs import PathSafetyError, resolve_project_path
+from scripts.workflow_engine.fs import PathSafetyError, hash_project_file
 from scripts.workflow_engine.receipts import (
     build_claim_evidence, build_invocation, build_stage_receipt,
-    canonical_bytes, canonical_result_sha256, parse_result, resolved_identity, sha256_file,
+    canonical_bytes, canonical_result_sha256, parse_result, resolved_identity,
 )
 from scripts.workflow_engine.scheduler import (
     ArtifactRuntime, NodeStatus, claim_transition, ready_node_ids, refresh_ready,
@@ -129,8 +129,7 @@ class WorkflowService:
     def _hash_inputs(self, evidence):
         for artifact in evidence:
             try:
-                path = resolve_project_path(self.project_root, artifact["path"])
-                current = sha256_file(path)
+                current = hash_project_file(self.project_root, artifact["path"])
             except (PathSafetyError, OSError, ValueError) as exc:
                 raise WorkflowManagerError("receipt.input_stale", "claimed input is no longer safely readable") from exc
             if current != artifact["sha256"]:
@@ -341,8 +340,14 @@ class WorkflowService:
             self._hash_inputs(claim["input_artifacts"])
             artifacts = []
             for artifact in result["artifacts"]:
-                path = resolve_project_path(self.project_root, artifact["path"])
-                artifacts.append(ArtifactRuntime(artifact["id"], artifact["path"], sha256_file(path), "verified", node_id, runtime.attempt))
+                try:
+                    output_digest = hash_project_file(self.project_root, artifact["path"])
+                except (PathSafetyError, OSError, ValueError) as exc:
+                    raise WorkflowManagerError(
+                        "receipt.output_unsafe",
+                        "result output is not a safely readable regular file",
+                    ) from exc
+                artifacts.append(ArtifactRuntime(artifact["id"], artifact["path"], output_digest, "verified", node_id, runtime.attempt))
             updated = result_transition(plan, state, {"node_id": node_id, "attempt": runtime.attempt,
                 "status": result["status"], "outcome": result["outcome"],
                 "outputs": {item["id"]: item["path"] for item in result["artifacts"]}, "artifacts": artifacts})
@@ -369,6 +374,73 @@ class WorkflowService:
             "attempts_before": dict(event.payload["attempts_before"]),
             "attempts_after": dict(event.payload["attempts_after"]),
         }
+
+    def register_artifact(self, artifact_id, path, provenance_summary):
+        """Hash and register one declared project input with recorded provenance."""
+        if (
+            not isinstance(artifact_id, str)
+            or not artifact_id
+            or not isinstance(path, str)
+            or not path
+            or not isinstance(provenance_summary, str)
+            or not provenance_summary
+            or provenance_summary != provenance_summary.strip()
+            or len(provenance_summary) > 4000
+            or any(ord(char) < 32 for char in provenance_summary)
+        ):
+            raise WorkflowManagerError(
+                "runtime.invalid_artifact_registration",
+                "artifact ID, relative path, and provenance summary are required",
+            )
+        recovered_before_registration = False
+        for attempt in range(2):
+            try:
+                with self.store.locked_run() as transaction:
+                    plan, _state = self._load(transaction)
+                    if artifact_id not in plan.external_inputs:
+                        raise WorkflowManagerError(
+                            "runtime.invalid_artifact_registration",
+                            "artifact ID is not a declared external input",
+                        )
+                    try:
+                        digest = hash_project_file(self.project_root, path)
+                    except (PathSafetyError, OSError, ValueError) as exc:
+                        raise WorkflowManagerError(
+                            "runtime.artifact_unsafe",
+                            "artifact path is not a safely readable project file",
+                        ) from exc
+                    artifact = ArtifactRuntime(
+                        artifact_id, path, digest, "verified", "external", 0
+                    )
+                    event = transaction.register_external_artifacts(
+                        {artifact_id: artifact},
+                        provenance={artifact_id: provenance_summary},
+                    )
+                    if event is not None:
+                        _, updated = transaction.load_active_run()
+                        self._stabilize(transaction, plan, updated)
+                    return {
+                        "status": "pass",
+                        "registration_status": "unchanged" if event is None else "registered",
+                        "artifact_id": artifact_id,
+                        "path": path,
+                        "sha256": digest,
+                        "event_seq": None if event is None else event.event_seq,
+                        "recovered_before_registration": recovered_before_registration,
+                    }
+            except StoreError as exc:
+                if exc.code != "recovery.required" or attempt != 0:
+                    raise
+                recovery = self.store.recover()
+                if recovery.status not in {"clean", "recovered"}:
+                    raise WorkflowManagerError(
+                        "runtime.recovery_required",
+                        "existing artifact changes need recovery before registration",
+                    ) from exc
+                recovered_before_registration = True
+        raise WorkflowManagerError(
+            "runtime.recovery_required", "artifact registration could not load an active run"
+        )
 
     def retry(self, node_id):
         """Retry one failed/interrupted executable node without advancing its attempt."""

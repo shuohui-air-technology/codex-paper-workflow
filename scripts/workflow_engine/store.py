@@ -33,6 +33,7 @@ from .fs import (
     append_event,
     atomic_write_json,
     ensure_project_directory,
+    hash_project_file,
     resolve_project_path,
 )
 from .scheduler import (
@@ -52,6 +53,7 @@ from .scheduler import (
     result_transition,
     rerun_stale_transition,
     claim_transition,
+    register_external_artifacts_transition,
     retry_transition,
     validator_claim_transition,
     validator_result_transition,
@@ -92,6 +94,18 @@ _EVENT_FIELDS = frozenset(
         "event_hash",
     }
 )
+
+
+def _changed_external_registration_ids(
+    previous: RunState,
+    current: RunState,
+) -> list[str]:
+    return sorted(
+        artifact_id
+        for artifact_id, artifact in current.artifacts.items()
+        if artifact.producer_node_id == _EXTERNAL_PRODUCER
+        and previous.artifacts.get(artifact_id) != artifact
+    )
 _SELECTION_FIELDS = frozenset(
     {
         "mode",
@@ -2589,7 +2603,7 @@ class WorkflowStore:
         validate_node_evidence_delta(plan, previous_state, state, event.event_type, event.payload, prior_events, witnesses)
         self._validate_drift_transition(plan, previous_state, state, event.event_type, event.payload, witnesses, prior_events)
         self._validate_artifact_source_transition(
-            plan, previous_state, state, event.event_type
+            plan, previous_state, state, event.event_type, event.payload
         )
         next_witnesses = _edge_witnesses_after_step(
             plan, previous_state, state, witnesses
@@ -2715,22 +2729,13 @@ class WorkflowStore:
         self._atomic_bytes(self.paths.events, prefix)
         return target
 
-    @staticmethod
-    def _hash_file(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
     def _artifact_drift_ids(self, state: RunState) -> tuple[str, ...]:
         drifted: list[str] = []
         for artifact_id, artifact in sorted(state.artifacts.items()):
             if artifact.state != "verified":
                 continue
             try:
-                path = resolve_project_path(self.project_root, artifact.path)
-                if not path.is_file() or self._hash_file(path) != artifact.sha256:
+                if hash_project_file(self.project_root, artifact.path) != artifact.sha256:
                     drifted.append(artifact_id)
             except (OSError, PathSafetyError):
                 drifted.append(artifact_id)
@@ -2741,8 +2746,7 @@ class WorkflowStore:
         for edge_proofs in witnesses.values():
             for proof in edge_proofs.values():
                 try:
-                    path = resolve_project_path(self.project_root, proof.path)
-                    if not path.is_file() or self._hash_file(path) != proof.sha256:
+                    if hash_project_file(self.project_root, proof.path) != proof.sha256:
                         drifted.add(proof.producer_node_id)
                 except (OSError, PathSafetyError):
                     drifted.add(proof.producer_node_id)
@@ -2765,8 +2769,7 @@ class WorkflowStore:
         for receipt in self._current_success_receipts(state, events):
             for artifact in (*receipt["input_artifacts"], *receipt["output_artifacts"]):
                 try:
-                    path = resolve_project_path(self.project_root, artifact["path"])
-                    if not path.is_file() or self._hash_file(path) != artifact["sha256"]:
+                    if hash_project_file(self.project_root, artifact["path"]) != artifact["sha256"]:
                         drifted.add(receipt["node_id"])
                 except (OSError, PathSafetyError):
                     drifted.add(receipt["node_id"])
@@ -2805,10 +2808,57 @@ class WorkflowStore:
         previous: RunState | None,
         current: RunState,
         event_type: str,
+        payload: Mapping[str, object],
     ) -> None:
         if previous is None:
             return
-        authorized_invalidation: set[str] = set()
+        if event_type == "artifact_registered":
+            changed_ids = _changed_external_registration_ids(previous, current)
+            fields = {
+                key: value for key, value in payload.items()
+                if key not in {"state", "run_status"}
+            }
+            provenance = fields.get("provenance")
+            if (
+                set(fields) != {"artifact_ids", "provenance"}
+                or _canonical_bytes(fields["artifact_ids"]) != _canonical_bytes(changed_ids)
+                or not isinstance(provenance, Mapping)
+                or set(provenance) != set(changed_ids)
+                or any(
+                    not isinstance(summary, str)
+                    or not summary
+                    or summary != summary.strip()
+                    or len(summary) > 4000
+                    or any(ord(char) < 32 for char in summary)
+                    for summary in provenance.values()
+                )
+            ):
+                raise StoreError(
+                    "artifact.authority_invalid",
+                    "registration event must name changed IDs and their provenance",
+                )
+            registrations: dict[str, ArtifactRuntime] = {}
+            for artifact_id in changed_ids:
+                artifact = current.artifacts.get(artifact_id)
+                if artifact is None:
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"artifact provenance cannot be removed: {artifact_id}",
+                    )
+                registrations[artifact_id] = artifact
+            try:
+                expected = register_external_artifacts_transition(
+                    plan, previous, registrations
+                )
+            except WorkflowError as exc:
+                raise StoreError("artifact.authority_invalid", str(exc)) from exc
+            if _state_data(expected) != _state_data(current):
+                raise StoreError(
+                    "artifact.authority_invalid",
+                    "registration state differs from the deterministic lineage transition",
+                )
+            return
+
         for artifact_id, earlier in previous.artifacts.items():
             replacement = current.artifacts.get(artifact_id)
             if replacement is None:
@@ -2816,193 +2866,32 @@ class WorkflowStore:
                     "artifact.authority_invalid",
                     f"artifact provenance cannot be removed: {artifact_id}",
                 )
-            if replacement.producer_node_id != _EXTERNAL_PRODUCER:
-                continue
-            if earlier == replacement:
-                continue
             if (
-                earlier.producer_node_id == _EXTERNAL_PRODUCER
-                and earlier.path == replacement.path
-                and earlier.sha256 == replacement.sha256
-                and replacement.state == "stale"
-                and event_type == "artifacts_marked_stale"
+                replacement.producer_node_id == _EXTERNAL_PRODUCER
+                and replacement != earlier
             ):
-                continue
-            if event_type != "artifact_registered" or replacement.state != "verified":
+                stale_invalidation = (
+                    event_type == "artifacts_marked_stale"
+                    and earlier.producer_node_id == _EXTERNAL_PRODUCER
+                    and replacement.producer_node_id == _EXTERNAL_PRODUCER
+                    and replacement.path == earlier.path
+                    and replacement.sha256 == earlier.sha256
+                    and replacement.state == "stale"
+                )
+                if not stale_invalidation:
+                    raise StoreError(
+                        "artifact.authority_invalid",
+                        f"changed external artifact needs explicit re-registration: {artifact_id}",
+                    )
+        for artifact_id, artifact in current.artifacts.items():
+            if (
+                artifact_id not in previous.artifacts
+                and artifact.producer_node_id == _EXTERNAL_PRODUCER
+            ):
                 raise StoreError(
                     "artifact.authority_invalid",
-                    f"changed external artifact needs explicit re-registration: {artifact_id}",
+                    f"new external artifact needs explicit registration: {artifact_id}",
                 )
-
-            affected = set()
-            if earlier.producer_node_id != _EXTERNAL_PRODUCER:
-                affected.add(earlier.producer_node_id)
-            for node_id, node in plan.nodes.items():
-                if artifact_id in node.inputs or any(
-                    self._predicate_mentions_artifact(case, artifact_id)
-                    for case in node.condition_cases
-                ):
-                    affected.add(node_id)
-            pending = list(affected)
-            while pending:
-                for edge_id in plan.outgoing[pending.pop()]:
-                    target = plan.edges[edge_id].target
-                    target_node = plan.nodes[target]
-                    if (
-                        target_node.type == "join"
-                        and target_node.join_mode == "any_success"
-                        and previous.nodes[target].winner_edge_id
-                        and previous.nodes[target].winner_edge_id != edge_id
-                    ):
-                        continue
-                    if target not in affected:
-                        affected.add(target)
-                        pending.append(target)
-            authorized_invalidation.update(affected)
-            independently_ready = dict(current.nodes)
-            for node_id in affected:
-                runtime = independently_ready[node_id]
-                if runtime.status is NodeStatus.READY:
-                    independently_ready[node_id] = replace(
-                        runtime, selected_inputs=MappingProxyType({})
-                    )
-            refreshed: RunState | None = None
-            for node_id in affected:
-                before = previous.nodes[node_id]
-                after = current.nodes[node_id]
-                if before.status is NodeStatus.RUNNING or after.status is NodeStatus.RUNNING:
-                    raise StoreError(
-                        "artifact.authority_invalid",
-                        f"external re-registration cannot continue running work: {node_id}",
-                    )
-                unattempted_exclusion = (
-                    before.status is NodeStatus.SKIPPED
-                    and before.attempt == 0
-                    and not before.outcome
-                    and not before.claim_token_hash
-                    and not before.selected_inputs
-                    and not before.outputs
-                    and not before.auxiliary_outputs
-                    and bool(plan.incoming[node_id])
-                )
-                unchanged_exclusion = unattempted_exclusion and all(
-                    previous.edges[edge_id] == current.edges[edge_id]
-                    and current.edges[edge_id].status is EdgeStatus.INACTIVE
-                    and previous.nodes[plan.edges[edge_id].source]
-                    == current.nodes[plan.edges[edge_id].source]
-                    for edge_id in plan.incoming[node_id]
-                )
-                if unattempted_exclusion:
-                    valid_status = (
-                        after == before if unchanged_exclusion
-                        else after == replace(before, status=NodeStatus.PENDING)
-                    )
-                elif before.status in {NodeStatus.SUCCEEDED, NodeStatus.SKIPPED, NodeStatus.STALE}:
-                    valid_status = after.status is NodeStatus.STALE
-                elif before.status in {NodeStatus.PENDING, NodeStatus.READY}:
-                    valid_status = after.status in {NodeStatus.PENDING, NodeStatus.READY} or (
-                        before.status is NodeStatus.READY
-                        and plan.nodes[node_id].type == "join"
-                        and plan.nodes[node_id].join_mode == "any_success"
-                        and bool(before.winner_edge_id)
-                        and after.status is NodeStatus.STALE
-                    )
-                else:
-                    valid_status = after.status in {before.status, NodeStatus.STALE}
-                if not valid_status:
-                    raise StoreError(
-                        "artifact.authority_invalid",
-                        f"external re-registration must invalidate completed evidence: {node_id}",
-                    )
-                if after.status is NodeStatus.STALE and plan.nodes[node_id].type in {"condition", "join"}:
-                    if (
-                        after.attempt != before.attempt
-                        or after.outcome
-                        or after.selected_inputs
-                        or after.auxiliary_outputs
-                        or after.claim_token_hash
-                        or after.outputs != before.outputs
-                        or after.winner_edge_id != before.winner_edge_id
-                    ):
-                        raise StoreError(
-                            "artifact.authority_invalid",
-                            f"stale control node retains or rewrites live decision evidence: {node_id}",
-                        )
-                for edge_id in plan.outgoing[node_id]:
-                    edge = current.edges[edge_id]
-                    if unchanged_exclusion:
-                        valid_edge = (
-                            edge == previous.edges[edge_id]
-                            and edge.status is EdgeStatus.INACTIVE
-                            and not edge.selected_output_map
-                        )
-                    else:
-                        valid_edge = edge.status is EdgeStatus.WAITING and not edge.selected_output_map
-                    if not valid_edge:
-                        raise StoreError(
-                            "artifact.authority_invalid",
-                            f"external re-registration must reset old output route: {edge_id}",
-                        )
-                if after.status is NodeStatus.PENDING and after.selected_inputs:
-                    raise StoreError(
-                        "artifact.authority_invalid",
-                        f"pending work retains superseded inputs: {node_id}",
-                    )
-                if after.status is NodeStatus.READY:
-                    if refreshed is None:
-                        refreshed = refresh_ready(
-                            plan, replace(
-                                current, nodes=MappingProxyType(independently_ready)
-                            )
-                        )
-                    expected = refreshed.nodes[node_id]
-                    if (
-                        expected.status is not NodeStatus.READY
-                        or expected.selected_inputs != after.selected_inputs
-                    ):
-                        raise StoreError(
-                            "artifact.authority_invalid",
-                            f"ready work retains superseded inputs: {node_id}",
-                        )
-                if after.status in {NodeStatus.FAILED, NodeStatus.BLOCKED} and after.selected_inputs:
-                    raise StoreError(
-                        "artifact.authority_invalid",
-                        f"unfinished work retains superseded inputs: {node_id}",
-                    )
-            for sibling_id, sibling in previous.artifacts.items():
-                if sibling_id == artifact_id:
-                    continue
-                present_sibling = current.artifacts.get(sibling_id)
-                if (
-                    (sibling.producer_node_id, sibling.producer_attempt)
-                    == (earlier.producer_node_id, earlier.producer_attempt)
-                    or sibling.producer_node_id in affected
-                ) and (present_sibling is None or present_sibling.state != "stale"):
-                    raise StoreError(
-                        "artifact.authority_invalid",
-                        f"external re-registration must stale related evidence: {sibling_id}",
-                    )
-        if event_type == "artifact_registered":
-            for node_id, runtime in current.nodes.items():
-                if (
-                    runtime.status is NodeStatus.STALE
-                    and previous.nodes[node_id].status is not NodeStatus.STALE
-                    and node_id not in authorized_invalidation
-                ):
-                    raise StoreError(
-                        "artifact.authority_invalid",
-                        f"registration staled an unrelated source: {node_id}",
-                    )
-            for edge_id, runtime in current.edges.items():
-                if (
-                    previous.edges[edge_id].status is EdgeStatus.SATISFIED
-                    and runtime.status is not EdgeStatus.SATISFIED
-                    and plan.edges[edge_id].source not in authorized_invalidation
-                ):
-                    raise StoreError(
-                        "artifact.authority_invalid",
-                        f"registration removed an unrelated route: {edge_id}",
-                    )
 
     def _validate_drift_transition(self, plan, before, after, event_type, payload, witnesses, events):
         if event_type != "artifacts_marked_stale":
@@ -3405,6 +3294,14 @@ class WorkflowTransaction:
         current = loaded_current if previous_state is None else previous_state
         self._validate_binding(plan, updated_state)
         state_data, updated_state = _validated_state_data(updated_state)
+        payload = dict(payload)
+        if event_type == "artifact_registered" and current is not None and not payload:
+            changed_ids = _changed_external_registration_ids(current, updated_state)
+            payload["artifact_ids"] = changed_ids
+            payload["provenance"] = {
+                artifact_id: "Registered project input."
+                for artifact_id in changed_ids
+            }
         witnesses_before = self._witnesses if witnesses is None else witnesses
         # Recovery must first persist that an in-flight attempt became
         # uncertain, even when the bytes proving its inputs have just drifted.
@@ -3431,7 +3328,7 @@ class WorkflowTransaction:
                 and self.store._current_receipt_drift_nodes(updated_state, self._events)):
             raise StoreError("artifact.verification_failed", "current attempt receipt bytes have changed")
         self.store._validate_artifact_source_transition(
-            plan, current, updated_state, event_type
+            plan, current, updated_state, event_type, payload
         )
         next_witnesses = _edge_witnesses_after_step(
             plan,
@@ -3538,6 +3435,32 @@ class WorkflowTransaction:
         payload: Mapping[str, object] | None = None,
     ) -> WorkflowEvent:
         return self._commit_event(event_type, updated_state, {} if payload is None else payload)
+
+    def register_external_artifacts(
+        self,
+        registrations: Mapping[str, ArtifactRuntime],
+        *,
+        provenance: Mapping[str, str] | None = None,
+    ) -> WorkflowEvent | None:
+        """Register verified inputs through the deterministic invalidation transition."""
+        plan, state = self._require_loaded()
+        try:
+            updated = register_external_artifacts_transition(plan, state, registrations)
+        except WorkflowError as exc:
+            raise StoreError(exc.code, str(exc)) from exc
+        artifact_ids = _changed_external_registration_ids(state, updated)
+        if not artifact_ids:
+            self.store._require_verified_artifact_bytes(state)
+            self.store._require_artifact_paths_contained(state)
+            return None
+        summaries = {
+            artifact_id: "Registered project input."
+            for artifact_id in artifact_ids
+        } if provenance is None else dict(provenance)
+        return self._commit_event(
+            "artifact_registered", updated,
+            {"artifact_ids": artifact_ids, "provenance": summaries},
+        )
 
     def request_stale_rerun(self, node_id: str) -> WorkflowEvent:
         """Persist the explicit stale-rerun transition without claiming work."""
