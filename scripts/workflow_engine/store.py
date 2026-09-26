@@ -2909,7 +2909,7 @@ class WorkflowStore:
             updated = mark_descendants_stale(plan, updated, tuple(sorted(direct)))
         return updated
 
-    def recover(self) -> RecoveryResult:
+    def recover(self, *, expected_claim: tuple[str, str, str, int, str] | None = None) -> RecoveryResult:
         with self._lock() as lease:
             archived: Path | None = None
             changed = False
@@ -2986,6 +2986,27 @@ class WorkflowStore:
                 return RecoveryResult("blocked", exc.code, state)
             if state is None:
                 return RecoveryResult("blocked", "recovery.incomplete_run")
+
+            # A caller resolving one in-flight execution may bind recovery to
+            # that exact claim. Check under the same lock as replay and repair
+            # so a stopped/replaced run or retried attempt is never recovered
+            # as a side effect of a late subprocess return.
+            if expected_claim is not None:
+                if (not isinstance(expected_claim, tuple) or len(expected_claim) != 5
+                        or not isinstance(expected_claim[0], str)
+                        or not isinstance(expected_claim[1], str)
+                        or not isinstance(expected_claim[2], str)
+                        or type(expected_claim[3]) is not int
+                        or not isinstance(expected_claim[4], str)):
+                    raise StoreError("recovery.invalid_target", "expected recovery claim is invalid")
+                expected_run_id, expected_semantic, expected_node_id, expected_attempt, expected_token_hash = expected_claim
+                runtime = state.nodes.get(expected_node_id)
+                if (state.run_id != expected_run_id or state.semantic_sha256 != expected_semantic
+                        or run_status != "active" or runtime is None
+                        or runtime.status is not NodeStatus.RUNNING
+                        or runtime.attempt != expected_attempt
+                        or runtime.claim_token_hash != expected_token_hash):
+                    return RecoveryResult("clean", "recovery.target_superseded", state)
             replayed = bool(suffix)
 
             try:

@@ -156,9 +156,11 @@ class WorkflowService:
             "code": "validator.invalid_result", "message": "Validator returned an invalid internal result.",
         }
 
-    def _recover_validator_drift(self):
+    def _recover_validator_drift(self, run_id, semantic_sha256, node_id, attempt, token_hash):
         """Let store recovery classify an in-flight attempt after evidence drift."""
-        recovery = self.store.recover()
+        recovery = self.store.recover(expected_claim=(run_id, semantic_sha256, node_id, attempt, token_hash))
+        if recovery.code == "recovery.target_superseded":
+            raise WorkflowManagerError("receipt.stale_attempt", "validator result belongs to a superseded attempt")
         if recovery.status == "blocked":
             message = "Validator evidence changed while it was running; recovery blocked the run."
         else:
@@ -234,6 +236,12 @@ class WorkflowService:
                     raise WorkflowManagerError("receipt.stale_attempt", "frozen validator claim changed")
                 self._identity(plan.nodes[node_id])
                 self._hash_inputs(claim["input_artifacts"])
+                if adapter_error is not None and adapter_error.code in {
+                    "validator.input_changed", "validator.identity_changed", "validator.unsafe_path",
+                }:
+                    # Once the adapter observed evidence drift, a later
+                    # recheck cannot prove what the process saw in between.
+                    raise WorkflowManagerError(adapter_error.code, str(adapter_error))
                 if adapter_error is not None:
                     # Identity and input checks above distinguish evidence drift
                     # from a bounded adapter/launch failure.
@@ -262,11 +270,13 @@ class WorkflowService:
                 return receipt
         except StoreError as exc:
             if exc.code in {"recovery.required", "artifact.verification_failed", "path.unsafe"}:
-                self._recover_validator_drift()
+                self._recover_validator_drift(frozen_run_id, frozen_semantic, node_id,
+                                              frozen_attempt, hashlib.sha256(token.encode("utf-8")).hexdigest())
             raise
         except WorkflowManagerError as exc:
             if exc.code in {"receipt.input_stale", "validator.input_changed", "validator.unsafe_path", "validator.identity_changed"}:
-                self._recover_validator_drift()
+                self._recover_validator_drift(frozen_run_id, frozen_semantic, node_id,
+                                              frozen_attempt, hashlib.sha256(token.encode("utf-8")).hexdigest())
             raise
 
     def _stabilize(self, transaction, plan, state):

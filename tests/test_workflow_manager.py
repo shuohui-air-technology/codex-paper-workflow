@@ -853,6 +853,45 @@ class ValidatorManagerTests(unittest.TestCase):
         self.assertNotIn("validator_result_recorded", event_types)
         self.assertIn(self.service.store.recover().status, {"clean", "recovered"})
 
+    def test_transient_observed_input_drift_recovers_even_after_bytes_return(self):
+        from scripts.workflow_engine.validators import ValidatorError
+        self.activate()
+        original = (self.project / "paper.md").read_bytes()
+
+        def transient_change(node, inputs, project_root, repository_root):
+            (self.project / "paper.md").write_bytes(b"temporary replacement")
+            (self.project / "paper.md").write_bytes(original)
+            raise ValidatorError("validator.input_changed", "Validator input changed during prelaunch checks.")
+
+        with mock.patch("scripts.workflow_manager.run_registered_validator", side_effect=transient_change):
+            with self.assertRaises(Exception) as caught:
+                self.service.run_validator("check")
+        self.assertEqual(caught.exception.code, "runtime.recovery_required")
+        events = self.service.store.read_run_events()
+        self.assertNotIn("validator_result_recorded", [event.event_type for event in events])
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+            self.assertEqual(state.nodes["check"].status.value, "blocked")
+
+    def test_drift_recovery_does_not_touch_a_run_deactivated_before_recovery(self):
+        from scripts.workflow_engine.validators import ValidatorError
+        self.activate()
+        original_recover = self.service.store.recover
+        events_after_deactivate = []
+
+        def deactivate_before_recover(*, expected_claim=None):
+            self.service.store.deactivate_custom()
+            events_after_deactivate.append(self.service.store.paths.events.read_bytes())
+            return original_recover(expected_claim=expected_claim)
+
+        with mock.patch("scripts.workflow_manager.run_registered_validator",
+                        side_effect=ValidatorError("validator.input_changed", "Validator input changed.")):
+            with mock.patch.object(self.service.store, "recover", side_effect=deactivate_before_recover):
+                with self.assertRaises(Exception) as caught:
+                    self.service.run_validator("check")
+        self.assertEqual(caught.exception.code, "receipt.stale_attempt")
+        self.assertEqual(self.service.store.paths.events.read_bytes(), events_after_deactivate[0])
+
     def test_superseded_attempt_result_is_rejected_without_another_write(self):
         from scripts.workflow_engine.scheduler import validator_retry_transition
         from scripts.workflow_engine.validators import ValidatorResult
