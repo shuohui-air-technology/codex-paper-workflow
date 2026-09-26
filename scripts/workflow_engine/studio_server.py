@@ -258,10 +258,12 @@ def _ROOTS(roots):
 def _safe_metadata(skill_file: Path) -> tuple[str, str]:
     """Read only bounded, plain-text name/description fields from frontmatter."""
     try:
-        raw = skill_file.read_text(encoding="utf-8")
+        with skill_file.open("rb") as source:
+            raw = source.read(256 * 1024)
+        text = raw.decode("utf-8")
     except (OSError, UnicodeError):
         return "", ""
-    lines = raw.splitlines()[:80]
+    lines = text.splitlines()[:80]
     if not lines or lines[0] != "---":
         return "", ""
     try:

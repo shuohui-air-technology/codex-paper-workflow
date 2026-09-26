@@ -381,7 +381,16 @@ def refresh_ready(plan: CompiledPlan, state: RunState) -> RunState:
                     selected, inputs_ready = _join_inputs(plan, snapshot, node_id)
                 else:
                     selected, inputs_ready = _resolve_node_inputs(plan, snapshot, node_id)
-                next_status = NodeStatus.READY if inputs_ready else NodeStatus.PENDING
+                if inputs_ready:
+                    next_status = NodeStatus.READY
+                elif node.type == "join":
+                    # Every potentially active incoming edge is terminal here. A
+                    # missing or conflicting output can no longer be resolved by
+                    # waiting, so make the join failure durable instead of leaving
+                    # it pending forever.
+                    next_status = NodeStatus.BLOCKED
+                else:
+                    next_status = NodeStatus.PENDING
 
             updated = replace(
                 runtime,
@@ -752,6 +761,49 @@ def validator_result_transition(
     return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges))
 
 
+def _retry_descendants(plan: CompiledPlan, state: RunState, node_id: str) -> set[str]:
+    descendants: set[str] = set()
+    pending = [node_id]
+    while pending:
+        current = pending.pop()
+        for edge_id in plan.outgoing[current]:
+            edge = plan.edges[edge_id]
+            target = plan.nodes[edge.target]
+            if (
+                target.type == "join"
+                and target.join_mode == "any_success"
+                and state.nodes[target.id].winner_edge_id
+                and state.nodes[target.id].winner_edge_id != edge_id
+            ):
+                continue
+            if edge.target not in descendants:
+                descendants.add(edge.target)
+                pending.append(edge.target)
+    return descendants
+
+
+def _assert_retry_descendants_unstarted(
+    plan: CompiledPlan, state: RunState, node_id: str, descendants: set[str]
+) -> None:
+    started = sorted(
+        current
+        for current in descendants
+        if state.nodes[current].attempt > 0
+        or state.nodes[current].status in {
+            NodeStatus.RUNNING,
+            NodeStatus.SUCCEEDED,
+            NodeStatus.FAILED,
+            NodeStatus.STALE,
+        }
+    )
+    if started:
+        _fail(
+            "runtime.retry_descendant_started",
+            f"cannot retry while affected descendant work has started: {started[0]}",
+            node_id=node_id,
+        )
+
+
 def retry_transition(plan: CompiledPlan, state: RunState, node_id: str) -> RunState:
     _validate_binding(plan, state)
     if node_id not in plan.nodes:
@@ -759,8 +811,19 @@ def retry_transition(plan: CompiledPlan, state: RunState, node_id: str) -> RunSt
     if plan.nodes[node_id].type != "task":
         _fail("runtime.node_type", "only task nodes may be retried", node_id=node_id)
     runtime = state.nodes[node_id]
-    if runtime.status not in {NodeStatus.FAILED, NodeStatus.BLOCKED}:
-        _fail("runtime.invalid_retry", "only failed or blocked nodes may be retried", node_id=node_id)
+    skipped_attempt = (
+        runtime.status is NodeStatus.SKIPPED
+        and runtime.attempt > 0
+        and plan.nodes[node_id].failure_policy == "skip_branch"
+    )
+    if runtime.status not in {NodeStatus.FAILED, NodeStatus.BLOCKED} and not skipped_attempt:
+        _fail(
+            "runtime.invalid_retry",
+            "only failed, blocked, or attempted skip_branch nodes may be retried",
+            node_id=node_id,
+        )
+    descendants = _retry_descendants(plan, state, node_id)
+    _assert_retry_descendants_unstarted(plan, state, node_id, descendants)
     nodes = dict(state.nodes)
     edges = dict(state.edges)
     nodes[node_id] = replace(
@@ -771,21 +834,17 @@ def retry_transition(plan: CompiledPlan, state: RunState, node_id: str) -> RunSt
         outputs=_string_map(),
         auxiliary_outputs=_aux_map(),
     )
-    pending = [node_id]
-    descendants: set[str] = set()
-    while pending:
-        current = pending.pop()
-        for edge_id in plan.outgoing[current]:
-            target = plan.edges[edge_id].target
-            if target not in descendants:
-                descendants.add(target)
-                pending.append(target)
+    revived = {node_id}
     for current in descendants:
-        if nodes[current].status is NodeStatus.BLOCKED:
+        if (
+            nodes[current].attempt == 0
+            and nodes[current].status in {NodeStatus.BLOCKED, NodeStatus.SKIPPED}
+        ):
             nodes[current] = replace(nodes[current], status=NodeStatus.PENDING)
-    for current in {node_id, *descendants}:
+            revived.add(current)
+    for current in revived:
         for edge_id in plan.outgoing[current]:
-            if edges[edge_id].status is EdgeStatus.FAILED:
+            if edges[edge_id].status in {EdgeStatus.FAILED, EdgeStatus.INACTIVE}:
                 edges[edge_id] = EdgeRuntime(EdgeStatus.WAITING)
     return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges))
 
@@ -801,19 +860,12 @@ def validator_retry_transition(plan: CompiledPlan, state: RunState, node_id: str
     if (runtime.status not in {NodeStatus.FAILED, NodeStatus.BLOCKED}
             or runtime.attempt < 1 or not runtime.claim_token_hash):
         _fail("runtime.invalid_retry", "only failed or interrupted validators may be retried", node_id=node_id)
+    descendants = _retry_descendants(plan, state, node_id)
+    _assert_retry_descendants_unstarted(plan, state, node_id, descendants)
     nodes = dict(state.nodes)
     edges = dict(state.edges)
     nodes[node_id] = replace(runtime, status=NodeStatus.PENDING, outcome="", claim_token_hash="",
                              outputs=_string_map(), auxiliary_outputs=_aux_map())
-    pending = [node_id]
-    descendants: set[str] = set()
-    while pending:
-        current = pending.pop()
-        for edge_id in plan.outgoing[current]:
-            target = plan.edges[edge_id].target
-            if target not in descendants:
-                descendants.add(target)
-                pending.append(target)
     revived = {node_id}
     for current in descendants:
         if (nodes[current].attempt == 0

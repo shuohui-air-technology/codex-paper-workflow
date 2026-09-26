@@ -381,8 +381,14 @@ are blocked until a separately reviewed trusted execution protocol exists.
 - Uses `block` as the default failure policy.
 - May use `skip_branch` only when the user selects that policy explicitly. A
   skipped task deactivates all of its outgoing edges for that run; it does not
-  report a successful outcome.
-- A manual retry creates a new attempt for the same node and run.
+  report a successful outcome. If the task itself was attempted and failed,
+  it may be retried manually while no affected descendant work has started; a task
+  merely skipped because an upstream path was inactive is not retryable. If a
+  dependent descendant has started or completed, retry is rejected to preserve
+  the dependencies that were satisfied when the descendant ran. Work behind a
+  different frozen `any_success` winner is not affected by this retry.
+- A manual retry creates a new attempt for the same node and run, reopening
+  descendants that were skipped or blocked without having started an attempt.
 
 ### 9.2 Condition node
 
@@ -412,6 +418,9 @@ The first release supports:
   results and do not replace the chosen join output.
 
 `all_active` is the default because its result is more deterministic.
+If every active incoming edge is terminal but the join's declared outputs are
+missing or map to conflicting artifact paths, the join becomes `blocked`; it
+does not remain pending indefinitely.
 
 ### 9.4 Validator node
 

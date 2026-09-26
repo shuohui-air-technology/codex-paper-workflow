@@ -596,7 +596,7 @@ export function App({ api: providedApi }: AppProps) {
             <ValidationPanel
               errors={errors}
               warnings={warnings}
-              projectionNotes={projectionNotes}
+              projectionNotes={workflow.derived_from ? projectionNotes : []}
               lastValidated={lastValidation !== null}
               busy={busy}
               advisoryHints={advisoryHints}

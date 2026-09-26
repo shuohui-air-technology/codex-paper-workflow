@@ -4,6 +4,7 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from scripts.workflow_engine.catalog import (
     CatalogError,
@@ -120,6 +121,80 @@ class WorkflowCatalogTests(unittest.TestCase):
                 "981e23293ea9f9e34ac5ee486967146f399e8387a2ba60837d7d302590b57820",
             )
             self.assertFalse(result.warnings)
+
+    def test_tree_digest_streams_without_changing_the_installer_hash(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "streamed")
+            expected = "sha256:" + hashlib.sha256(
+                b"SKILL.md\0" + skill.joinpath("SKILL.md").read_bytes() + b"\0"
+            ).hexdigest()
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded read")):
+                self.assertEqual(tree_sha256(skill), expected)
+
+    def test_tree_digest_rejects_a_skill_file_over_the_resource_limit(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "oversized")
+            with mock.patch("scripts.workflow_engine.catalog._MAX_SKILL_FILE_BYTES", 32):
+                with self.assertRaises(CatalogError) as caught:
+                    tree_sha256(skill)
+            self.assertEqual(caught.exception.code, "catalog.file_too_large")
+
+    def test_discovery_rejects_large_skill_markdown_before_hashing_its_body(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "oversized-markdown", "x" * 500_000)
+            with (
+                mock.patch("scripts.workflow_engine.catalog._MAX_SKILL_FILE_BYTES", 32),
+                mock.patch("scripts.workflow_engine.catalog._HASH_CHUNK_BYTES", 8),
+            ):
+                result = discover_skills((root,), install_receipts={})
+            self.assertNotIn("oversized-markdown", result.skills)
+            self.assertEqual(result.errors[0].code, "catalog.file_too_large")
+
+    def test_discovery_preflights_tree_limits_before_bulk_content_hashing(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "oversized-tree")
+            skill.joinpath("large.dat").write_bytes(b"x" * 64)
+            with (
+                mock.patch("scripts.workflow_engine.catalog._frontmatter_name", return_value="oversized-tree"),
+                mock.patch("scripts.workflow_engine.catalog._MAX_SKILL_TREE_BYTES", 32),
+                mock.patch.object(Path, "open", side_effect=AssertionError("bulk body read before preflight")),
+            ):
+                result = discover_skills((root,), install_receipts={})
+            self.assertNotIn("oversized-tree", result.skills)
+            self.assertEqual(result.errors[0].code, "catalog.tree_too_large")
+
+    def test_discovery_rejects_unbounded_skill_entry_count(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "many-files")
+            skill.joinpath("one.txt").write_text("one", encoding="utf-8")
+            skill.joinpath("two.txt").write_text("two", encoding="utf-8")
+            with mock.patch("scripts.workflow_engine.catalog._MAX_SKILL_TREE_ENTRIES", 2):
+                result = discover_skills((root,), install_receipts={})
+            self.assertNotIn("many-files", result.skills)
+            self.assertEqual(result.errors[0].code, "catalog.tree_too_many_entries")
+
+    def test_discovery_rejects_too_many_skill_roots_without_hashing_partial_results(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            write_skill(root, "first")
+            write_skill(root, "second")
+            with mock.patch("scripts.workflow_engine.catalog._MAX_SKILLS_PER_ROOT", 1):
+                result = discover_skills((root,), install_receipts={})
+            self.assertEqual(result.skills, {})
+            self.assertEqual(result.errors[0].code, "catalog.too_many_skills")
+
+    def test_frontmatter_name_reads_only_a_bounded_prefix(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "bounded", "x" * 500_000)
+            result = discover_skills((root,), install_receipts={})
+            self.assertIn("bounded", result.skills)
+            self.assertFalse(result.errors)
 
     def test_digit_leading_installer_skill_is_discovered_and_locked(self):
         """Catches rejecting a receipt-bound Skill ID the installer accepts."""

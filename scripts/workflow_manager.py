@@ -803,7 +803,7 @@ class WorkflowService:
         )
 
     def retry(self, node_id):
-        """Retry one failed/interrupted executable node without advancing its attempt."""
+        """Retry one failed, interrupted, or execution-skipped node without advancing its attempt."""
         with self.store.locked_run() as transaction:
             plan, state = self._load(transaction)
             if not isinstance(node_id, str) or node_id not in plan.nodes:

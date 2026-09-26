@@ -17,6 +17,13 @@ from .schema import WorkflowIssue
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_HASH_CHUNK_BYTES = 1024 * 1024
+_MAX_SKILLS_PER_ROOT = 512
+_MAX_SKILL_TREE_ENTRIES = 20_000
+_MAX_SKILL_TREE_FILES = 10_000
+_MAX_SKILL_FILE_BYTES = 32 * 1024 * 1024
+_MAX_SKILL_TREE_BYTES = 512 * 1024 * 1024
+_MAX_SKILL_FRONTMATTER_BYTES = 256 * 1024
 _ADAPTERS = frozenset(
     {
         "experiment_contract_v1",
@@ -82,32 +89,105 @@ def _contains(root: Path, path: Path) -> bool:
     return True
 
 
-def _sha256(path: Path, *, prefixed: bool) -> str:
-    value = hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256(path: Path, *, prefixed: bool, max_bytes: int | None = None) -> str:
+    if max_bytes is not None and path.stat().st_size > max_bytes:
+        raise CatalogError("catalog.file_too_large", f"Skill file exceeds the per-file size limit: {path}")
+    digest = hashlib.sha256()
+    total_read = 0
+    with path.open("rb") as source:
+        while chunk := source.read(_HASH_CHUNK_BYTES):
+            total_read += len(chunk)
+            if max_bytes is not None and total_read > max_bytes:
+                raise CatalogError("catalog.file_too_large", f"Skill file grew beyond the per-file size limit: {path}")
+            digest.update(chunk)
+    value = digest.hexdigest()
     return "sha256:" + value if prefixed else value
 
 
 def tree_sha256(path: Path) -> str:
     """Return the installer-compatible digest for a literal Skill tree."""
-    root = path.resolve()
+    tree_hash, _ = _tree_hashes(path)
+    return tree_hash
+
+
+def _tree_hashes(path: Path, *, selected_file: Path | None = None) -> tuple[str, str | None]:
+    """Hash a Skill tree and optionally one file after a complete metadata preflight."""
+    try:
+        root = path.resolve()
+    except OSError as exc:
+        raise CatalogError("catalog.invalid_tree", f"Skill tree cannot be resolved: {path}") from exc
     if _is_link(path) or not root.is_dir():
         raise CatalogError("catalog.invalid_tree", f"Skill tree is not a regular directory: {path}")
-    files: list[Path] = []
+    selected = selected_file
+    if selected is not None:
+        try:
+            selected = selected.resolve()
+        except OSError as exc:
+            raise CatalogError("catalog.invalid_tree", f"Skill file cannot be resolved: {selected_file}") from exc
+        if not _contains(root, selected):
+            raise CatalogError("catalog.invalid_tree", f"Selected Skill file is outside its tree: {selected_file}")
+    try:
+        return _tree_digest_contents(root, path, selected_file=selected)
+    except OSError as exc:
+        raise CatalogError("catalog.unreadable_tree", f"Skill tree cannot be read safely: {path}") from exc
+
+
+def _tree_digest_contents(
+    root: Path, path: Path, *, selected_file: Path | None = None
+) -> tuple[str, str | None]:
+    files: list[tuple[Path, int]] = []
+    entries = 0
+    total_bytes = 0
     for candidate in root.rglob("*"):
+        entries += 1
+        if entries > _MAX_SKILL_TREE_ENTRIES:
+            raise CatalogError("catalog.tree_too_many_entries", f"Skill tree exceeds the entry limit: {path}")
         if _is_link(candidate):
             raise CatalogError("catalog.symlink_in_tree", f"Skill tree contains a symlink or reparse point: {candidate}")
         if candidate.is_file():
-            files.append(candidate)
+            size = candidate.stat().st_size
+            if size > _MAX_SKILL_FILE_BYTES:
+                raise CatalogError("catalog.file_too_large", f"Skill file exceeds the per-file size limit: {candidate}")
+            total_bytes += size
+            if total_bytes > _MAX_SKILL_TREE_BYTES:
+                raise CatalogError("catalog.tree_too_large", f"Skill tree exceeds the total size limit: {path}")
+            files.append((candidate, size))
+            if len(files) > _MAX_SKILL_TREE_FILES:
+                raise CatalogError("catalog.tree_too_many_files", f"Skill tree exceeds the file-count limit: {path}")
     digest = hashlib.sha256()
-    for candidate in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
+    selected_digest = hashlib.sha256() if selected_file is not None else None
+    selected_found = selected_file is None
+    total_read = 0
+    for candidate, expected_size in sorted(files, key=lambda item: item[0].relative_to(root).as_posix()):
         relative = candidate.relative_to(root).as_posix().encode("utf-8")
-        digest.update(relative + b"\0" + candidate.read_bytes() + b"\0")
-    return "sha256:" + digest.hexdigest()
+        digest.update(relative + b"\0")
+        is_selected = selected_file == candidate
+        if is_selected:
+            selected_found = True
+        file_read = 0
+        with candidate.open("rb") as source:
+            while chunk := source.read(_HASH_CHUNK_BYTES):
+                file_read += len(chunk)
+                total_read += len(chunk)
+                if file_read > _MAX_SKILL_FILE_BYTES or total_read > _MAX_SKILL_TREE_BYTES:
+                    raise CatalogError("catalog.tree_too_large", f"Skill tree changed while being scanned: {path}")
+                digest.update(chunk)
+                if is_selected and selected_digest is not None:
+                    selected_digest.update(chunk)
+        if file_read != expected_size:
+            raise CatalogError("catalog.tree_changed", f"Skill file changed while being scanned: {candidate}")
+        digest.update(b"\0")
+    if not selected_found:
+        raise CatalogError("catalog.invalid_tree", f"Selected Skill file is not a regular tree file: {selected_file}")
+    selected_hash = selected_digest.hexdigest() if selected_digest is not None else None
+    return "sha256:" + digest.hexdigest(), selected_hash
 
 
 def _frontmatter_name(skill_file: Path) -> str:
     try:
-        lines = skill_file.read_text(encoding="utf-8").splitlines()
+        with skill_file.open("rb") as source:
+            raw = source.read(_MAX_SKILL_FRONTMATTER_BYTES + 1)
+        lines = raw[:_MAX_SKILL_FRONTMATTER_BYTES].decode("utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
         raise CatalogError("catalog.invalid_frontmatter", f"Skill frontmatter is unreadable: {skill_file}") from exc
     if not lines or lines[0] != "---":
@@ -115,6 +195,8 @@ def _frontmatter_name(skill_file: Path) -> str:
     try:
         close = lines.index("---", 1)
     except ValueError as exc:
+        if len(raw) > _MAX_SKILL_FRONTMATTER_BYTES:
+            raise CatalogError("catalog.frontmatter_too_large", f"Skill frontmatter exceeds the size limit: {skill_file}") from exc
         raise CatalogError("catalog.invalid_frontmatter", f"Skill frontmatter is not closed: {skill_file}") from exc
     names = [line[5:].strip() for line in lines[1:close] if line.startswith("name:")]
     if len(names) != 1 or not _SKILL_NAME_RE.fullmatch(names[0]):
@@ -153,7 +235,22 @@ def discover_skills(
         root = supplied_root.expanduser().resolve()
         if not root.is_dir():
             continue
-        for child in sorted(root.iterdir(), key=lambda item: item.name):
+        children: list[Path] = []
+        try:
+            for child in root.iterdir():
+                children.append(child)
+                if len(children) > _MAX_SKILLS_PER_ROOT:
+                    raise CatalogError(
+                        "catalog.too_many_skills",
+                        f"Skill root exceeds the catalog limit of {_MAX_SKILLS_PER_ROOT}: {root}",
+                    )
+        except CatalogError as exc:
+            errors.append(_issue("error", exc.code, str(exc)))
+            continue
+        except OSError as exc:
+            errors.append(_issue("error", "catalog.invalid_root", f"Skill root cannot be read: {root}: {exc}"))
+            continue
+        for child in sorted(children, key=lambda item: item.name):
             direct_link = _is_link(child)
             try:
                 candidate = child.resolve()
@@ -175,8 +272,9 @@ def discover_skills(
                 catalog_id = _frontmatter_name(skill_file)
                 if catalog_id != child.name:
                     raise CatalogError("catalog.name_mismatch", f"Skill directory and frontmatter name differ: {child}")
-                skill_hash = _sha256(skill_file, prefixed=False)
-                tree_hash = tree_sha256(candidate)
+                tree_hash, skill_hash = _tree_hashes(candidate, selected_file=skill_file)
+                if skill_hash is None:
+                    raise CatalogError("catalog.invalid_tree", f"Skill entrypoint is missing from its tree: {skill_file}")
             except CatalogError as exc:
                 errors.append(_issue("error", exc.code, str(exc)))
                 continue

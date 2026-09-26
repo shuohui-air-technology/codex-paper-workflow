@@ -179,7 +179,7 @@ python3 scripts/install_workflow.py --profile core --update --prune
 
 ## 自定义工作流编排
 
-官方 v1.0 流程仍是默认流程，安装后即可直接使用。希望自行安排阶段的进阶用户，可以在论文项目目录中启动图形界面。macOS 和 Linux 使用以下命令；如果安装时设置了 `CODEX_HOME`，命令会使用该位置：
+官方 v1.0 流程仍是默认流程，安装后即可直接使用。希望自行安排阶段的进阶用户，可以在论文项目目录中启动图形界面。macOS 和 Linux 使用以下命令。如果安装到了自定义 Codex 主目录，请在启动 Studio 的当前终端中导出同一个 `CODEX_HOME`，这样 Studio 进程也能读取它；安装时设置的值不会自动带入之后的新终端。未设置时，命令会从 `~/.codex` 查找：
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
@@ -192,7 +192,14 @@ $skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else {
 py -3 (Join-Path $skillsHome 'paper-workflow-orchestrator\scripts\workflow_studio.py') --project .
 ```
 
-你可以从官方流程创建副本，也可以新建空白流程；随后在画布上排列阶段、选择已安装的 Skill、连接阶段，并加入条件、并行和汇合步骤。检查流程并查看风险提示后，才可以启用自定义版本。整个过程无需编辑 JSON 文件。Studio 只读取本机已安装的 Skill，不负责安装 Skill；运行界面只需要 Python，不需要 Node.js。
+如果使用自定义路径，请在 macOS 或 Linux 的同一终端中先设置路径，再启动 Studio：
+
+```bash
+export CODEX_HOME="/你的 Codex 主目录"
+python3 "$CODEX_HOME/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
+```
+
+你可以从官方流程创建副本，也可以新建空白流程；随后在画布上排列阶段、选择已安装的 Skill、连接阶段，并加入条件、并行和汇合步骤。检查流程并查看风险提示后，才可以启用自定义版本。整个过程无需编辑 JSON 文件。Studio 只读取本机已安装的 Skill，不负责安装 Skill；运行界面需要 Python 3.10 或以上版本，不需要 Node.js。
 
 ![Workflow Studio 图形化工作流编排界面](assets/workflow-studio.png)
 

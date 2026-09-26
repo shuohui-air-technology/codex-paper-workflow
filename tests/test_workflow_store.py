@@ -105,6 +105,7 @@ def compiled_node(
     outcomes=("succeeded",),
     cases=(),
     skill=None,
+    failure_policy="block",
 ):
     if node_type == "task" and skill is None:
         skill = SkillIdentity("test-skill", Path("/installed/skills"), "test-skill",
@@ -120,13 +121,13 @@ def compiled_node(
         outputs=tuple(outputs),
         outcomes=tuple(outcomes),
         write_scopes=tuple(outputs),
-        failure_policy="block",
+        failure_policy=failure_policy,
         condition_cases=tuple(MappingProxyType(dict(item)) for item in cases),
         join_mode="all_active",
     )
 
 
-def task_plan(*, workflow_id="stored-flow", semantic_revision=1):
+def task_plan(*, workflow_id="stored-flow", semantic_revision=1, failure_policy="block"):
     skill = SkillIdentity(
         catalog_id="test-skill",
         root=Path("/installed/skills"),
@@ -135,7 +136,8 @@ def task_plan(*, workflow_id="stored-flow", semantic_revision=1):
         tree_sha256="sha256:" + sha256_bytes(b"tree"),
         locked=True,
     )
-    node = compiled_node("produce", entry=True, outputs=("draft",), skill=skill)
+    node = compiled_node("produce", entry=True, outputs=("draft",), skill=skill,
+                         failure_policy=failure_policy)
     semantic = sha256_bytes(f"{workflow_id}:{semantic_revision}".encode())
     return CompiledPlan(
         workflow_id=workflow_id,
@@ -3128,6 +3130,31 @@ class WorkflowStoreTests(unittest.TestCase):
                 self.assertEqual(
                     (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before,
                 )
+
+    def test_execution_skipped_task_retry_is_a_valid_store_transition(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = WorkflowStore(root)
+            plan = task_plan(workflow_id="run-skip-then-retry", failure_policy="skip_branch")
+            store.start_run(plan, "run-skip-then-retry")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", "skip-retry-token")
+                commit_claim(transaction, running)
+                skipped = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "failed",
+                    "outcome": "", "outputs": {}, "artifacts": [],
+                })
+                commit_result(transaction, skipped)
+                self.assertEqual(skipped.nodes["produce"].status, NodeStatus.SKIPPED)
+                retried = retry_transition(plan, skipped, "produce")
+                event = transaction.commit_transition(
+                    "node_retried", retried, {"node_id": "produce"},
+                )
+                self.assertEqual(event.event_type, "node_retried")
+                self.assertEqual(retried.nodes["produce"].status, NodeStatus.READY)
+                self.assertEqual(retried.nodes["produce"].attempt, 1)
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
 
     def test_stopped_run_cannot_replay_a_hash_valid_task_retry(self):
         with TemporaryDirectory() as temporary:

@@ -13,6 +13,11 @@ the official v1.0 workflow as the default.
   third-party license inventory, file hashes, and an offline-resource verifier.
 - Keeps the normal Skill runtime on Python's standard library; Node.js is only
   required when developing or rebuilding the Studio frontend.
+- Bounds local Skill catalog scans and hashes files incrementally so oversized
+  or unusually large Skill trees cannot consume unbounded resources.
+- Marks all-active joins with missing or conflicting outputs as blocked, and
+  allows an attempted `skip_branch` task failure to be retried in the same run
+  when no dependent descendant work has started.
 - Adds frontend unit tests, browser end-to-end coverage, and CI checks for the
   reproducible runtime bundle.
 

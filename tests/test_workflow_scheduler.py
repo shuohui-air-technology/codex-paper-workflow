@@ -284,6 +284,38 @@ class WorkflowSchedulerTests(unittest.TestCase):
         self.assertEqual(state.nodes["merge"].status, NodeStatus.SUCCEEDED)
         self.assertEqual(state.nodes["merge"].selected_inputs["draft"], "left.md")
 
+    def test_all_active_join_with_conflicting_outputs_becomes_durably_blocked(self):
+        plan = self.compile(
+            [
+                task("left", entry=True, outputs=("draft",)),
+                task("right", entry=True, outputs=("draft",)),
+                join("merge", outputs=("draft",)),
+                task("sink"),
+            ],
+            [
+                edge("left-merge", "left", "merge", output_map={"draft": "draft"}),
+                edge("right-merge", "right", "merge", output_map={"draft": "draft"}),
+                edge("merge-sink", "merge", "sink"),
+            ],
+            max_parallelism=2,
+        )
+        state = initial_run(plan, "run-ambiguous-all-join")
+        state = self.complete(plan, state, "left", outputs={"draft": "left.md"})
+        state = self.complete(plan, state, "right", outputs={"draft": "right.md"})
+        self.assertEqual(state.nodes["merge"].status, NodeStatus.BLOCKED)
+        self.assertEqual(state.edges["merge-sink"].status, EdgeStatus.FAILED)
+        self.assertEqual(state.nodes["sink"].status, NodeStatus.BLOCKED)
+        self.assertEqual(refresh_ready(plan, state), state)
+
+    def test_all_active_join_with_missing_declared_output_becomes_blocked(self):
+        plan = self.compile(
+            [task("source", entry=True, outputs=("other",)), join("merge", outputs=("draft",))],
+            [edge("source-merge", "source", "merge")],
+        )
+        state = self.complete(plan, initial_run(plan, "run-incomplete-all-join"), "source", outputs={"other": "other.md"})
+        self.assertEqual(state.nodes["merge"].status, NodeStatus.BLOCKED)
+        self.assertEqual(refresh_ready(plan, state), state)
+
     def test_all_inactive_path_skips_recursively_instead_of_becoming_ready(self):
         plan = self.compile(
             [
@@ -589,6 +621,85 @@ class WorkflowSchedulerTests(unittest.TestCase):
         self.assertEqual(skipped.nodes["source"].status, NodeStatus.SKIPPED)
         self.assertEqual(skipped.edges["source-sink"].status, EdgeStatus.INACTIVE)
         self.assertEqual(skipped.nodes["sink"].status, NodeStatus.SKIPPED)
+        retried = retry_transition(plan, skipped, "source")
+        self.assertEqual(retried.nodes["source"].status, NodeStatus.READY)
+        self.assertEqual(retried.nodes["source"].attempt, 1)
+        self.assertEqual(retried.nodes["sink"].status, NodeStatus.PENDING)
+        self.assertEqual(retried.edges["source-sink"].status, EdgeStatus.WAITING)
+        with self.assertRaises(WorkflowError) as repeated:
+            retry_transition(plan, retried, "source")
+        self.assertEqual(repeated.exception.code, "runtime.invalid_retry")
+        running_again = claim_transition(plan, retried, "source", "retry-token")
+        succeeded = result_transition(plan, running_again, {
+            "node_id": "source", "attempt": 2, "status": "succeeded",
+            "outcome": "succeeded", "outputs": {}, "artifacts": (),
+        })
+        self.assertEqual(succeeded.nodes["sink"].status, NodeStatus.READY)
+
+    def test_skip_branch_retry_is_rejected_after_a_descendant_has_completed(self):
+        plan = self.compile(
+            [
+                task("source", entry=True, failure_policy="skip_branch"),
+                task("other", entry=True),
+                task("sink"),
+            ],
+            [edge("source-sink", "source", "sink"), edge("other-sink", "other", "sink")],
+            max_parallelism=2,
+        )
+        state = initial_run(plan, "run-retry-after-descendant")
+        failed = claim_transition(plan, state, "source", "source-first-token")
+        failed = result_transition(plan, failed, {
+            "node_id": "source", "attempt": 1, "status": "failed",
+            "outcome": "", "outputs": {}, "artifacts": (),
+        })
+        state = self.complete(plan, failed, "other")
+        state = self.complete(plan, state, "sink")
+        with self.assertRaises(WorkflowError) as caught:
+            retry_transition(plan, state, "source")
+        self.assertEqual(caught.exception.code, "runtime.retry_descendant_started")
+        self.assertEqual(state.nodes["source"].status, NodeStatus.SKIPPED)
+        self.assertEqual(state.nodes["sink"].status, NodeStatus.SUCCEEDED)
+
+    def test_skip_branch_retry_does_not_reopen_a_frozen_any_success_winner(self):
+        plan = self.compile(
+            [
+                task("source", entry=True, outputs=("draft",), failure_policy="skip_branch"),
+                task("other", entry=True, outputs=("draft",)),
+                join("race", outputs=("draft",), mode="any_success"),
+                task("sink"),
+            ],
+            [
+                edge("source-race", "source", "race", output_map={"draft": "draft"}),
+                edge("other-race", "other", "race", output_map={"draft": "draft"}),
+                edge("race-sink", "race", "sink"),
+            ],
+            max_parallelism=2,
+        )
+        state = claim_transition(plan, initial_run(plan, "run-retry-frozen-winner"), "source", "source-token")
+        state = result_transition(plan, state, {
+            "node_id": "source", "attempt": 1, "status": "failed",
+            "outcome": "", "outputs": {}, "artifacts": (),
+        })
+        state = self.complete(plan, state, "other", outputs={"draft": "other.md"})
+        state, _ = stabilize_control_nodes(plan, state)
+        state = self.complete(plan, state, "sink")
+        winner = state.nodes["race"].winner_edge_id
+        self.assertEqual(winner, "other-race")
+
+        retried = retry_transition(plan, state, "source")
+        self.assertEqual(retried.nodes["race"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(retried.nodes["race"].winner_edge_id, winner)
+        self.assertEqual(retried.nodes["sink"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(retried.edges["source-race"].status, EdgeStatus.WAITING)
+
+        running = claim_transition(plan, retried, "source", "source-retry-token")
+        completed = result_transition(plan, running, {
+            "node_id": "source", "attempt": 2, "status": "succeeded",
+            "outcome": "succeeded", "outputs": {"draft": "source.md"}, "artifacts": (),
+        })
+        self.assertEqual(completed.nodes["race"].winner_edge_id, winner)
+        self.assertEqual(completed.nodes["race"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(completed.nodes["sink"].status, NodeStatus.SUCCEEDED)
 
     def test_mark_descendants_stale_uses_compiled_adjacency_without_mutating_old_state(self):
         plan = self.compile(

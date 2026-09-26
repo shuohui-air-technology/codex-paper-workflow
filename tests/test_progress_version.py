@@ -168,6 +168,9 @@ class ProgressVersionTests(unittest.TestCase):
                 "paper-workflow-orchestrator/scripts/workflow_studio.py",
                 "--project .",
                 "without editing JSON",
+                "export `CODEX_HOME` with that same path in the shell where you launch Studio",
+                "export CODEX_HOME=\"/path/to/codex-home\"",
+                "Python 3.10 or later but no Node.js",
                 "assets/workflow-studio.png",
             ),
             "README.zh-CN.md": (
@@ -176,6 +179,9 @@ class ProgressVersionTests(unittest.TestCase):
                 "paper-workflow-orchestrator/scripts/workflow_studio.py",
                 "--project .",
                 "无需编辑 JSON",
+                "在启动 Studio 的当前终端中导出同一个 `CODEX_HOME`",
+                "export CODEX_HOME=\"/你的 Codex 主目录\"",
+                "Python 3.10 或以上版本",
                 "assets/workflow-studio.png",
             ),
         }

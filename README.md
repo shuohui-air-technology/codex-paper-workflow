@@ -185,14 +185,21 @@ The official v1.0 workflow remains the default and is ready to use after install
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
 ```
 
-If `CODEX_HOME` was set during installation, the command uses that location. On Windows PowerShell, run:
+If you installed to a custom Codex home, export `CODEX_HOME` with that same path in the shell where you launch Studio so the Studio process can use it too. The installer's setting is not automatically reused in a later shell; if you do not set it, the command looks under `~/.codex`. On Windows PowerShell, run:
 
 ```powershell
 $skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $HOME '.codex\skills' }
 py -3 (Join-Path $skillsHome 'paper-workflow-orchestrator\scripts\workflow_studio.py') --project .
 ```
 
-Start from a copy of the official workflow or create a blank one. Arrange stages on the canvas, choose Skills that are already installed, connect steps, and add conditions, parallel branches, or joins. Review validation results and any risk notices before activating the custom workflow. The editor works without editing JSON. It does not install Skills, and its runtime needs Python but no Node.js.
+On macOS or Linux, set a custom path and start Studio in the same terminal like this:
+
+```bash
+export CODEX_HOME="/path/to/codex-home"
+python3 "$CODEX_HOME/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
+```
+
+Start from a copy of the official workflow or create a blank one. Arrange stages on the canvas, choose Skills that are already installed, connect steps, and add conditions, parallel branches, or joins. Review validation results and any risk notices before activating the custom workflow. The editor works without editing JSON. It does not install Skills, and its runtime needs Python 3.10 or later but no Node.js.
 
 ![Workflow Studio visual workflow editor](assets/workflow-studio.png)
 
