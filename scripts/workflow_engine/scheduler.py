@@ -536,6 +536,30 @@ def claim_transition(
     return _replace_state(state, nodes=nodes)
 
 
+def validator_claim_transition(
+    plan: CompiledPlan, state: RunState, node_id: str, token: str
+) -> RunState:
+    """Claim a ready validator without granting task-result authority."""
+    _validate_binding(plan, state)
+    if node_id not in plan.nodes:
+        _fail("runtime.unknown_node", f"node does not exist: {node_id}", node_id=node_id)
+    if plan.nodes[node_id].type != "validator":
+        _fail("runtime.node_type", "only validator nodes may be claimed", node_id=node_id)
+    runtime = state.nodes[node_id]
+    if runtime.status is not NodeStatus.READY:
+        _fail("runtime.node_not_ready", "node is not ready to claim", node_id=node_id)
+    if not isinstance(token, str) or not token:
+        _fail("runtime.invalid_claim_token", "claim token must be a non-empty string", node_id=node_id)
+    if sum(item.status is NodeStatus.RUNNING for item in state.nodes.values()) >= plan.max_parallelism:
+        _fail("runtime.parallelism_exceeded", "maximum workflow parallelism reached")
+    nodes = dict(state.nodes)
+    nodes[node_id] = replace(
+        runtime, status=NodeStatus.RUNNING, attempt=runtime.attempt + 1,
+        claim_token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    )
+    return _replace_state(state, nodes=nodes)
+
+
 def _validate_outputs(node: CompiledNode, value: object) -> Mapping[str, str]:
     if not isinstance(value, Mapping) or not all(
         isinstance(key, str) and isinstance(path, str) and path
@@ -680,6 +704,53 @@ def result_transition(
     return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges, artifacts=artifacts))
 
 
+def validator_result_transition(
+    plan: CompiledPlan, state: RunState, result: Mapping[str, object]
+) -> RunState:
+    """Record a domain outcome or an execution failure; validators produce no files."""
+    _validate_binding(plan, state)
+    if not isinstance(result, Mapping) or set(result) != {
+        "node_id", "attempt", "status", "outcome", "outputs", "artifacts"
+    }:
+        _fail("runtime.invalid_result", "validator result has invalid fields")
+    node_id = result["node_id"]
+    if not isinstance(node_id, str) or node_id not in plan.nodes:
+        _fail("runtime.unknown_node", "result node does not exist")
+    node = plan.nodes[node_id]
+    if node.type != "validator":
+        _fail("runtime.node_type", "validator result transition is validator-only", node_id=node_id)
+    runtime = state.nodes[node_id]
+    if runtime.status is not NodeStatus.RUNNING:
+        _fail("runtime.node_not_running", "validator is not running", node_id=node_id)
+    if type(result["attempt"]) is not int or result["attempt"] != runtime.attempt:
+        _fail("runtime.stale_attempt", "validator attempt is not current", node_id=node_id)
+    if type(result["status"]) is not str or result["status"] not in {"succeeded", "failed"}:
+        _fail("runtime.invalid_result_status", "validator status must be succeeded or failed")
+    if not isinstance(result["outputs"], Mapping) or result["outputs"] or not isinstance(result["artifacts"], (list, tuple)) or result["artifacts"]:
+        _fail("runtime.invalid_outputs", "validator results cannot produce file outputs")
+    nodes = dict(state.nodes)
+    edges = dict(state.edges)
+    if result["status"] == "succeeded":
+        outcome = result["outcome"]
+        if not isinstance(outcome, str) or outcome not in node.outcomes or outcome not in {"pass", "fail", "blocked"}:
+            _fail("runtime.invalid_outcome", "validator outcome is not declared", node_id=node_id)
+        nodes[node_id] = replace(runtime, status=NodeStatus.SUCCEEDED, outcome=outcome, outputs=_string_map())
+        for edge_id in plan.outgoing[node_id]:
+            edge_status = EdgeStatus.SATISFIED if plan.edges[edge_id].trigger == outcome else EdgeStatus.INACTIVE
+            edges[edge_id] = EdgeRuntime(edge_status)
+    else:
+        if result["outcome"] != "" or type(result["outcome"]) is not str:
+            _fail("runtime.invalid_failure", "execution failure has no domain outcome")
+        if node.failure_policy == "skip_branch":
+            nodes[node_id] = replace(runtime, status=NodeStatus.SKIPPED, outcome="")
+            _set_outgoing_status(plan, edges, node_id, EdgeStatus.INACTIVE)
+        else:
+            nodes[node_id] = replace(runtime, status=NodeStatus.FAILED, outcome="")
+            _set_outgoing_status(plan, edges, node_id, EdgeStatus.FAILED)
+    _record_late_join_outputs(plan, nodes, edges)
+    return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges))
+
+
 def retry_transition(plan: CompiledPlan, state: RunState, node_id: str) -> RunState:
     _validate_binding(plan, state)
     if node_id not in plan.nodes:
@@ -699,6 +770,39 @@ def retry_transition(plan: CompiledPlan, state: RunState, node_id: str) -> RunSt
         outputs=_string_map(),
         auxiliary_outputs=_aux_map(),
     )
+    pending = [node_id]
+    descendants: set[str] = set()
+    while pending:
+        current = pending.pop()
+        for edge_id in plan.outgoing[current]:
+            target = plan.edges[edge_id].target
+            if target not in descendants:
+                descendants.add(target)
+                pending.append(target)
+    for current in descendants:
+        if nodes[current].status is NodeStatus.BLOCKED:
+            nodes[current] = replace(nodes[current], status=NodeStatus.PENDING)
+    for current in {node_id, *descendants}:
+        for edge_id in plan.outgoing[current]:
+            if edges[edge_id].status is EdgeStatus.FAILED:
+                edges[edge_id] = EdgeRuntime(EdgeStatus.WAITING)
+    return refresh_ready(plan, _replace_state(state, nodes=nodes, edges=edges))
+
+
+def validator_retry_transition(plan: CompiledPlan, state: RunState, node_id: str) -> RunState:
+    """Retry only an interrupted or failed validator execution."""
+    _validate_binding(plan, state)
+    if node_id not in plan.nodes:
+        _fail("runtime.unknown_node", f"node does not exist: {node_id}", node_id=node_id)
+    if plan.nodes[node_id].type != "validator":
+        _fail("runtime.node_type", "only validator nodes may be retried", node_id=node_id)
+    runtime = state.nodes[node_id]
+    if runtime.status not in {NodeStatus.FAILED, NodeStatus.BLOCKED}:
+        _fail("runtime.invalid_retry", "only failed or interrupted validators may be retried", node_id=node_id)
+    nodes = dict(state.nodes)
+    edges = dict(state.edges)
+    nodes[node_id] = replace(runtime, status=NodeStatus.PENDING, outcome="", claim_token_hash="",
+                             outputs=_string_map(), auxiliary_outputs=_aux_map())
     pending = [node_id]
     descendants: set[str] = set()
     while pending:

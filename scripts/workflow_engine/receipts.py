@@ -338,7 +338,7 @@ def input_evidence(plan, state, node_id, witnesses) -> list[dict[str, str]]:
 def build_claim_evidence(plan, state, node_id, witnesses, started_at) -> dict[str, object]:
     _timestamp(started_at)
     runtime = state.nodes[node_id]
-    return {
+    claim = {
         "run_id": state.run_id, "semantic_sha256": plan.semantic_sha256,
         "node_id": node_id, "attempt": runtime.attempt,
         "claim_token_sha256": runtime.claim_token_hash,
@@ -347,6 +347,9 @@ def build_claim_evidence(plan, state, node_id, witnesses, started_at) -> dict[st
         "expected_outputs": list(plan.nodes[node_id].outputs),
         "outcomes": list(plan.nodes[node_id].outcomes), "started_at": started_at,
     }
+    if plan.nodes[node_id].type == "validator":
+        claim["validator_config"] = json.loads(canonical_bytes(plan.nodes[node_id].validator_config))
+    return claim
 
 
 def build_stage_receipt(plan, state, node_id, claim, *, summary, uncertainties,
@@ -355,7 +358,7 @@ def build_stage_receipt(plan, state, node_id, claim, *, summary, uncertainties,
     outputs = [
         {"id": artifact_id, "path": state.artifacts[artifact_id].path, "sha256": state.artifacts[artifact_id].sha256}
         for artifact_id in sorted(plan.nodes[node_id].outputs)
-    ] if runtime.status.value == "succeeded" else []
+    ] if runtime.status.value == "succeeded" and plan.nodes[node_id].type == "task" else []
     return validate_stage_receipt({
         "schema_version": RECEIPT_SCHEMA, "workflow_id": plan.workflow_id,
         "semantic_revision": plan.semantic_revision, "semantic_sha256": plan.semantic_sha256,

@@ -23,6 +23,9 @@ from scripts.workflow_engine.scheduler import (
     refresh_ready,
     result_transition,
     retry_transition,
+    validator_claim_transition,
+    validator_result_transition,
+    validator_retry_transition,
     stabilize_control_nodes,
 )
 
@@ -642,6 +645,97 @@ class WorkflowSchedulerTests(unittest.TestCase):
         self.assertTrue(evaluate_predicate({"op": "decision_is", "name": "boolean", "value": True}, facts))
         self.assertFalse(evaluate_predicate({"op": "decision_is", "name": "boolean", "value": 1}, facts))
         self.assertTrue(evaluate_predicate({"op": "decision_is", "name": "number", "value": 1}, facts))
+
+
+    def test_validator_domain_outcomes_complete_only_matching_gate(self):
+        nodes = [validator("check", entry=True), *(task(f"{name}-task") for name in ("pass", "fail", "blocked"))]
+        routes = [edge(f"to-{name}", "check", f"{name}-task", trigger=name)
+                  for name in ("pass", "fail", "blocked")]
+        plan = self.compile(nodes, routes, external_inputs=("section",))
+        initial = self.register(initial_run(plan, "run-validator"), self.artifact("section"))
+        for outcome in ("pass", "fail", "blocked"):
+            with self.subTest(outcome=outcome):
+                running = validator_claim_transition(plan, refresh_ready(plan, initial), "check", "token")
+                completed = validator_result_transition(plan, running, {
+                    "node_id": "check", "attempt": 1, "status": "succeeded",
+                    "outcome": outcome, "outputs": {}, "artifacts": (),
+                })
+                self.assertEqual(completed.nodes["check"].status, NodeStatus.SUCCEEDED)
+                self.assertEqual(completed.nodes["check"].outcome, outcome)
+                for name in ("pass", "fail", "blocked"):
+                    self.assertEqual(completed.edges[f"to-{name}"].status,
+                                     EdgeStatus.SATISFIED if name == outcome else EdgeStatus.INACTIVE)
+                self.assertEqual(completed.nodes[f"{outcome}-task"].status, NodeStatus.READY)
+                with self.assertRaises(WorkflowError):
+                    validator_retry_transition(plan, completed, "check")
+
+    def test_validator_execution_failure_retry_and_type_isolation(self):
+        plan = self.compile([validator("check", entry=True), task("sink")],
+                            [edge("gate", "check", "sink", trigger="pass")],
+                            external_inputs=("section",))
+        ready = refresh_ready(plan, self.register(initial_run(plan, "run-validator-failure"),
+                                                  self.artifact("section")))
+        running = validator_claim_transition(plan, ready, "check", "first-token")
+        failed = validator_result_transition(plan, running, {
+            "node_id": "check", "attempt": 1, "status": "failed",
+            "outcome": "", "outputs": {}, "artifacts": (),
+        })
+        self.assertEqual(failed.nodes["check"].status, NodeStatus.FAILED)
+        self.assertEqual(failed.edges["gate"].status, EdgeStatus.FAILED)
+        self.assertEqual(failed.nodes["sink"].status, NodeStatus.BLOCKED)
+        retried = validator_retry_transition(plan, failed, "check")
+        self.assertEqual(retried.nodes["check"].status, NodeStatus.READY)
+        self.assertEqual(retried.nodes["check"].attempt, 1)
+        self.assertEqual(retried.nodes["check"].claim_token_hash, "")
+        self.assertEqual(retried.edges["gate"].status, EdgeStatus.WAITING)
+        self.assertEqual(validator_claim_transition(plan, retried, "check", "next-token").nodes["check"].attempt, 2)
+        interrupted = replace(running, nodes={
+            **running.nodes, "check": replace(running.nodes["check"], status=NodeStatus.BLOCKED),
+        })
+        resumed = validator_retry_transition(plan, interrupted, "check")
+        self.assertEqual((resumed.nodes["check"].status, resumed.nodes["check"].attempt,
+                          resumed.nodes["check"].claim_token_hash), (NodeStatus.READY, 1, ""))
+        for invalid in ({"node_id": "check", "attempt": 1, "status": "succeeded", "outcome": "pass",
+                         "outputs": {"invented": "file"}, "artifacts": ()},
+                        {"node_id": "check", "attempt": 1, "status": "failed", "outcome": "fail",
+                         "outputs": {}, "artifacts": ()}):
+            with self.assertRaises(WorkflowError):
+                validator_result_transition(plan, running, invalid)
+        with self.assertRaises(WorkflowError):
+            claim_transition(plan, ready, "check", "token")
+        with self.assertRaises(WorkflowError):
+            result_transition(plan, running, {"node_id": "check", "attempt": 1,
+                "status": "succeeded", "outcome": "pass", "outputs": {}, "artifacts": ()})
+        with self.assertRaises(WorkflowError):
+            retry_transition(plan, failed, "check")
+
+    def test_validator_claim_respects_shared_parallel_limit(self):
+        plan = self.compile([validator("check", entry=True), task("work", entry=True)], [],
+                            external_inputs=("section",), max_parallelism=1)
+        ready = refresh_ready(plan, self.register(initial_run(plan, "run-types"), self.artifact("section")))
+        running = claim_transition(plan, ready, "work", "task-token")
+        with self.assertRaises(WorkflowError) as full:
+            validator_claim_transition(plan, running, "check", "validator-token")
+        self.assertEqual(full.exception.code, "runtime.parallelism_exceeded")
+        with self.assertRaises(WorkflowError):
+            validator_claim_transition(plan, ready, "work", "token")
+        with self.assertRaises(WorkflowError):
+            validator_result_transition(plan, running, {"node_id": "work", "attempt": 1,
+                "status": "succeeded", "outcome": "pass", "outputs": {}, "artifacts": ()})
+
+    def test_validator_execution_failure_obeys_skip_branch_policy(self):
+        check = validator("check", entry=True)
+        check["failure_policy"] = "skip_branch"
+        plan = self.compile([check, task("sink")],
+                            [edge("gate", "check", "sink", trigger="pass")],
+                            external_inputs=("section",))
+        ready = refresh_ready(plan, self.register(initial_run(plan, "run-validator-skip"), self.artifact("section")))
+        running = validator_claim_transition(plan, ready, "check", "token")
+        skipped = validator_result_transition(plan, running, {"node_id": "check", "attempt": 1,
+            "status": "failed", "outcome": "", "outputs": {}, "artifacts": ()})
+        self.assertEqual(skipped.nodes["check"].status, NodeStatus.SKIPPED)
+        self.assertEqual(skipped.edges["gate"].status, EdgeStatus.INACTIVE)
+        self.assertEqual(skipped.nodes["sink"].status, NodeStatus.SKIPPED)
 
 
 if __name__ == "__main__":

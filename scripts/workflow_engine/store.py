@@ -51,6 +51,9 @@ from .scheduler import (
     refresh_ready,
     result_transition,
     claim_transition,
+    validator_claim_transition,
+    validator_result_transition,
+    validator_retry_transition,
 )
 from .receipts import (
     MAX_ENVELOPE_BYTES, ReceiptError, build_claim_evidence, build_stage_receipt, canonical_bytes,
@@ -1074,7 +1077,7 @@ def _validate_completion_transition(
     payload: Mapping[str, object],
 ) -> None:
     """Only a scheduler-equivalent result/control event can mint a live edge."""
-    if event_type == "node_result_recorded":
+    if event_type in {"node_result_recorded", "validator_result_recorded"}:
         changed = [
             node_id for node_id in plan.nodes
             if previous.nodes[node_id].status is NodeStatus.RUNNING
@@ -1087,8 +1090,9 @@ def _validate_completion_transition(
         node_id = changed[0]
         node = plan.nodes[node_id]
         after = current.nodes[node_id]
-        if node.type != "task":
-            raise StoreError("events.invalid_completion", "node_result source is not a task")
+        expected_event = "node_result_recorded" if node.type == "task" else "validator_result_recorded"
+        if node.type not in {"task", "validator"} or event_type != expected_event:
+            raise StoreError("events.invalid_completion", "result event does not match node type")
         receipt_artifacts = [
             artifact for artifact in current.artifacts.values()
             if artifact.producer_node_id == node_id and artifact.producer_attempt == after.attempt
@@ -1102,7 +1106,7 @@ def _validate_completion_transition(
             "artifacts": receipt_artifacts if after.status is NodeStatus.SUCCEEDED else [],
         }
         try:
-            expected = result_transition(plan, previous, result)
+            expected = (result_transition if node.type == "task" else validator_result_transition)(plan, previous, result)
         except WorkflowError as exc:
             raise StoreError("events.invalid_completion", str(exc)) from exc
         if _state_data(expected) != _state_data(current):
@@ -1155,7 +1159,8 @@ def _validate_edge_and_winner_transition(
         if runtime.status is NodeStatus.SUCCEEDED
         and previous.nodes[node_id].status is not NodeStatus.SUCCEEDED
     }
-    if newly_succeeded and event_type not in {"node_result_recorded", "condition_selected", "join_succeeded"}:
+    completion_events = {"node_result_recorded", "validator_result_recorded", "condition_selected", "join_succeeded"}
+    if newly_succeeded and event_type not in completion_events:
         raise StoreError("events.invalid_completion", "non-completion event cannot finish a node")
     for edge_id, runtime in current.edges.items():
         before = previous.edges[edge_id]
@@ -1167,9 +1172,9 @@ def _validate_edge_and_winner_transition(
             and current.nodes[plan.edges[edge_id].source].status is NodeStatus.SUCCEEDED
         ):
             raise StoreError("edge.authority_invalid", f"completed source lost its satisfied route: {edge_id}")
-    if newly_satisfied and event_type not in {"node_result_recorded", "condition_selected", "join_succeeded"}:
+    if newly_satisfied and event_type not in completion_events:
         raise StoreError("events.invalid_completion", "non-completion event cannot create a satisfied edge")
-    if event_type in {"node_result_recorded", "condition_selected", "join_succeeded"}:
+    if event_type in completion_events:
         _validate_completion_transition(plan, previous, current, event_type, payload)
     for node_id, runtime in current.nodes.items():
         node = plan.nodes[node_id]
@@ -1201,6 +1206,18 @@ def validate_node_evidence_delta(
 ) -> None:
     """Check claims/completions across every event name, both commit and replay."""
     if before is None:
+        return
+    if event_type == "validator_retried":
+        fields = set(payload) - {"state", "run_status"}
+        node_id = payload.get("node_id")
+        if fields != {"node_id"} or not isinstance(node_id, str) or node_id not in plan.nodes:
+            raise StoreError("events.invalid_retry", "validator retry requires one named node")
+        try:
+            expected = validator_retry_transition(plan, before, node_id)
+        except WorkflowError as exc:
+            raise StoreError("events.invalid_retry", str(exc)) from exc
+        if _state_data(expected) != _state_data(after):
+            raise StoreError("events.invalid_retry", "validator retry differs from scheduler transition")
         return
     if event_type == "recovery_running_blocked":
         running = sorted(node_id for node_id, runtime in before.nodes.items()
@@ -1237,7 +1254,7 @@ def validate_node_evidence_delta(
             ):
                 raise StoreError("artifact.authority_invalid", "invalidation cannot rewrite the attempt's historical evidence")
         if current.status is NodeStatus.SKIPPED and earlier.status not in {NodeStatus.RUNNING, NodeStatus.SKIPPED}:
-            if event_type not in {"node_result_recorded", "condition_selected", "join_succeeded"}:
+            if event_type not in {"node_result_recorded", "validator_result_recorded", "condition_selected", "join_succeeded"}:
                 if event_type not in {"readiness_refreshed", "artifact_registered", "fact_recorded", "decision_recorded"}:
                     raise StoreError("events.invalid_completion", "event cannot exclude a task branch")
                 if derived is None:
@@ -1246,7 +1263,8 @@ def validate_node_evidence_delta(
                 if current != derived.nodes[node_id]:
                     raise StoreError("events.invalid_completion", "skipped task is not a derived branch exclusion")
         if current.status is NodeStatus.FAILED and earlier.status is not NodeStatus.FAILED:
-            if earlier.status is not NodeStatus.RUNNING or event_type != "node_result_recorded":
+            required = "node_result_recorded" if node.type == "task" else "validator_result_recorded"
+            if earlier.status is not NodeStatus.RUNNING or event_type != required:
                 raise StoreError("events.invalid_completion", "execution failure requires a receipted running attempt")
         if (earlier.status is current.status and earlier.status in {
                 NodeStatus.RUNNING, NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED,
@@ -1255,7 +1273,8 @@ def validate_node_evidence_delta(
             raise StoreError("events.invalid_evidence", "an existing attempt's frozen evidence changed")
         if earlier.status is NodeStatus.RUNNING and current.status is NodeStatus.BLOCKED and event_type != "recovery_running_blocked":
             raise StoreError("events.invalid_evidence", "only recovery may block an interrupted attempt")
-        if earlier.attempt != current.attempt and event_type != "node_claimed":
+        claim_event = "node_claimed" if node.type == "task" else "validator_claimed"
+        if earlier.attempt != current.attempt and event_type != claim_event:
             raise StoreError("events.invalid_claim", "only a claim may advance an attempt")
     for artifact_id, artifact in after.artifacts.items():
         earlier = before.artifacts.get(artifact_id)
@@ -1269,10 +1288,13 @@ def validate_node_evidence_delta(
     terminals = [node_id for node_id in plan.nodes if before.nodes[node_id].status is NodeStatus.RUNNING
                  and after.nodes[node_id].status in {NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED}]
     try:
-        if claims or event_type == "node_claimed":
-            if len(claims) != 1 or event_type != "node_claimed":
+        if claims or event_type in {"node_claimed", "validator_claimed"}:
+            if len(claims) != 1:
                 raise StoreError("events.invalid_claim", "running attempt requires a dedicated claim event")
             node_id = claims[0]
+            expected_event = "node_claimed" if plan.nodes[node_id].type == "task" else "validator_claimed"
+            if event_type != expected_event:
+                raise StoreError("events.invalid_claim", "claim event does not match node type")
             _lower_sha256(after.nodes[node_id].claim_token_hash, "events.invalid_claim")
             claim = payload.get("claim_evidence")
             if not isinstance(claim, Mapping):
@@ -1284,25 +1306,31 @@ def validate_node_evidence_delta(
                 datetime.fromisoformat(started.replace("Z", "+00:00"))
             except ValueError as exc:
                 raise StoreError("events.invalid_claim", "claim start timestamp is invalid") from exc
-            expected = claim_transition(plan, before, node_id, "evidence-verification")
+            claim_function = claim_transition if plan.nodes[node_id].type == "task" else validator_claim_transition
+            expected = claim_function(plan, before, node_id, "evidence-verification")
             nodes = dict(expected.nodes)
             nodes[node_id] = replace(nodes[node_id], claim_token_hash=after.nodes[node_id].claim_token_hash)
             expected = replace(expected, nodes=nodes)
             if expected != after or _json_value(claim) != build_claim_evidence(plan, after, node_id, witnesses, started):
                 raise StoreError("events.invalid_claim", "claim differs from scheduler or frozen input evidence")
-        if terminals or event_type == "node_result_recorded":
-            if len(terminals) != 1 or event_type != "node_result_recorded":
+        if terminals or event_type in {"node_result_recorded", "validator_result_recorded"}:
+            if len(terminals) != 1:
                 raise StoreError("events.invalid_completion", "terminal attempt requires a receipted completion event")
             node_id = terminals[0]
+            claim_event_type = "node_claimed" if plan.nodes[node_id].type == "task" else "validator_claimed"
+            result_event_type = "node_result_recorded" if plan.nodes[node_id].type == "task" else "validator_result_recorded"
+            if event_type != result_event_type:
+                raise StoreError("events.invalid_completion", "result event does not match node type")
             receipt = validate_stage_receipt(payload.get("receipt"))
             digest = _lower_sha256(payload.get("result_sha256"), "events.invalid_completion")
             claim_seq = payload.get("claim_event_seq")
-            matching = [event for event in prior_events if event.event_type == "node_claimed"
+            matching = [event for event in prior_events if event.event_type == claim_event_type
                         and event.payload.get("claim_evidence", {}).get("node_id") == node_id
                         and event.payload.get("claim_evidence", {}).get("attempt") == after.nodes[node_id].attempt]
             if len(matching) != 1 or type(claim_seq) is not int or matching[0].event_seq != claim_seq:
                 raise StoreError("events.invalid_completion", "completion lacks one matching claim")
-            if any(event.event_type == "node_result_recorded" and event.payload.get("claim_event_seq") == claim_seq for event in prior_events):
+            if any(event.event_type in {"node_result_recorded", "validator_result_recorded"}
+                   and event.payload.get("claim_event_seq") == claim_seq for event in prior_events):
                 raise StoreError("events.invalid_completion", "attempt already completed")
             claim = matching[0].payload["claim_evidence"]
             if before.nodes[node_id].claim_token_hash != claim["claim_token_sha256"]:
@@ -2465,7 +2493,7 @@ class WorkflowStore:
     ) -> dict[Path, bytes]:
         material = {}
         for event in events:
-            if event.event_type != "node_result_recorded":
+            if event.event_type not in {"node_result_recorded", "validator_result_recorded"}:
                 continue
             try:
                 receipt = validate_stage_receipt(event.payload.get("receipt"))
@@ -2569,7 +2597,7 @@ class WorkflowStore:
     @staticmethod
     def _current_success_receipts(state, events):
         for event in events:
-            if event.event_type != "node_result_recorded":
+            if event.event_type not in {"node_result_recorded", "validator_result_recorded"}:
                 continue
             receipt = event.payload["receipt"]
             runtime = state.nodes[receipt["node_id"]]
@@ -3280,7 +3308,7 @@ class WorkflowTransaction:
         return self._commit_event(event_type, updated_state, {} if payload is None else payload)
 
     def commit_receipted_transition(self, event_type, updated_state, receipt, *, result_sha256, claim_event_seq):
-        if event_type != "node_result_recorded":
+        if event_type not in {"node_result_recorded", "validator_result_recorded"}:
             raise StoreError("events.invalid_completion", "unsupported receipt event type")
         return self._commit_event(event_type, updated_state, {
             "receipt": receipt, "result_sha256": result_sha256, "claim_event_seq": claim_event_seq,
