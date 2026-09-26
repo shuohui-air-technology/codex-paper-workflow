@@ -72,7 +72,11 @@ class WorkflowService:
         return _document_data(self.store.load_draft())
 
     def save_draft(self, document, *, expected_document_revision):
-        parsed = document if isinstance(document, WorkflowDocument) else parse_workflow(document)
+        parsed = (
+            normalize_workflow_document(document)
+            if isinstance(document, WorkflowDocument)
+            else parse_workflow(document)
+        )
         return _document_data(self.store.save_draft(parsed, expected_document_revision=expected_document_revision))
 
     def activate(self, document, *, acknowledged_warning_codes=()):

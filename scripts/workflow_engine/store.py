@@ -63,6 +63,7 @@ from .schema import (
     behavior_payload,
     document_data,
     document_sha256,
+    normalize_workflow_document,
     parse_workflow,
 )
 
@@ -1936,6 +1937,10 @@ class WorkflowStore:
             "store.invalid_revision",
             maximum=_MAX_REVISION - 1,
         )
+        try:
+            document = normalize_workflow_document(document)
+        except WorkflowError as exc:
+            raise StoreError("store.draft_invalid", str(exc)) from exc
         with self._lock():
             self._ensure_locked_directory(self.paths.revisions)
             self._validate_revision_snapshots()

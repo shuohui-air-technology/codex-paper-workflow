@@ -298,6 +298,46 @@ class ValidatorFormTests(unittest.TestCase):
         self.assertIsNone(result.plan)
         self.assertEqual(result.errors[0].code, "schema.invalid_constructed_document")
 
+    def test_save_draft_rejects_forged_control_outcomes_before_any_file_write(self):
+        raw = json.loads((ROOT / "tests/fixtures/workflow_valid_branch_join.json").read_text())
+        parsed = parse_workflow(raw)
+        for node_type in ("condition", "join"):
+            forged = replace(parsed, nodes=tuple(
+                replace(node, outcomes=("forged",)) if node.type == node_type else node
+                for node in parsed.nodes
+            ))
+            with self.subTest(node_type=node_type), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                service = WorkflowService(root, skill_roots=(root,))
+                with self.assertRaises(WorkflowError) as service_error:
+                    service.save_draft(forged, expected_document_revision=0)
+                self.assertEqual(service_error.exception.code, "schema.document_noncanonical")
+                with self.assertRaises(StoreError) as store_error:
+                    WorkflowStore(root).save_draft(forged, expected_document_revision=0)
+                self.assertEqual(store_error.exception.code, "store.draft_invalid")
+                self.assertEqual(store_error.exception.__cause__.code, "schema.document_noncanonical")
+                self.assertFalse(service.store.paths.workflow.exists())
+                self.assertEqual(list(service.store.paths.revisions.glob("*.json")), [])
+
+                saved = service.save_draft(parsed, expected_document_revision=0)
+                self.assertEqual(saved["document_revision"], 1)
+                self.assertEqual(service.load_draft(), saved)
+                workflow_before = service.store.paths.workflow.read_bytes()
+                revisions_before = {
+                    path.name: path.read_bytes()
+                    for path in service.store.paths.revisions.glob("*.json")
+                }
+                with self.assertRaises(WorkflowError):
+                    service.save_draft(forged, expected_document_revision=1)
+                with self.assertRaises(StoreError):
+                    service.store.save_draft(forged, expected_document_revision=1)
+                self.assertEqual(service.store.paths.workflow.read_bytes(), workflow_before)
+                self.assertEqual(
+                    {path.name: path.read_bytes()
+                     for path in service.store.paths.revisions.glob("*.json")},
+                    revisions_before,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
