@@ -49,7 +49,7 @@ describe('Workflow Studio API client', () => {
 
     const [url, init] = fetchMock.mock.calls[0] ?? [];
     const headers = new Headers(init?.headers);
-    expect(url).toBe('/api/workflow');
+    expect(url).toBe('./api/workflow');
     expect(init?.method).toBe('PUT');
     expect(headers.get('Authorization')).toBe(`Bearer ${'t'.repeat(64)}`);
     expect(headers.get('X-Workflow-CSRF')).toBe('c'.repeat(64));

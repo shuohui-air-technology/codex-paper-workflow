@@ -68,31 +68,31 @@ export class ApiClient {
   }
 
   getBootstrap(): Promise<ApiEnvelope<BootstrapData>> {
-    return this.get('/api/bootstrap');
+    return this.get('./api/bootstrap');
   }
 
   getCatalog(): Promise<ApiEnvelope<CatalogData>> {
-    return this.get('/api/catalog');
+    return this.get('./api/catalog');
   }
 
   getProjection(): Promise<ApiEnvelope<ProjectionData>> {
-    return this.get('/api/projection');
+    return this.get('./api/projection');
   }
 
   getWorkflow(): Promise<ApiEnvelope<WorkflowData>> {
-    return this.get('/api/workflow');
+    return this.get('./api/workflow');
   }
 
   validateWorkflow(workflow: WorkflowDocument): Promise<ApiEnvelope<ValidationData>> {
-    return this.write('/api/validate', 'POST', { workflow });
+    return this.write('./api/validate', 'POST', { workflow });
   }
 
   compileWorkflow(workflow: WorkflowDocument): Promise<ApiEnvelope<CompileData>> {
-    return this.write('/api/compile', 'POST', { workflow });
+    return this.write('./api/compile', 'POST', { workflow });
   }
 
   saveWorkflow(workflow: WorkflowDocument, expectedDocumentRevision: number): Promise<ApiEnvelope<WorkflowData>> {
-    return this.write('/api/workflow', 'PUT', {
+    return this.write('./api/workflow', 'PUT', {
       workflow,
       expected_document_revision: expectedDocumentRevision,
     });
@@ -104,15 +104,15 @@ export class ApiClient {
     semantic_sha256: string;
     acknowledged_warning_codes: string[];
   }): Promise<ApiEnvelope<{ selection: SelectionData; run_id: string; document_revision: number }>> {
-    return this.write('/api/activate', 'POST', input);
+    return this.write('./api/activate', 'POST', input);
   }
 
   deactivateWorkflow(): Promise<ApiEnvelope<{ selection: SelectionData }>> {
-    return this.write('/api/deactivate', 'POST', {});
+    return this.write('./api/deactivate', 'POST', {});
   }
 
   shutdown(): Promise<ApiEnvelope<{ shutdown_requested: boolean }>> {
-    return this.write('/api/shutdown', 'POST', {});
+    return this.write('./api/shutdown', 'POST', {});
   }
 
   private get<T>(path: string): Promise<ApiEnvelope<T>> {
@@ -124,7 +124,7 @@ export class ApiClient {
   }
 
   private async request<T>(path: string, method: 'GET' | 'POST' | 'PUT', body?: object): Promise<ApiEnvelope<T>> {
-    if (!path.startsWith('/api/') || path.startsWith('//')) {
+    if (!path.startsWith('./api/') || path.includes('..') || path.includes('\\')) {
       throw new Error('Workflow Studio requests must use a local API route.');
     }
     const headers = new Headers({ Authorization: `Bearer ${this.sessionToken}` });

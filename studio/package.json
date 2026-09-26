@@ -10,7 +10,7 @@
     "dev": "vite",
     "typecheck": "tsc -b --pretty false",
     "test": "vitest",
-    "build": "vite build",
+    "build": "vite build && node scripts/write-license-inventory.mjs && node scripts/write-bundle-manifest.mjs",
     "e2e": "playwright test"
   },
   "dependencies": {

@@ -28,3 +28,75 @@ jobs:
 
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v
+
+  studio-unit:
+    name: Workflow Studio / deterministic offline bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Install locked frontend dependencies
+        working-directory: studio
+        run: npm ci --ignore-scripts
+
+      - name: Check frontend types
+        working-directory: studio
+        run: npm run typecheck
+
+      - name: Run frontend unit tests
+        working-directory: studio
+        run: npm test -- --run
+
+      - name: Rebuild the offline bundle
+        working-directory: studio
+        run: npm run build
+
+      - name: Verify bundle hashes and offline resources
+        run: python scripts/verify_workflow_studio_bundle.py assets/workflow-studio
+
+      - name: Require the committed bundle to match the clean build
+        run: git diff --exit-code -- assets/workflow-studio
+
+  studio-browser:
+    name: Workflow Studio / Chromium browser flow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Install locked frontend dependencies
+        working-directory: studio
+        run: npm ci --ignore-scripts
+
+      - name: Install Playwright Chromium
+        working-directory: studio
+        run: npx playwright install --with-deps chromium
+
+      - name: Exercise the real local Studio server in Chromium
+        working-directory: studio
+        run: npm run e2e -- --project=chromium
