@@ -38,6 +38,7 @@ from scripts.workflow_engine.scheduler import (
     result_transition,
     refresh_ready,
     rerun_stale_transition,
+    retry_transition,
     stabilize_control_nodes,
 )
 from scripts.workflow_engine.schema import document_sha256, parse_workflow
@@ -2991,6 +2992,129 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(
                 (recovered.status, recovered.code),
                 ("blocked", "events.invalid_stale_rerun"),
+            )
+            self.assertEqual(
+                (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before,
+            )
+
+    def test_task_retry_event_is_exact_and_rehashed_forgery_blocks_replay(self):
+        def failed_store(root, run_id):
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, run_id)
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", f"{run_id}-token")
+                commit_claim(transaction, running)
+                failed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "failed",
+                    "outcome": "", "outputs": {}, "artifacts": [],
+                })
+                commit_result(transaction, failed)
+            return store
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = failed_store(root, "run-task-retry-exact")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                expected = retry_transition(plan, state, "produce")
+                before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+                forged = replace(expected, nodes=MappingProxyType({
+                    "produce": replace(expected.nodes["produce"], attempt=2),
+                }))
+                cases = (
+                    (expected, {"node_id": "produce", "extra": True}),
+                    (forged, {"node_id": "produce"}),
+                )
+                for state_value, payload in cases:
+                    with self.subTest(payload=payload, attempt=state_value.nodes["produce"].attempt):
+                        with self.assertRaises(StoreError) as caught:
+                            transaction.commit_transition("node_retried", state_value, payload)
+                        self.assertEqual(caught.exception.code, "events.invalid_retry")
+                        self.assertEqual(
+                            (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before,
+                        )
+                event = transaction.commit_transition(
+                    "node_retried", expected, {"node_id": "produce"},
+                )
+                self.assertEqual(event.event_type, "node_retried")
+                self.assertEqual(event.payload["state"]["nodes"]["produce"]["attempt"], 1)
+            self.assertEqual(WorkflowStore(root).recover().status, "clean")
+
+        for boundary in ("suffix", "full_chain"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = failed_store(root, f"run-task-retry-forged-{boundary}")
+                with store.locked_run() as transaction:
+                    plan, state = transaction.load_active_run()
+                    expected = retry_transition(plan, state, "produce")
+                event = append_rehashed_state_event(
+                    store,
+                    workflow_store._state_data(expected),
+                    "node_retried",
+                    {"node_id": "not-produce"},
+                )
+                if boundary == "full_chain":
+                    snapshot = json.loads(store.paths.state.read_text(encoding="utf-8"))
+                    snapshot["state"] = workflow_store._state_data(expected)
+                    snapshot["last_applied_event_seq"] = event.event_seq
+                    snapshot["last_applied_event_hash"] = event.event_hash
+                    store.paths.state.write_text(
+                        json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+                recovered = WorkflowStore(root).recover()
+                self.assertEqual(
+                    (recovered.status, recovered.code),
+                    ("blocked", "events.invalid_retry"),
+                )
+                self.assertEqual(
+                    (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before,
+                )
+
+    def test_stopped_run_cannot_replay_a_hash_valid_task_retry(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, "run-task-retry-after-stop")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", "retry-stop-token")
+                commit_claim(transaction, running)
+                failed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "failed",
+                    "outcome": "", "outputs": {}, "artifacts": [],
+                })
+                commit_result(transaction, failed)
+            store.deactivate_custom()
+            with store._lock():
+                material = store._validated_run_material(
+                    allow_truncated=False, require_no_suffix=True,
+                )
+            plan, state, sequence, event_hash, status, _events, _tail, _prefix, _witnesses = material
+            self.assertEqual(status, "stopped")
+            updated = retry_transition(plan, state, "produce")
+            event = WorkflowEvent.create(
+                event_seq=sequence + 1,
+                run_id=state.run_id,
+                semantic_sha256=plan.semantic_sha256,
+                event_type="node_retried",
+                payload={"node_id": "produce", "state": workflow_store._state_data(updated),
+                         "run_status": "stopped"},
+                previous_event_hash=event_hash,
+            )
+            with store.paths.events.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    event.to_payload(), sort_keys=True, separators=(",", ":")
+                ) + "\n")
+            before = store.paths.events.read_bytes(), store.paths.state.read_bytes()
+            recovered = WorkflowStore(root).recover()
+            self.assertEqual(
+                (recovered.status, recovered.code),
+                ("blocked", "events.lifecycle_invalid"),
             )
             self.assertEqual(
                 (store.paths.events.read_bytes(), store.paths.state.read_bytes()), before,

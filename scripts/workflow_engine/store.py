@@ -52,6 +52,7 @@ from .scheduler import (
     result_transition,
     rerun_stale_transition,
     claim_transition,
+    retry_transition,
     validator_claim_transition,
     validator_result_transition,
     validator_retry_transition,
@@ -490,6 +491,11 @@ def _validate_lifecycle_step(
         raise StoreError(
             "events.invalid_stale_rerun",
             "stale reruns are valid only within an active run",
+        )
+    if previous_status in {"stopped", "archived"}:
+        raise StoreError(
+            "events.lifecycle_invalid",
+            "stopped or archived runs cannot accept additional runtime events",
         )
     if event.event_seq == 1:
         if (
@@ -1337,6 +1343,18 @@ def validate_node_evidence_delta(
                 "stale rerun event differs from the scheduler's deterministic transition",
             )
         return
+    if event_type == "node_retried":
+        fields = set(payload) - {"state", "run_status"}
+        node_id = payload.get("node_id")
+        if fields != {"node_id"} or not isinstance(node_id, str) or node_id not in plan.nodes:
+            raise StoreError("events.invalid_retry", "task retry requires one named node")
+        try:
+            expected = retry_transition(plan, before, node_id)
+        except WorkflowError as exc:
+            raise StoreError("events.invalid_retry", str(exc)) from exc
+        if expected == before or _state_data(expected) != _state_data(after):
+            raise StoreError("events.invalid_retry", "task retry differs from scheduler transition")
+        return
     if event_type == "validator_retried":
         fields = set(payload) - {"state", "run_status"}
         node_id = payload.get("node_id")
@@ -1998,7 +2016,7 @@ class WorkflowStore:
             history.append(candidate)
         return tuple(history)
 
-    def _selection_unlocked(self) -> Selection:
+    def _selection_unlocked(self, *, repair_projection: bool = True) -> Selection:
         self._checked(self.paths.selection)
         selection_exists = self.paths.selection.exists() or self.paths.selection.is_symlink()
         journal_exists = self.paths.audit_events.exists() or self.paths.audit_events.is_symlink()
@@ -2033,7 +2051,8 @@ class WorkflowStore:
                     "selection projection conflicts with its journal boundary",
                 )
         if projected is None or projected.selection_revision < tip.selection_revision:
-            self._atomic_json(self.paths.selection, tip.to_payload())
+            if repair_projection:
+                self._atomic_json(self.paths.selection, tip.to_payload())
             return tip
         if (
             projected.selection_revision > tip.selection_revision

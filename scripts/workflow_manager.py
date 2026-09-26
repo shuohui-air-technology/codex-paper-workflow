@@ -24,8 +24,9 @@ from scripts.workflow_engine.receipts import (
 )
 from scripts.workflow_engine.scheduler import (
     ArtifactRuntime, NodeStatus, claim_transition, ready_node_ids, refresh_ready,
-    result_transition, stabilize_control_nodes, validator_claim_transition,
+    result_transition, retry_transition, stabilize_control_nodes, validator_claim_transition,
     validator_result_transition,
+    validator_retry_transition,
 )
 from scripts.workflow_engine.schema import (
     WorkflowDocument, WorkflowError, document_sha256, normalize_workflow_document, parse_workflow,
@@ -105,9 +106,9 @@ class WorkflowService:
         state = self.store.start_run(compiled.plan, "run-" + secrets.token_hex(16))
         return {"status": "pass", "selection": selection.to_payload(), "run_id": state.run_id}
 
-    def _load(self, transaction):
+    def _load(self, transaction, *, repair_selection=True):
         plan, state = transaction.load_active_run()
-        selection = self.store._selection_unlocked()
+        selection = self.store._selection_unlocked(repair_projection=repair_selection)
         if selection.mode != "custom" or selection.semantic_sha256 != plan.semantic_sha256:
             raise WorkflowManagerError("runtime.selection_mismatch", "run is not the selected custom workflow")
         return plan, state
@@ -351,3 +352,84 @@ class WorkflowService:
                 result_sha256=digest, claim_event_seq=claim_event.event_seq)
             self._stabilize(transaction, plan, updated)
             return receipt
+
+    def rerun_stale(self, node_id):
+        """Explicitly requeue a stale closure; execution remains a separate claim."""
+        if not isinstance(node_id, str):
+            raise WorkflowManagerError("runtime.invalid_stale_rerun", "stale rerun requires one node ID")
+        with self.store.locked_run() as transaction:
+            plan, _state = self._load(transaction)
+            if node_id not in plan.nodes:
+                raise WorkflowManagerError("runtime.invalid_stale_rerun", "stale rerun target is unknown")
+            event = transaction.request_stale_rerun(node_id)
+        return {
+            "status": "pass",
+            "root_node_id": event.payload["root_node_id"],
+            "affected_node_ids": list(event.payload["affected_node_ids"]),
+            "attempts_before": dict(event.payload["attempts_before"]),
+            "attempts_after": dict(event.payload["attempts_after"]),
+        }
+
+    def retry(self, node_id):
+        """Retry one failed/interrupted executable node without advancing its attempt."""
+        with self.store.locked_run() as transaction:
+            plan, state = self._load(transaction)
+            if not isinstance(node_id, str) or node_id not in plan.nodes:
+                raise WorkflowManagerError("runtime.unknown_node", "unknown node")
+            node = plan.nodes[node_id]
+            if node.type == "task":
+                event_type = "node_retried"
+                updated = retry_transition(plan, state, node_id)
+            elif node.type == "validator":
+                event_type = "validator_retried"
+                updated = validator_retry_transition(plan, state, node_id)
+            else:
+                raise WorkflowManagerError("runtime.node_type", "only task or validator nodes can be retried")
+            transaction.commit_transition(event_type, updated, {"node_id": node_id})
+            stabilized = self._stabilize(transaction, plan, updated)
+            runtime = stabilized.nodes[node_id]
+            return {
+                "status": "pass",
+                "node_id": node_id,
+                "node_status": runtime.status.value,
+                "attempt": runtime.attempt,
+            }
+
+    def summary(self):
+        """Return a deterministic, read-only summary of the active custom run."""
+        with self.store.locked_run() as transaction:
+            plan, state = self._load(transaction, repair_selection=False)
+            return {
+                "status": "pass",
+                "workflow_id": plan.workflow_id,
+                "semantic_revision": plan.semantic_revision,
+                "semantic_sha256": plan.semantic_sha256,
+                "run_id": state.run_id,
+                "run_status": "active",
+                "nodes": [
+                    {
+                        "node_id": node_id,
+                        "node_type": plan.nodes[node_id].type,
+                        "status": state.nodes[node_id].status.value,
+                        "attempt": state.nodes[node_id].attempt,
+                        "outcome": state.nodes[node_id].outcome,
+                    }
+                    for node_id in sorted(plan.nodes)
+                ],
+                "artifacts": [
+                    {
+                        "artifact_id": artifact_id,
+                        "path": artifact.path,
+                        "sha256": artifact.sha256,
+                        "state": artifact.state,
+                        "producer_node_id": artifact.producer_node_id,
+                        "producer_attempt": artifact.producer_attempt,
+                    }
+                    for artifact_id, artifact in sorted(state.artifacts.items())
+                ],
+            }
+
+    def deactivate(self):
+        """Stop the active custom run and return the authoritative selection."""
+        selection = self.store.deactivate_custom()
+        return {"status": "pass", "selection": selection.to_payload()}

@@ -673,6 +673,85 @@ class TaskProtocolTests(unittest.TestCase):
                 self.assertEqual((recovered.status, recovered.code), ("blocked", "receipt.inspection_failed"))
                 self.assertEqual((store.paths.events.read_bytes(), store.paths.state.read_bytes()), before)
 
+    def test_rerun_stale_requeues_without_claim_and_invalid_target_is_zero_write(self):
+        before = self.service.store.paths.events.read_bytes()
+        with self.assertRaises(Exception) as invalid:
+            self.service.rerun_stale("directions")
+        self.assertEqual(invalid.exception.code, "runtime.invalid_stale_rerun")
+        self.assertEqual(self.service.store.paths.events.read_bytes(), before)
+
+        invocation = self.service.claim("directions")
+        self.service.submit_result(self.result(invocation))
+        (self.project / "idea.md").write_text("changed", encoding="utf-8")
+        self.service.store.recover()
+        before_claims = sum(
+            event.event_type == "node_claimed"
+            for event in self.service.store.read_run_events()
+        )
+        response = self.service.rerun_stale("directions")
+        self.assertEqual(response["affected_node_ids"], ["directions"])
+        self.assertEqual(response["root_node_id"], "directions")
+        self.assertEqual(
+            sum(event.event_type == "node_claimed" for event in self.service.store.read_run_events()),
+            before_claims,
+        )
+        with self.service.store.locked_run() as transaction:
+            _plan, state = transaction.load_active_run()
+        self.assertEqual(state.nodes["directions"].status.value, "ready")
+        self.assertEqual(state.nodes["directions"].attempt, 1)
+        self.assertEqual(state.artifacts["research_idea_brief"].state, "stale")
+
+    def test_task_retry_summary_and_deactivate_lifecycle(self):
+        invocation = self.service.claim("directions")
+        failed = dict(
+            task_result(), run_id=invocation["run_id"], node_id="directions",
+            attempt=invocation["attempt"], idempotency_token=invocation["idempotency_token"],
+            status="failed", outcome="", artifacts=[],
+            error={"code": "test.failure", "message": "Fixture task failure."},
+        )
+        receipt = self.service.submit_result(failed)
+        self.assertEqual(receipt["status"], "failed")
+        retry = self.service.retry("directions")
+        self.assertEqual(retry["attempt"], 1)
+        self.assertEqual(retry["node_status"], "ready")
+        self.assertEqual(self.service.store.read_run_events()[-1].event_type, "node_retried")
+
+        before = self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()
+        first, second = self.service.summary(), self.service.summary()
+        self.assertEqual(first, second)
+        self.assertEqual(first["run_status"], "active")
+        self.assertEqual(first["nodes"][0]["node_id"], "directions")
+        self.assertEqual((self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()), before)
+
+        deactivated = self.service.deactivate()
+        self.assertEqual(deactivated["selection"]["mode"], "official")
+        snapshot = json.loads(self.service.store.paths.state.read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["run_status"], "stopped")
+
+    def test_summary_does_not_repair_a_lagging_selection_projection(self):
+        from scripts.workflow_engine.store import Selection
+
+        store = self.service.store
+        store.paths.selection.write_text(
+            json.dumps(Selection("official").to_payload(), sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        before = (
+            store.paths.selection.read_bytes(),
+            store.paths.events.read_bytes(),
+            store.paths.state.read_bytes(),
+        )
+        summary = self.service.summary()
+        self.assertEqual(summary["run_status"], "active")
+        self.assertEqual(
+            (
+                store.paths.selection.read_bytes(),
+                store.paths.events.read_bytes(),
+                store.paths.state.read_bytes(),
+            ),
+            before,
+        )
+
 
 class ValidatorManagerTests(unittest.TestCase):
     PAPER = (
@@ -778,6 +857,17 @@ class ValidatorManagerTests(unittest.TestCase):
         self.assertEqual(claim["validator_config"]["options"]["language"], "en")
         self.assertEqual(claim["input_artifacts"][0]["sha256"], receipt["input_artifacts"][0]["sha256"])
         self.assertEqual(self.service.store.recover().status, "clean")
+
+    def test_failed_validator_retry_requeues_same_attempt_without_running_it(self):
+        from scripts.workflow_engine.validators import ValidatorError
+        self.activate()
+        with mock.patch("scripts.workflow_manager.run_registered_validator",
+                        side_effect=ValidatorError("validator.fixture_failure", "fixture failure")):
+            receipt = self.service.run_validator("check")
+        self.assertEqual(receipt["status"], "failed")
+        retry = self.service.retry("check")
+        self.assertEqual((retry["node_status"], retry["attempt"]), ("ready", 1))
+        self.assertEqual(self.service.store.read_run_events()[-1].event_type, "validator_retried")
 
     def test_domain_fail_and_blocked_are_successful_validator_completions(self):
         (self.project / "paper.md").write_text("# A paper\n", encoding="utf-8")
