@@ -2601,6 +2601,108 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(store.paths.events.read_bytes(), events_before)
             self.assertEqual(store.paths.state.read_bytes(), state_before)
 
+    def test_prior_attempt_stale_artifact_requires_exact_historical_success_receipt(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact_path = root / "artifact.txt"
+            artifact_path.write_bytes(b"artifact")
+            store = WorkflowStore(root)
+            plan = task_plan()
+            store.start_run(plan, "run-prior-attempt-stale-proof")
+            with store.locked_run() as transaction:
+                plan, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", "attempt-one")
+                commit_claim(transaction, running)
+                completed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "artifact.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "artifact.txt", sha256_bytes(b"artifact"),
+                        "verified", "produce", 1,
+                    )],
+                })
+                commit_result(transaction, completed)
+
+            with store.locked_run() as transaction:
+                plan, completed = transaction.load_active_run()
+                history = transaction.events()
+            stale_artifact = replace(completed.artifacts["draft"], state="stale")
+            # Model a later attempt whose mutable runtime path no longer points at
+            # the stale artifact; only its earlier success receipt may authorize it.
+            later_runtime = replace(
+                completed.nodes["produce"], status=NodeStatus.RUNNING, attempt=2,
+                outputs=MappingProxyType({"draft": "later-attempt.txt"}),
+                claim_token_hash=sha256_bytes(b"attempt-two"),
+            )
+            later_state = replace(
+                completed,
+                nodes=MappingProxyType({"produce": later_runtime}),
+                artifacts=MappingProxyType({"draft": stale_artifact}),
+            )
+            workflow_store._validate_artifact_authority(plan, later_state, history)
+
+            invalid_cases = {
+                "missing_history": (later_state, ()),
+                "wrong_path": (
+                    replace(later_state, artifacts=MappingProxyType({
+                        "draft": replace(stale_artifact, path="other.txt"),
+                    })), history,
+                ),
+                "wrong_hash": (
+                    replace(later_state, artifacts=MappingProxyType({
+                        "draft": replace(stale_artifact, sha256=sha256_bytes(b"other")),
+                    })), history,
+                ),
+                "mutable_output_without_receipt": (
+                    replace(later_state, nodes=MappingProxyType({
+                        "produce": replace(later_runtime, outputs=MappingProxyType({"draft": "artifact.txt"})),
+                    })), (),
+                ),
+                "undeclared_historical_producer": (
+                    replace(later_state, artifacts=MappingProxyType({
+                        "draft": replace(stale_artifact, producer_node_id="other-producer"),
+                    })), history,
+                ),
+                "invalid_prior_attempt": (
+                    replace(later_state, artifacts=MappingProxyType({
+                        "draft": replace(stale_artifact, producer_attempt=0),
+                    })), history,
+                ),
+            }
+            for name, (candidate, events) in invalid_cases.items():
+                with self.subTest(name=name), self.assertRaises(StoreError) as caught:
+                    workflow_store._validate_artifact_authority(plan, candidate, events)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+
+            for field, value in (("node_id", "other-producer"), ("attempt", 2)):
+                forged_history = list(history)
+                result_index = next(
+                    index for index, event in enumerate(forged_history)
+                    if event.event_type == "node_result_recorded"
+                )
+                original = forged_history[result_index]
+                forged_payload = json.loads(workflow_store._canonical_bytes(original.payload))
+                forged_payload["receipt"][field] = value
+                forged_history[result_index] = replace(original, payload=forged_payload)
+                with self.subTest(receipt_field=field), self.assertRaises(StoreError) as caught:
+                    workflow_store._validate_artifact_authority(plan, later_state, forged_history)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+
+            for field, value in (("id", "other"), ("path", "other.txt"),
+                                 ("sha256", sha256_bytes(b"other"))):
+                forged_history = list(history)
+                result_index = next(
+                    index for index, event in enumerate(forged_history)
+                    if event.event_type == "node_result_recorded"
+                )
+                original = forged_history[result_index]
+                forged_payload = json.loads(workflow_store._canonical_bytes(original.payload))
+                forged_payload["receipt"]["output_artifacts"][0][field] = value
+                forged_history[result_index] = replace(original, payload=forged_payload)
+                with self.subTest(receipt_output_field=field), self.assertRaises(StoreError) as caught:
+                    workflow_store._validate_artifact_authority(plan, later_state, forged_history)
+                self.assertEqual(caught.exception.code, "artifact.authority_invalid")
+
     def test_verified_produced_artifact_requires_completed_matching_attempt(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

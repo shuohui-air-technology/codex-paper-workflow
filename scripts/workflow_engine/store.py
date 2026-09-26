@@ -998,7 +998,60 @@ def _validate_state_binding(plan: CompiledPlan, state: RunState) -> None:
         )
 
 
-def _validate_artifact_authority(plan: CompiledPlan, state: RunState) -> None:
+def _has_historical_output_receipt(
+    plan: CompiledPlan,
+    state: RunState,
+    events: Sequence[WorkflowEvent],
+    *,
+    artifact_id: str,
+    producer_node_id: str,
+    producer_attempt: int,
+    path: str,
+    sha256: str,
+) -> bool:
+    """Return whether a prior validated task-success receipt binds this artifact.
+
+    Callers supply only events preceding the state being checked, except for the
+    snapshot's preliminary state check, which is followed by a complete ordered
+    replay before that state is accepted.
+    """
+    for event in events:
+        if (
+            event.event_type != "node_result_recorded"
+            or event.run_id != state.run_id
+            or event.semantic_sha256 != plan.semantic_sha256
+        ):
+            continue
+        try:
+            receipt = validate_stage_receipt(event.payload.get("receipt"))
+        except ReceiptError:
+            continue
+        if (
+            receipt["workflow_id"] != plan.workflow_id
+            or receipt["semantic_revision"] != plan.semantic_revision
+            or receipt["semantic_sha256"] != plan.semantic_sha256
+            or receipt["run_id"] != state.run_id
+            or receipt["node_type"] != "task"
+            or receipt["status"] != "succeeded"
+            or receipt["node_id"] != producer_node_id
+            or receipt["attempt"] != producer_attempt
+        ):
+            continue
+        if any(
+            output["id"] == artifact_id
+            and output["path"] == path
+            and output["sha256"] == sha256
+            for output in receipt["output_artifacts"]
+        ):
+            return True
+    return False
+
+
+def _validate_artifact_authority(
+    plan: CompiledPlan,
+    state: RunState,
+    events: Sequence[WorkflowEvent] = (),
+) -> None:
     for artifact_id, artifact in state.artifacts.items():
         if artifact.producer_node_id == _EXTERNAL_PRODUCER:
             valid = (
@@ -1008,18 +1061,38 @@ def _validate_artifact_authority(plan: CompiledPlan, state: RunState) -> None:
         else:
             producer = plan.nodes.get(artifact.producer_node_id)
             runtime = state.nodes.get(artifact.producer_node_id)
-            valid = (
+            declared = (
                 producer is not None
                 and runtime is not None
                 and artifact_id in producer.outputs
                 and artifact.producer_attempt > 0
+                and artifact.producer_attempt <= runtime.attempt
+            )
+            current_attempt = (
+                declared
+                and runtime is not None
                 and artifact.producer_attempt == runtime.attempt
                 and runtime.outputs.get(artifact_id) == artifact.path
-                and (
-                    artifact.state != "verified"
-                    or runtime.status is NodeStatus.SUCCEEDED
-                )
             )
+            if artifact.state == "verified":
+                valid = current_attempt and runtime is not None and runtime.status is NodeStatus.SUCCEEDED
+            elif artifact.state == "stale":
+                valid = current_attempt or (
+                    declared
+                    and artifact.producer_attempt < runtime.attempt
+                    and _has_historical_output_receipt(
+                        plan,
+                        state,
+                        events,
+                        artifact_id=artifact_id,
+                        producer_node_id=artifact.producer_node_id,
+                        producer_attempt=artifact.producer_attempt,
+                        path=artifact.path,
+                        sha256=artifact.sha256,
+                    )
+                )
+            else:
+                valid = False
         if not valid:
             raise StoreError(
                 "artifact.authority_invalid",
@@ -2357,7 +2430,7 @@ class WorkflowStore:
                 resolve_project_path(self.project_root, artifact.path)
             except PathSafetyError as exc:
                 raise StoreError("path.unsafe", "runtime artifact path is not project-contained") from exc
-        _validate_artifact_authority(plan, state)
+        _validate_artifact_authority(plan, state, events)
         previous_status: str | None = None
         previous_state: RunState | None = None
         witnesses: EdgeWitnesses = {}
@@ -2433,7 +2506,7 @@ class WorkflowStore:
                 resolve_project_path(self.project_root, artifact.path)
             except PathSafetyError as exc:
                 raise StoreError("events.unreplayable", "event artifact path is unsafe") from exc
-        _validate_artifact_authority(plan, state)
+        _validate_artifact_authority(plan, state, prior_events)
         _validate_edge_and_winner_transition(
             plan, previous_state, state, event.event_type, event.payload
         )
@@ -3270,7 +3343,7 @@ class WorkflowTransaction:
         if not recovery_drift_boundary:
             self.store._require_verified_artifact_bytes(updated_state)
         self.store._require_artifact_paths_contained(updated_state)
-        _validate_artifact_authority(plan, updated_state)
+        _validate_artifact_authority(plan, updated_state, self._events)
         _validate_edge_and_winner_transition(
             plan, current, updated_state, event_type, payload
         )
@@ -3457,7 +3530,7 @@ class WorkflowTransaction:
         if not transitions:
             self._validate_binding(plan, final_state)
             _raw_final, normalized_final = _validated_state_data(final_state)
-            _validate_artifact_authority(plan, normalized_final)
+            _validate_artifact_authority(plan, normalized_final, self._events)
             self.store._require_verified_artifact_bytes(normalized_final)
             self.store._require_artifact_paths_contained(normalized_final)
             if _canonical_bytes(_state_data(current)) != _canonical_bytes(_state_data(final_state)):
@@ -3496,7 +3569,7 @@ class WorkflowTransaction:
             next_status = self._run_status
         self._validate_binding(plan, final_state)
         _raw_final, normalized_final = _validated_state_data(final_state)
-        _validate_artifact_authority(plan, normalized_final)
+        _validate_artifact_authority(plan, normalized_final, self._events)
         self.store._require_verified_artifact_bytes(normalized_final)
         self.store._require_artifact_paths_contained(normalized_final)
         if _canonical_bytes(_state_data(intermediate)) != _canonical_bytes(_state_data(final_state)):
