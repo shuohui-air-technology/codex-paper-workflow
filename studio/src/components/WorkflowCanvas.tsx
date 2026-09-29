@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react';
 import {
   Background,
   BackgroundVariant,
@@ -7,6 +8,7 @@ import {
   MarkerType,
   type Connection,
   type Edge,
+  type ReactFlowInstance,
 } from '@xyflow/react';
 import type { SkillCatalogEntry, ValidatorCatalogEntry, WorkflowDocument } from '../types';
 import { ConditionNode } from '../nodes/ConditionNode';
@@ -32,6 +34,9 @@ interface WorkflowCanvasProps {
   onMoveNode: (nodeId: string, position: { x: number; y: number }) => void;
   onConnect: (connection: Connection) => void;
   onDeleteEdges: (edges: Edge[]) => void;
+  onDeselect: () => void;
+  focusRequest: number;
+  layoutRequest: number;
 }
 
 export function WorkflowCanvas({
@@ -44,7 +49,34 @@ export function WorkflowCanvas({
   onMoveNode,
   onConnect,
   onDeleteEdges,
+  onDeselect,
+  focusRequest,
+  layoutRequest,
 }: WorkflowCanvasProps) {
+  const [flow, setFlow] = useState<ReactFlowInstance<WorkflowFlowNode, Edge> | null>(null);
+  const canvasArea = useRef<HTMLDivElement>(null);
+  const consumedFocus = useRef(0);
+  useEffect(() => {
+    if (!flow || !canvasArea.current) return;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => { void flow.fitView({ padding: 0.2 }); });
+    });
+    observer.observe(canvasArea.current);
+    return () => { observer.disconnect(); cancelAnimationFrame(frame); };
+  }, [flow]);
+  useEffect(() => {
+    if (!flow || focusRequest === consumedFocus.current) return;
+    consumedFocus.current = focusRequest;
+    if (!selectedNodeId) return;
+    void flow.fitView({ nodes: [{ id: selectedNodeId }], padding: 0.8, maxZoom: 1, duration: 180 });
+  }, [flow, focusRequest, selectedNodeId]);
+  useEffect(() => {
+    if (!flow) return;
+    const frame = requestAnimationFrame(() => { void flow.fitView({ padding: 0.2, duration: 180 }); });
+    return () => cancelAnimationFrame(frame);
+  }, [flow, layoutRequest]);
   const nodes: WorkflowFlowNode[] = workflow ? workflow.nodes.map((node) => {
     const skill = node.type === 'task' ? skills.find((item) => item.catalog_id === node.skill_ref) : undefined;
     const validator = node.type === 'validator' ? validators.find((item) => item.validator_id === node.validator_ref) : undefined;
@@ -71,7 +103,7 @@ export function WorkflowCanvas({
     id: edge.id,
     source: edge.source,
     target: edge.target,
-    label: edge.trigger,
+    label: ({ succeeded: '完成', pass: '通过', fail: '未通过', blocked: '需处理', default: '默认' } as Record<string, string>)[edge.trigger] ?? edge.trigger,
     type: 'smoothstep',
     selectable: !readOnly,
     deletable: !readOnly,
@@ -99,7 +131,7 @@ export function WorkflowCanvas({
           <span><i className="legend-dot legend-dot--join" />汇合</span>
         </div>
       </div>
-      <div className="canvas-area" role="region" aria-label="可视化工作流图">
+      <div className="canvas-area" ref={canvasArea} role="region" aria-label="可视化工作流图">
         {!workflow || workflow.nodes.length === 0 ? (
           <div className="canvas-empty">
             <span aria-hidden="true">✧</span>
@@ -120,18 +152,20 @@ export function WorkflowCanvas({
             minZoom={0.25}
             maxZoom={1.6}
             onNodeClick={(_event, node) => onSelectNode(node.id)}
+            onInit={setFlow}
+            onPaneClick={onDeselect}
             onNodeDragStop={(_event, node) => onMoveNode(node.id, node.position)}
             onConnect={handleConnect}
             onEdgesDelete={(deleted) => { if (!readOnly) onDeleteEdges(deleted); }}
             proOptions={{ hideAttribution: true }}
           >
             <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#d9e0ea" />
-            <MiniMap
+            {nodes.length > 5 && <MiniMap
               pannable
               zoomable
               nodeColor={(node) => ({ task: '#4f77d6', condition: '#c98b32', validator: '#259a7a', join: '#8a66bb' }[node.type ?? 'task'] ?? '#4f77d6')}
               maskColor="rgba(244,247,251,0.75)"
-            />
+            />}
             <Controls showInteractive={false} />
           </ReactFlow>
         )}

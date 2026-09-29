@@ -7,6 +7,9 @@ interface NodePaletteProps {
   onAddNode: (type: WorkflowNodeType, skillRef?: string) => void;
   onRefresh: () => void;
   refreshing: boolean;
+  placement: 'after' | 'detached';
+  onPlacementChange: (placement: 'after' | 'detached') => void;
+  selectedNodeName: string | null;
 }
 
 const NODE_OPTIONS: Array<{ type: WorkflowNodeType; label: string; description: string; icon: string }> = [
@@ -16,7 +19,7 @@ const NODE_OPTIONS: Array<{ type: WorkflowNodeType; label: string; description: 
   { type: 'validator', label: '验证阶段', description: '运行项目内置的安全检查', icon: '✓' },
 ];
 
-export function NodePalette({ skills, editable, onAddNode, onRefresh, refreshing }: NodePaletteProps) {
+export function NodePalette({ skills, editable, onAddNode, onRefresh, refreshing, placement, onPlacementChange, selectedNodeName }: NodePaletteProps) {
   const [query, setQuery] = useState('');
   const visibleSkills = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -34,6 +37,7 @@ export function NodePalette({ skills, editable, onAddNode, onRefresh, refreshing
         </div>
       </div>
       {!editable && <p className="muted-note">官方流程仅供查看。复制为自定义流程后即可编排。</p>}
+      {editable && <label className="field palette-placement"><span className="field__label">新阶段添加位置</span><select aria-label="新阶段添加位置" value={placement} onChange={(event) => onPlacementChange(event.target.value as 'after' | 'detached')}><option value="after">接在所选阶段之后</option><option value="detached">独立添加，稍后连接</option></select><small className="field__help">{placement === 'after' && selectedNodeName ? `接在「${selectedNodeName}」之后，自动连接。` : '作为独立阶段添加，可通过连接表单安排顺序。'}</small></label>}
       <div className="palette-control-list">
         {NODE_OPTIONS.map((option) => (
           <button
@@ -61,7 +65,7 @@ export function NodePalette({ skills, editable, onAddNode, onRefresh, refreshing
       </label>
       <div className="skill-list">
         {visibleSkills.map((skill) => (
-          <button type="button" className="skill-choice" key={skill.catalog_id} disabled={!editable} onClick={() => onAddNode('task', skill.catalog_id)}>
+          <button type="button" className="skill-choice" key={skill.catalog_id} disabled={!editable} title={skill.description || skill.display_name} onClick={() => onAddNode('task', skill.catalog_id)}>
             <span className="skill-choice__symbol" aria-hidden="true">✧</span>
             <span className="skill-choice__copy">
               <strong>{skill.display_name}</strong>

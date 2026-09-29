@@ -45,14 +45,17 @@ export function StudioHeader({
         <span className={`mode-badge${bootstrap.mode === 'custom' ? ' mode-badge--custom' : ''}`}>
           {bootstrap.mode === 'custom' ? '自定义流程已启用' : '官方流程 v1.0'}
         </span>
+        {editable && bootstrap.mode === 'official' && (
+          <span className="draft-editing-label">正在编辑自定义草稿</span>
+        )}
         {!editable && <span className="readonly-label">只读预览</span>}
       </div>
       <div className="studio-header__actions" aria-label="工作流操作">
         {!editable ? (
           <>
             {hasSavedDraft && <button type="button" className="button button--quiet" onClick={onOpenSavedDraft}>打开已保存草稿</button>}
-            <button type="button" className="button button--quiet" onClick={onCopyOfficial}>复制为自定义流程</button>
-            <button type="button" className="button button--primary" onClick={onNewBlank}>新建空白流程</button>
+            <button type="button" className="button button--primary" onClick={onCopyOfficial}>复制为自定义流程</button>
+            <button type="button" className="button button--quiet" onClick={onNewBlank}>新建空白流程</button>
           </>
         ) : (
           <>

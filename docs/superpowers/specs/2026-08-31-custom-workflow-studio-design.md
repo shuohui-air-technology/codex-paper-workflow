@@ -193,7 +193,8 @@ is never the execution source for the official default path.
 
 A recognized Skill has a valid `SKILL.md`, a normalized metadata name matching
 its catalog ID, and a resolved path contained by an allowed Skill root. A
-symlink is accepted only when its resolved target remains inside that same root.
+direct-child Skill symlink is accepted only when its resolved target remains
+inside that same root; nested symlinks inside a Skill tree are rejected.
 Two copies with the same catalog ID and different content are `ambiguous` and
 cannot be selected. Byte-identical duplicates collapse to one identity.
 
@@ -623,7 +624,9 @@ The approved desktop layout contains:
 
 Typical flow:
 
-1. From the research project, run `python3 scripts/workflow_studio.py --project .`.
+1. From the research project directory, run the installed Studio launcher:
+   `python3 "${CODEX_HOME:-$HOME/.codex}/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .`.
+   Set `CODEX_HOME` in that shell when using a custom installation location.
 2. The browser opens the official v1.0 Studio projection in read-only mode.
 3. Choose **Copy as custom workflow** or create a blank custom workflow.
 4. Add task, condition, join, or validator nodes.

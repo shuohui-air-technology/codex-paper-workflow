@@ -8,9 +8,10 @@ interface ValidationPanelProps {
   lastValidated: boolean;
   busy: boolean;
   advisoryHints: LocalWorkflowHint[];
+  onLocateIssue?: (issue: { node_id?: string; edge_id?: string }) => void;
 }
 
-export function ValidationPanel({ errors, warnings, projectionNotes, lastValidated, busy, advisoryHints }: ValidationPanelProps) {
+export function ValidationPanel({ errors, warnings, projectionNotes, lastValidated, busy, advisoryHints, onLocateIssue }: ValidationPanelProps) {
   const hasResults = lastValidated || errors.length > 0 || warnings.length > 0 || advisoryHints.length > 0;
   const waitingForServer = !lastValidated && !busy && (errors.length > 0 || warnings.length > 0 || advisoryHints.length > 0);
   return (
@@ -31,20 +32,20 @@ export function ValidationPanel({ errors, warnings, projectionNotes, lastValidat
       {errors.length > 0 && (
         <div className="issue-group issue-group--error">
           <h3>需要修正</h3>
-          <ul>{errors.map((issue, index) => <li key={`${issue.code}-${issue.node_id}-${index}`}><strong>{issue.message}</strong><span>{issue.recovery}</span></li>)}</ul>
+          <ul>{errors.map((issue, index) => <li key={`${issue.code}-${issue.node_id}-${index}`}><strong>{issue.message}</strong><span>{issue.recovery}</span>{onLocateIssue && <button type="button" className="text-button issue-locate" onClick={() => onLocateIssue(issue)}>{issue.node_id || issue.edge_id ? '定位相关阶段' : '查看流程设置'}</button>}</li>)}</ul>
         </div>
       )}
       {warnings.length > 0 && (
         <div className="issue-group issue-group--warning">
           <h3>风险提示</h3>
-          <ul>{warnings.map((issue, index) => <li key={`${issue.code}-${issue.node_id}-${index}`}><strong>{issue.message}</strong><span>{issue.recovery}</span></li>)}</ul>
+          <ul>{warnings.map((issue, index) => <li key={`${issue.code}-${issue.node_id}-${index}`}><strong>{issue.message}</strong><span>{issue.recovery}</span>{onLocateIssue && (issue.node_id || issue.edge_id) && <button type="button" className="text-button issue-locate" onClick={() => onLocateIssue(issue)}>定位相关阶段</button>}</li>)}</ul>
         </div>
       )}
       {advisoryHints.length > 0 && (
         <div className="issue-group issue-group--note">
           <h3>编辑提示（仅供参考）</h3>
           <p className="muted-note">这些提示由编辑器快速检查生成，不会替代服务端验证，也不会单独阻止保存或启用。</p>
-          <ul>{advisoryHints.map((hint) => <li key={`${hint.code}-${hint.node_id}`}><strong>{hint.message}</strong>{hint.node_id && <span>阶段：{hint.node_id}</span>}</li>)}</ul>
+          <ul>{advisoryHints.map((hint) => <li key={`${hint.code}-${hint.node_id}`}><strong>{hint.message}</strong>{hint.node_id && <span>阶段：{hint.node_id}</span>}{onLocateIssue && <button type="button" className="text-button issue-locate" onClick={() => onLocateIssue(hint)}>{hint.node_id ? '配置此阶段' : '查看流程设置'}</button>}</li>)}</ul>
         </div>
       )}
       {projectionNotes.length > 0 && (

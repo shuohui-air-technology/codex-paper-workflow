@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +11,7 @@ from unittest import mock
 from scripts.workflow_engine.catalog import (
     CatalogError,
     discover_skills,
+    load_install_receipts,
     load_validator_registry,
     resolve_skill_roots,
     tree_sha256,
@@ -28,7 +31,147 @@ def write_skill(root: Path, name: str, body: str = "instructions") -> Path:
     return path
 
 
+def write_install_receipt(root: Path, name: str, tree_hash: str) -> Path:
+    receipt = {
+        "schema_version": "paper-workflow-install-v1",
+        "profile": "core",
+        "skills": {name: {
+            "tree_hash": tree_hash,
+            "source": {"name": name, "source": "bundled", "path": f"companion-skills/{name}", "license": "MIT"},
+        }},
+    }
+    path = root / ".paper-workflow-install.json"
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    return path
+
+
 class WorkflowCatalogTests(unittest.TestCase):
+    def test_cache_named_ancestor_does_not_exempt_standalone_bytecode(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "outer" / "__pycache__" / "skills"
+            skill = write_skill(root, "installed")
+            expected = tree_sha256(skill)
+            write_install_receipt(root, "installed", expected)
+            skill.joinpath("standalone.pyc").write_bytes(b"executable outside Skill cache")
+            self.assertNotEqual(tree_sha256(skill), expected)
+            found = discover_skills((root,), load_install_receipts((root,)))
+            self.assertFalse(found.skills["installed"].locked)
+
+    def test_normal_python_launch_creates_cache_without_unlocking_skill(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "installed")
+            skill.joinpath("helper.py").write_text("value = 42\n", encoding="utf-8")
+            entry = skill / "run.py"
+            entry.write_text("import helper\nprint(helper.value)\n", encoding="utf-8")
+            write_install_receipt(root, "installed", tree_sha256(skill))
+            environment = dict(os.environ)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            launched = subprocess.run(
+                [sys.executable, str(entry)], cwd=skill, env=environment,
+                capture_output=True, text=True, check=True,
+            )
+            self.assertEqual(launched.stdout.strip(), "42")
+            self.assertTrue(list(skill.joinpath("__pycache__").glob("helper.*.pyc")))
+            result = discover_skills((root,), load_install_receipts((root,)))
+            self.assertTrue(result.skills["installed"].locked)
+
+    def test_generated_bytecode_cache_does_not_change_source_tree_lock(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "installed")
+            source = skill / "scripts" / "worker.py"
+            source.parent.mkdir()
+            source.write_text("answer = 42\n", encoding="utf-8")
+            expected = tree_sha256(skill)
+            cache = source.parent / "__pycache__"
+            cache.mkdir()
+            cache.joinpath("worker.cpython-313.pyc").write_bytes(b"runtime cache")
+            cache.joinpath("worker.opt-1.pyo").write_bytes(b"runtime optimized cache")
+            self.assertEqual(tree_sha256(skill), expected)
+            write_install_receipt(root, "installed", expected)
+            self.assertTrue(discover_skills((root,), load_install_receipts((root,))).skills["installed"].locked)
+
+            cache.joinpath("notes.txt").write_text("not bytecode", encoding="utf-8")
+            self.assertNotEqual(tree_sha256(skill), expected)
+            cache.joinpath("notes.txt").unlink()
+            source.parent.joinpath("worker.pyc").write_bytes(b"outside cache")
+            self.assertNotEqual(tree_sha256(skill), expected)
+            source.parent.joinpath("worker.pyc").unlink()
+            source.write_text("answer = 43\n", encoding="utf-8")
+            self.assertNotEqual(tree_sha256(skill), expected)
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires platform privileges")
+    def test_symlinked_generated_cache_is_still_rejected(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "installed")
+            cache = skill / "__pycache__"
+            cache.mkdir()
+            outside = Path(temporary) / "outside.pyc"
+            outside.write_bytes(b"untrusted")
+            cache.joinpath("worker.cpython-313.pyc").symlink_to(outside)
+            with self.assertRaises(CatalogError) as caught:
+                tree_sha256(skill)
+            self.assertEqual(caught.exception.code, "catalog.symlink_in_tree")
+
+    @unittest.skipIf(os.name == "nt", "FIFO creation requires POSIX filesystem support")
+    def test_fifo_in_skill_tree_is_rejected(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "installed")
+            os.mkfifo(skill / "runtime.pipe")
+            with self.assertRaises(CatalogError) as caught:
+                tree_sha256(skill)
+            self.assertEqual(caught.exception.code, "catalog.invalid_tree")
+
+    def test_installer_receipt_is_loaded_only_for_exact_current_tree(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "installed")
+            path = write_install_receipt(root, "installed", tree_sha256(skill))
+            locked = discover_skills((root,), load_install_receipts((root,)))
+            self.assertTrue(locked.skills["installed"].locked)
+            self.assertFalse(locked.warnings)
+
+            skill.joinpath("SKILL.md").write_text("---\nname: installed\n---\nchanged\n", encoding="utf-8")
+            stale = discover_skills((root,), load_install_receipts((root,)))
+            self.assertFalse(stale.skills["installed"].locked)
+            self.assertEqual(stale.warnings[0].code, "catalog.unlocked_skill")
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["skills"]["installed"]["tree_hash"] = "sha256:" + "0" * 64
+            path.write_text(json.dumps(data), encoding="utf-8")
+            forged = discover_skills((root,), load_install_receipts((root,)))
+            self.assertFalse(forged.skills["installed"].locked)
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires platform privileges")
+    def test_symlinked_or_oversized_install_receipt_confers_no_lock(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "installed")
+            receipt = write_install_receipt(root, "installed", tree_sha256(skill))
+            outside = Path(temporary) / "outside-receipt.json"
+            receipt.rename(outside)
+            receipt.symlink_to(outside)
+            self.assertEqual(load_install_receipts((root,)), {})
+            receipt.unlink()
+            receipt.write_bytes(b" " * (1024 * 1024 + 1))
+            self.assertEqual(load_install_receipts((root,)), {})
+
+    def test_malformed_install_receipt_does_not_crash_catalog(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            skill = write_skill(root, "installed")
+            receipt = write_install_receipt(root, "installed", tree_sha256(skill))
+            data = json.loads(receipt.read_text(encoding="utf-8"))
+            data["profile"] = ["core"]
+            receipt.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(load_install_receipts((root,)), {})
+            self.assertFalse(discover_skills((root,), load_install_receipts((root,))).skills["installed"].locked)
+            receipt.write_text('{"schema_version":"paper-workflow-install-v1","schema_version":"paper-workflow-install-v1"}', encoding="utf-8")
+            self.assertEqual(load_install_receipts((root,)), {})
+
     def test_different_duplicate_skill_ids_are_ambiguous(self):
         """Catches root-priority silently selecting different Skill content."""
         with TemporaryDirectory() as temporary:
@@ -122,6 +265,17 @@ class WorkflowCatalogTests(unittest.TestCase):
             )
             self.assertFalse(result.warnings)
 
+    def test_tree_digest_matches_installer_when_file_and_directory_share_prefix(self):
+        from scripts.install_workflow import _tree_hash
+
+        with TemporaryDirectory() as temporary:
+            skill = write_skill(Path(temporary) / "skills", "prefix-collision")
+            nested = skill / "assets" / "workflow-studio"
+            nested.mkdir(parents=True)
+            nested.joinpath("index.js").write_text("nested asset", encoding="utf-8")
+            skill.joinpath("assets/workflow-studio.png").write_bytes(b"sibling asset")
+            self.assertEqual(tree_sha256(skill), _tree_hash(skill))
+
     def test_tree_digest_streams_without_changing_the_installer_hash(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "skills"
@@ -187,6 +341,20 @@ class WorkflowCatalogTests(unittest.TestCase):
                 result = discover_skills((root,), install_receipts={})
             self.assertEqual(result.skills, {})
             self.assertEqual(result.errors[0].code, "catalog.too_many_skills")
+
+    def test_skipped_second_root_is_reported_even_when_first_root_has_selected_skill(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            valid_root = base / "valid"
+            crowded_root = base / "crowded"
+            write_skill(valid_root, "selected")
+            write_skill(crowded_root, "first")
+            write_skill(crowded_root, "second")
+            with mock.patch("scripts.workflow_engine.catalog._MAX_SKILLS_PER_ROOT", 1):
+                result = discover_skills((valid_root, crowded_root), install_receipts={})
+            self.assertIn("selected", result.skills)
+            self.assertEqual([issue.code for issue in result.errors], ["catalog.too_many_skills"])
+            self.assertNotIn("selected", result.failed_skill_ids)
 
     def test_frontmatter_name_reads_only_a_bounded_prefix(self):
         with TemporaryDirectory() as temporary:

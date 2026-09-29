@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ MAX_MEMBER_UNCOMPRESSED = 64 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED = 512 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSED = 256 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 1_000
+POSIX_LOCK_BASE = Path("/tmp")
 WINDOWS_RESERVED_NAMES = {
     "con", "prn", "aux", "nul",
     *(f"com{index}" for index in range(1, 10)),
@@ -81,6 +83,98 @@ def _assert_safe_control_paths(target: Path) -> None:
         candidate = target / relative
         if _is_link(candidate):
             raise InstallError(f"installer control path must not be a symlink or reparse point: {candidate}")
+
+
+@contextmanager
+def _target_install_lock(target: Path):
+    """Serialize install and recovery for one canonical target.
+
+    A POSIX dry run may create only its stable per-user lock file under the
+    system temporary directory; it never creates the target or its parents.
+    Windows uses a target-named global kernel mutex. Both locks are released by the
+    OS when their holder exits unexpectedly.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        canonical = os.path.normcase(os.path.abspath(os.path.expanduser(str(target))))
+        identity = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.CreateMutexW(None, False, f"Global\\paper-workflow-install-{identity}")
+        if not handle:
+            raise InstallError(f"cannot create installation lock: Windows error {ctypes.get_last_error()}")
+        acquired = False
+        try:
+            outcome = kernel32.WaitForSingleObject(handle, 60_000)
+            if outcome not in (0, 0x80):  # WAIT_OBJECT_0 or WAIT_ABANDONED
+                raise InstallError(f"installation lock could not be acquired: Windows wait result {outcome}")
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+
+    import fcntl
+
+    try:
+        canonical = target.expanduser().resolve(strict=False)
+        identity = hashlib.sha256(os.fsencode(str(canonical))).hexdigest()
+        # tempfile.gettempdir() depends on TMPDIR and can differ between
+        # concurrent processes. A shared system path is required for a real
+        # cross-process lock on the same installation target.
+        lock_base = POSIX_LOCK_BASE.resolve(strict=True)
+        lock_base_info = lock_base.stat()
+        if not stat.S_ISDIR(lock_base_info.st_mode) or not lock_base_info.st_mode & stat.S_ISVTX:
+            raise InstallError(f"installation lock base is not a sticky directory: {lock_base}")
+        lock_directory = lock_base / f"paper-workflow-locks-{os.getuid()}"
+        lock_directory.mkdir(mode=0o700, exist_ok=True)
+        directory_info = lock_directory.lstat()
+        if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.getuid()
+                or directory_info.st_mode & 0o077):
+            raise InstallError(f"installation lock directory is unsafe: {lock_directory}")
+        lock_path = lock_directory / f"{identity}.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+    except (OSError, RuntimeError) as exc:
+        raise InstallError(f"cannot open installation lock safely: {exc}") from exc
+    try:
+        file_info = os.fstat(descriptor)
+        if (not stat.S_ISREG(file_info.st_mode) or file_info.st_uid != os.getuid()
+                or file_info.st_mode & 0o077):
+            raise InstallError(f"installation lock file is unsafe: {lock_path}")
+        path_info = lock_path.lstat()
+        if (not stat.S_ISREG(path_info.st_mode)
+                or (path_info.st_dev, path_info.st_ino) != (file_info.st_dev, file_info.st_ino)):
+            raise InstallError(f"installation lock file changed unexpectedly: {lock_path}")
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise InstallError("installation lock timed out after 60 seconds") from exc
+                time.sleep(0.05)
+            except OSError as exc:
+                raise InstallError(f"installation lock failed: {exc}") from exc
+        try:
+            path_info = lock_path.lstat()
+            if (not stat.S_ISREG(path_info.st_mode)
+                    or (path_info.st_dev, path_info.st_ino) != (file_info.st_dev, file_info.st_ino)):
+                raise InstallError(f"installation lock file changed unexpectedly: {lock_path}")
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_skill_name(name: Any) -> str:
@@ -303,6 +397,32 @@ def _materialize_archive_links(extract_root: Path, links: dict[str, str]) -> Non
         resolving.remove(name)
         return resolved
 
+    def tree_usage(path: Path) -> tuple[int, int]:
+        """Count real entries and file bytes, including the supplied path."""
+        entries = 0
+        file_bytes = 0
+        pending = [path]
+        while pending:
+            current = pending.pop()
+            if _is_link(current):
+                raise InstallError(f"archive materialization contains a link: {current}")
+            if current.is_dir():
+                entries += 1
+                pending.extend(current.iterdir())
+            elif current.is_file():
+                entries += 1
+                file_bytes += current.stat().st_size
+            else:
+                raise InstallError(f"archive materialization contains an unsupported entry: {current}")
+            if entries > MAX_ARCHIVE_MEMBERS or file_bytes > MAX_ARCHIVE_UNCOMPRESSED:
+                raise InstallError("archive materialization exceeds the entry or byte limit")
+        return entries, file_bytes
+
+    # ZIP metadata limits cover the extracted members, but copied link targets
+    # need a second budget. Count implicit directories as well as regular files.
+    total_entries, total_bytes = tree_usage(extract_root)
+    total_entries -= 1  # The extraction root is not an archive entry.
+
     # Materialize deeper aliases first so a copied directory cannot contain an
     # unresolved alias that _copy_tree would later reject.
     for link_name in sorted(links, key=lambda value: len(PurePosixPath(value).parts), reverse=True):
@@ -313,13 +433,30 @@ def _materialize_archive_links(extract_root: Path, links: dict[str, str]) -> Non
             raise InstallError(f"symlink target is missing from archive: {link_name} -> {target_name}")
         if link_path.exists() or _is_link(link_path):
             raise InstallError(f"symlink destination collides with archive member: {link_name}")
+        if target_path.is_dir():
+            if link_path.is_relative_to(target_path):
+                raise InstallError(f"directory symlink would copy into itself: {link_name} -> {target_name}")
+            copied_entries, copied_bytes = tree_usage(target_path)
+        elif target_path.is_file():
+            copied_entries, copied_bytes = tree_usage(target_path)
+        else:
+            raise InstallError(f"unsupported symlink target type: {link_name} -> {target_name}")
+        missing_parents = 0
+        parent = link_path.parent
+        while parent != extract_root and not parent.exists():
+            if _is_link(parent):
+                raise InstallError(f"symlink destination parent is unsafe: {parent}")
+            missing_parents += 1
+            parent = parent.parent
+        if total_entries + missing_parents + copied_entries > MAX_ARCHIVE_MEMBERS or total_bytes + copied_bytes > MAX_ARCHIVE_UNCOMPRESSED:
+            raise InstallError(f"archive materialization exceeds the entry or byte limit: {link_name}")
         link_path.parent.mkdir(parents=True, exist_ok=True)
         if target_path.is_dir():
             _copy_tree(target_path, link_path)
-        elif target_path.is_file():
-            shutil.copy2(target_path, link_path)
         else:
-            raise InstallError(f"unsupported symlink target type: {link_name} -> {target_name}")
+            shutil.copy2(target_path, link_path)
+        total_entries += missing_parents + copied_entries
+        total_bytes += copied_bytes
 
 
 def _tree_hash(root: Path) -> str:
@@ -327,11 +464,28 @@ def _tree_hash(root: Path) -> str:
     for path in sorted(root.rglob("*")):
         if _is_link(path):
             raise InstallError(f"symlink is not allowed in installed tree: {path}")
-        if not path.is_file():
+        if path.is_dir():
             continue
-        relative = path.relative_to(root).as_posix().encode("utf-8")
+        if not path.is_file():
+            raise InstallError(f"unsupported filesystem entry in installed tree: {path}")
+        relative_path = path.relative_to(root)
+        if is_generated_python_cache_file(relative_path):
+            continue
+        relative = relative_path.as_posix().encode("utf-8")
         digest.update(relative + b"\0" + path.read_bytes() + b"\0")
     return "sha256:" + digest.hexdigest()
+
+
+def is_generated_python_cache_file(relative_path: Path) -> bool:
+    """Identify bytecode inside a Python cache directory, relative to a Skill root.
+
+    Standalone bytecode and any non-bytecode file under ``__pycache__`` stay
+    part of the installed tree and its identity hash.
+    """
+    return (
+        relative_path.suffix.lower() in {".pyc", ".pyo"}
+        and "__pycache__" in relative_path.parts[:-1]
+    )
 
 
 def _skill_name(root: Path) -> str:
@@ -347,11 +501,13 @@ def _skill_name(root: Path) -> str:
     return match.group(1)
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
+def _copy_tree(source: Path, destination: Path, *, _source_root: Path | None = None) -> None:
     if _is_link(source) or not source.is_dir():
         raise InstallError(f"skill source directory does not exist: {source}")
     if _is_link(destination):
         raise InstallError(f"skill destination must not be a symlink or reparse point: {destination}")
+    if _source_root is None:
+        _source_root = source
     destination.mkdir(parents=True, exist_ok=True)
     for item in source.iterdir():
         if item.name in {".git", ".gitignore"}:
@@ -360,9 +516,15 @@ def _copy_tree(source: Path, destination: Path) -> None:
         if _is_link(item):
             raise InstallError(f"symlink is not allowed in skill source: {item}")
         if item.is_dir():
-            _copy_tree(item, target)
-        else:
+            _copy_tree(item, target, _source_root=_source_root)
+            if item.name == "__pycache__" and not any(target.iterdir()):
+                target.rmdir()
+        elif item.is_file():
+            if is_generated_python_cache_file(item.relative_to(_source_root)):
+                continue
             shutil.copy2(item, target)
+        else:
+            raise InstallError(f"unsupported filesystem entry in skill source: {item}")
 
 
 def _download_github(entry: dict[str, Any], staging: Path) -> Path:
@@ -738,6 +900,11 @@ def _prepare_target(target: Path, staged: dict[str, Path], update: bool, prune: 
 
 
 def install(manifest: dict[str, Any], profile: str, target: Path, repository_root: Path, *, dry_run: bool = False, update: bool = False, prune: bool = False) -> dict[str, Any]:
+    with _target_install_lock(target):
+        return _install_locked(manifest, profile, target, repository_root, dry_run=dry_run, update=update, prune=prune)
+
+
+def _install_locked(manifest: dict[str, Any], profile: str, target: Path, repository_root: Path, *, dry_run: bool = False, update: bool = False, prune: bool = False) -> dict[str, Any]:
     _validate_release_metadata(manifest, "dependency manifest")
     entries = resolve_profile(manifest, profile)
     target = target.expanduser()
@@ -970,6 +1137,11 @@ def install(manifest: dict[str, Any], profile: str, target: Path, repository_roo
 
 
 def verify(target: Path, profile: str | None = None, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    with _target_install_lock(target):
+        return _verify_locked(target, profile, manifest)
+
+
+def _verify_locked(target: Path, profile: str | None = None, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     target = target.expanduser()
     if _is_link(target):
         raise InstallError(f"symlink target directory is not allowed: {target}")

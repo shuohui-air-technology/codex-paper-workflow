@@ -187,6 +187,143 @@ class TaskProtocolTests(unittest.TestCase):
         (self.project / "idea.md").write_text("evidence-backed idea", encoding="utf-8")
         return dict(task_result(), run_id=invocation["run_id"], node_id="directions", attempt=invocation["attempt"], idempotency_token=invocation["idempotency_token"], artifacts=[{"id": "research_idea_brief", "path": "idea.md"}])
 
+    def test_unrelated_invalid_installed_skill_does_not_require_acknowledgement(self):
+        from scripts.workflow_manager import WorkflowService
+
+        project = self.project / "catalog-project"
+        project.mkdir()
+        skills = self.project / "catalog-skills"
+        valid = skills / "test-workflow-task"
+        valid.mkdir(parents=True)
+        valid.joinpath("SKILL.md").write_text(
+            "---\nname: test-workflow-task\ndescription: Test skill\n---\nPerform the task.\n"
+        )
+        invalid = skills / "unused-invalid-skill"
+        invalid.mkdir()
+        invalid.joinpath("SKILL.md").write_text("missing YAML frontmatter\n")
+        service = WorkflowService(project, skill_roots=(skills,))
+
+        validation = service.validate_document(self.document)
+        self.assertEqual(validation["status"], "pass", validation["errors"])
+        self.assertIn(
+            ("catalog.invalid_frontmatter", "diagnostic"),
+            {(item["code"], item["severity"]) for item in validation["warnings"]},
+        )
+        self.assertNotIn("catalog.invalid_frontmatter", validation["required_warning_codes"])
+        activated = service.activate(
+            self.document,
+            acknowledged_warning_codes=validation["required_warning_codes"],
+        )
+        self.assertEqual(activated["selection"]["mode"], "custom")
+
+        selected_invalid = copy.deepcopy(self.document)
+        selected_invalid["nodes"][0]["skill_ref"] = "unused-invalid-skill"
+        blocked = service.validate_document(selected_invalid)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn("catalog.skill_unsafe", {item["code"] for item in blocked["errors"]})
+
+        duplicate_root = self.project / "duplicate-skills"
+        duplicate = duplicate_root / "test-workflow-task"
+        duplicate.mkdir(parents=True)
+        duplicate.joinpath("SKILL.md").write_text("missing YAML frontmatter\n")
+        conflicting = WorkflowService(project, skill_roots=(skills, duplicate_root))
+        conflict = conflicting.validate_document(self.document)
+        self.assertEqual(conflict["status"], "blocked")
+        self.assertIn("catalog.skill_unsafe", {item["code"] for item in conflict["errors"]})
+
+    def test_install_receipt_locks_selected_skill_through_activation_and_claim(self):
+        from scripts.workflow_engine.catalog import tree_sha256
+        from scripts.workflow_manager import WorkflowService
+
+        project = self.project / "installed-project"
+        project.mkdir()
+        root = self.project / "installed-skills"
+        skill = root / "test-workflow-task"
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            "---\nname: test-workflow-task\ndescription: Test skill\n---\nPerform the task.\n"
+        )
+        receipt = {
+            "schema_version": "paper-workflow-install-v1", "profile": "core",
+            "skills": {"test-workflow-task": {
+                "tree_hash": tree_sha256(skill),
+                "source": {"name": "test-workflow-task", "source": "bundled",
+                           "path": "companion-skills/test-workflow-task", "license": "MIT"},
+            }},
+        }
+        root.joinpath(".paper-workflow-install.json").write_text(json.dumps(receipt), encoding="utf-8")
+        service = WorkflowService(project, skill_roots=(root,))
+        validation = service.validate_document(self.document)
+        self.assertEqual(validation["status"], "pass", validation["errors"])
+        self.assertNotIn("catalog.unlocked_skill", validation["required_warning_codes"])
+        service.activate(self.document, acknowledged_warning_codes=validation["required_warning_codes"])
+        invocation = service.claim("directions")
+        self.assertTrue(invocation["resolved_identity"]["locked"])
+
+    def test_activation_rechecks_receipt_and_skill_after_saving_draft(self):
+        from scripts.workflow_engine.catalog import tree_sha256
+        from scripts.workflow_manager import WorkflowManagerError, WorkflowService
+
+        for change in ("receipt", "skill", "invalid-skill"):
+            with self.subTest(change=change):
+                project = self.project / f"race-project-{change}"
+                project.mkdir()
+                root = self.project / f"race-skills-{change}"
+                skill = root / "test-workflow-task"
+                skill.mkdir(parents=True)
+                skill_file = skill / "SKILL.md"
+                skill_file.write_text("---\nname: test-workflow-task\n---\nOriginal.\n", encoding="utf-8")
+                receipt_path = root / ".paper-workflow-install.json"
+                receipt = {
+                    "schema_version": "paper-workflow-install-v1", "profile": "core",
+                    "skills": {"test-workflow-task": {
+                        "tree_hash": tree_sha256(skill),
+                        "source": {"name": "test-workflow-task", "source": "bundled",
+                                   "path": "companion-skills/test-workflow-task", "license": "MIT"},
+                    }},
+                }
+                if change == "receipt":
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                service = WorkflowService(project, skill_roots=(root,))
+                validation = service.validate_document(self.document)
+                self.assertEqual(validation["status"], "pass", validation["errors"])
+                self.assertEqual(
+                    "catalog.unlocked_skill" in validation["required_warning_codes"],
+                    change != "receipt",
+                )
+                original_compile = service._compile
+                calls = 0
+
+                def mutate_between_compiles(document):
+                    nonlocal calls
+                    result = original_compile(document)
+                    calls += 1
+                    if calls == 1:
+                        if change == "receipt":
+                            receipt_path.unlink()
+                        elif change == "invalid-skill":
+                            skill_file.write_text("missing frontmatter\n", encoding="utf-8")
+                        else:
+                            skill_file.write_text("---\nname: test-workflow-task\n---\nChanged.\n", encoding="utf-8")
+                    return result
+
+                with mock.patch.object(service, "_compile", side_effect=mutate_between_compiles):
+                    with self.assertRaises(WorkflowManagerError) as caught:
+                        service.activate(
+                            self.document,
+                            acknowledged_warning_codes=validation["required_warning_codes"],
+                        )
+                self.assertEqual(calls, 2)
+                self.assertEqual(
+                    caught.exception.code,
+                    {
+                        "receipt": "activation.acknowledgement_mismatch",
+                        "skill": "activation.validation_changed",
+                        "invalid-skill": "activation.validation_blocked",
+                    }[change],
+                )
+                self.assertFalse(service.store.paths.selection.exists())
+
     def test_claim_submit_and_duplicate_bind_hashes_without_persisting_token(self):
         invocation = self.service.claim("directions")
         result = self.result(invocation)
@@ -721,6 +858,8 @@ class TaskProtocolTests(unittest.TestCase):
         first, second = self.service.summary(), self.service.summary()
         self.assertEqual(first, second)
         self.assertEqual(first["run_status"], "active")
+        self.assertEqual(first["progress"]["phase"], "ready")
+        self.assertEqual(first["progress"]["node_ids_by_status"]["ready"], ["directions"])
         self.assertEqual(first["nodes"][0]["node_id"], "directions")
         self.assertEqual((self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()), before)
 
@@ -734,6 +873,19 @@ class TaskProtocolTests(unittest.TestCase):
         self.assertEqual(summary["mode"], "custom")
         self.assertEqual(summary["run_status"], "active")
         self.assertFalse((self.project / ".research" / "progress.md").exists())
+
+    def test_explicit_recovery_requires_confirmation_and_never_completes_lost_work(self):
+        self.service.claim("directions")
+        before = self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()
+        with self.assertRaises(Exception) as rejected:
+            self.service.recover()
+        self.assertEqual(rejected.exception.code, "recovery.confirmation_required")
+        self.assertEqual((self.service.store.paths.events.read_bytes(), self.service.store.paths.state.read_bytes()), before)
+        result = self.service.recover(confirmed_interrupted=True)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["recovery_code"], "recovery.running_work_uncertain")
+        self.assertEqual(self.service.summary()["progress"]["counts"]["blocked"], 1)
+        self.assertEqual(self.service.retry("directions")["node_status"], "ready")
 
     def test_custom_selection_with_missing_run_blocks_without_official_fallback(self):
         from scripts.workflow_engine.store import StoreError
@@ -1474,6 +1626,15 @@ class WorkflowManagerCLITests(unittest.TestCase):
         code, summary = self._run("module", "summary", *self._common())
         self.assertEqual((code, summary["status"], summary["mode"]), (0, "pass", "official"))
         self.assertFalse((self.project / ".research" / "custom-workflow").exists())
+
+    def test_recover_cli_requires_confirmation_and_returns_one_json_response(self):
+        code, result = self._run("direct", "recover", "--project", str(self.project), "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["error"]["code"], "cli.invalid_arguments")
+        self.assertFalse((self.project / ".research" / "custom-workflow").exists())
+        code, result = self._run("module", "recover", "--project", str(self.project), "--json", "--confirm-interrupted")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["recovery_code"], "recovery.no_run")
 
     def test_corrupt_selection_cli_fails_closed_with_json_error(self):
         custom_base = self.project / ".research" / "custom-workflow"

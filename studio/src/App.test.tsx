@@ -118,6 +118,88 @@ function makeApi(options: {
 }
 
 describe('Workflow Studio app', () => {
+  it('saves the workflow identifier entered immediately before clicking save', async () => {
+    const api = makeApi();
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '新建空白流程' }));
+    await user.click(screen.getByRole('button', { name: '流程设置' }));
+    const identifier = screen.getByLabelText('流程标识');
+    await user.clear(identifier);
+    await user.type(identifier, 'introduction-review');
+    expect(identifier).toHaveValue('introduction-review');
+    await user.click(screen.getByRole('button', { name: '保存草稿' }));
+    await waitFor(() => expect(api.saveWorkflow).toHaveBeenCalledOnce());
+    expect((api.saveWorkflow.mock.calls[0]![0] as WorkflowDocument).workflow_id).toBe('introduction-review');
+    expect(screen.getByLabelText('流程标识')).toHaveValue('introduction-review');
+  });
+
+  it('requires a new workflow check after refreshing the installed Skill list', async () => {
+    const api = makeApi();
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '新建空白流程' }));
+    await user.click(screen.getByRole('button', { name: '验证流程' }));
+    expect(await screen.findByText('服务端验证通过')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+    await waitFor(() => expect(api.getCatalog).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('服务端验证通过')).not.toBeInTheDocument();
+    expect(screen.queryByText('检查已完成，可点击「验证并启用」继续。')).not.toBeInTheDocument();
+  });
+
+  it('appends linked stages, undoes deletion with its connections, and resets history after saving', async () => {
+    const api = makeApi();
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '新建空白流程' }));
+    await user.selectOptions(screen.getByLabelText('主要 Skill'), 'clarify-research-idea');
+    await user.click(screen.getByRole('button', { name: /空白任务阶段/ }));
+    await user.selectOptions(screen.getByLabelText('主要 Skill'), 'clarify-research-idea');
+    expect(screen.getByText('2 阶段')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '删除阶段' }));
+    expect(screen.getByText('1 阶段')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /撤销$/ }));
+    expect(screen.getByText('2 阶段')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /重做$/ }));
+    expect(screen.getByText('1 阶段')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /撤销$/ }));
+    await user.click(screen.getByRole('button', { name: '保存草稿' }));
+    await waitFor(() => expect(api.saveWorkflow).toHaveBeenCalledOnce());
+    const saved = api.saveWorkflow.mock.calls[0]![0] as WorkflowDocument;
+    expect(saved.edges).toMatchObject([{ source: 'step-1', target: 'stage-1', trigger: 'succeeded' }]);
+    expect(saved.nodes.find((node) => node.id === 'stage-1')?.entry).toBe(false);
+    expect(screen.getByRole('button', { name: /撤销$/ })).toBeDisabled();
+  });
+
+  it('opens workflow settings without deleting a stage and locates a stage from validation errors', async () => {
+    const error: WorkflowIssue = { code: 'catalog.skill_missing', message: '找不到对应 Skill', node_id: 'step-1', edge_id: '', operation: 'validate', recovery: '请选择已安装的 Skill。' };
+    const api = makeApi({ validateResult: envelope({ document_sha256: 'd'.repeat(64), semantic_sha256: null, required_warning_codes: [] }, [error]) });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '新建空白流程' }));
+    await user.click(screen.getByRole('button', { name: '流程设置' }));
+    expect(screen.getByRole('heading', { name: '流程设置' })).toBeInTheDocument();
+    expect(screen.getByText('1 阶段')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '验证流程' }));
+    await user.click(await screen.findByRole('button', { name: '定位相关阶段' }));
+    expect(screen.getByLabelText('阶段名称')).toHaveValue('第一个任务阶段');
+  });
+
+  it('keeps independent addition explicit and does not intercept undo inside text fields', async () => {
+    const api = makeApi();
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '新建空白流程' }));
+    await user.selectOptions(screen.getByLabelText('新阶段添加位置'), 'detached');
+    await user.click(screen.getByRole('button', { name: /空白任务阶段/ }));
+    await user.click(screen.getByLabelText('阶段名称'));
+    await user.keyboard('{Control>}z{/Control}');
+    expect(screen.getByText('2 阶段')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '保存草稿' }));
+    await waitFor(() => expect(api.saveWorkflow).toHaveBeenCalledOnce());
+    expect((api.saveWorkflow.mock.calls[0]![0] as WorkflowDocument).edges).toEqual([]);
+  });
+
   it('opens the official workflow as a read-only preview without saving or activating anything', async () => {
     const api = makeApi();
     render(<App api={api} />);
@@ -135,12 +217,28 @@ describe('Workflow Studio app', () => {
     render(<App api={api} />);
 
     await user.click(await screen.findByRole('button', { name: '复制为自定义流程' }));
+    expect(screen.getByText('官方流程 v1.0')).toBeInTheDocument();
+    expect(screen.getByText('正在编辑自定义草稿')).toBeInTheDocument();
     expect(screen.getByText('有未保存修改')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '保存草稿' })).toBeEnabled();
+    await user.selectOptions(screen.getByLabelText('新阶段添加位置'), 'detached');
     await user.click(within(screen.getByRole('complementary', { name: '添加流程阶段' })).getByRole('button', { name: /Clarify Research Idea/ }));
+    expect(screen.getByText('3 阶段')).toBeInTheDocument();
     expect(screen.getAllByText('Clarify Research Idea').length).toBeGreaterThan(0);
     expect(api.saveWorkflow).not.toHaveBeenCalled();
     expect(api.getBootstrap).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the selected stage when inserting before the only entry cannot succeed', async () => {
+    const api = makeApi();
+    const user = userEvent.setup();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole('button', { name: '新建空白流程' }));
+    expect(screen.getByRole('heading', { name: '阶段设置' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '插入之前' })).toBeDisabled();
+    expect(screen.getByRole('heading', { name: '阶段设置' })).toBeInTheDocument();
+    expect(screen.getByText(/前方没有连接/)).toBeInTheDocument();
   });
 
   it('validates and saves only after explicit user actions', async () => {

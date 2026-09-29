@@ -25,6 +25,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .catalog import SkillIdentity, ValidatorIdentity
 from .compiler import CompiledEdge, CompiledNode, CompiledPlan
 from .conditions import evaluate_condition
+from .reporting import summarize_run_progress
 from .fs import (
     PathSafetyError,
     MAX_EVENT_BYTES,
@@ -1672,9 +1673,21 @@ def _projection_material(
         f"- Status: `{run_status}`",
         f"- Semantic SHA-256: `{state.semantic_sha256}`",
         "",
-        "## Nodes",
+        "## Progress",
         "",
     ]
+    progress = summarize_run_progress(state, run_status=run_status)
+    lines.extend([
+        f"- Execution phase: `{progress['phase']}`",
+        f"- Total stages: {progress['total_nodes']}",
+        "- Recorded states: " + "; ".join(
+            f"{status}={count}" for status, count in progress["counts"].items()
+        ),
+        "- Counts include task, condition, join, and validator stages; skipped stages remain separate.",
+        "",
+        "## Nodes",
+        "",
+    ])
     lines.extend(
         f"- `{node_id}`: `{runtime.status.value}` (attempt {runtime.attempt})"
         for node_id, runtime in sorted(state.nodes.items())
@@ -2136,6 +2149,22 @@ class WorkflowStore:
             return Selection("official")
         with self._lock():
             return self._selection_unlocked(repair_projection=repair_projection)
+
+    @contextmanager
+    def locked_official(self) -> Iterator[Selection]:
+        """Keep official-only updates isolated from concurrent mode changes.
+
+        Acquire this mode lock before the official progress lock. Reading the
+        journal authority here does not repair the selection projection.
+        """
+        with self._lock():
+            selection = self._selection_unlocked(repair_projection=False)
+            if selection.mode != "official":
+                raise StoreError(
+                    "selection.custom_active",
+                    "当前已启用自定义流程；请先切回官方流程，再更新官方进度。",
+                )
+            yield selection
 
     def _validate_revision_snapshots(self) -> None:
         if not self.paths.revisions.exists():
@@ -2705,7 +2734,7 @@ class WorkflowStore:
             raise StoreError("snapshot.boundary_mismatch", "snapshot content differs from its boundary event")
         if require_no_suffix and any(event.event_seq > sequence for event in events):
             raise StoreError("recovery.required", "verified event suffix must be recovered before mutation")
-        if require_no_suffix and (
+        if require_no_suffix and run_status == "active" and (
             self._artifact_drift_ids(state) or self._witness_drift_producers(boundary_witnesses)
             or self._current_receipt_drift_nodes(state, events)
         ):
@@ -3260,12 +3289,17 @@ class WorkflowStore:
                     return RecoveryResult("blocked", exc.code, state, archived)
                 changed = True
 
-            drifted = list(self._artifact_drift_ids(state))
-            historical_producers = self._witness_drift_producers(witnesses)
-            receipt_nodes = self._current_receipt_drift_nodes(state, events)
+            # Stopped runs are historical records. Their artifacts may be edited
+            # for the next run, and their final nodes can retain running status.
+            # Replay and receipt integrity remain mandatory, but history cannot
+            # accept new drift or interrupted-work events after run_stopped.
+            active_run = run_status == "active"
+            drifted = list(self._artifact_drift_ids(state)) if active_run else []
+            historical_producers = self._witness_drift_producers(witnesses) if active_run else ()
+            receipt_nodes = self._current_receipt_drift_nodes(state, events) if active_run else ()
             running = [
                 node_id for node_id, runtime in state.nodes.items()
-                if runtime.status is NodeStatus.RUNNING
+                if active_run and runtime.status is NodeStatus.RUNNING
             ]
             if running:
                 nodes = dict(state.nodes)

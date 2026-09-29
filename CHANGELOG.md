@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- Organizes the documentation around default use, visual customization, and
+  development, with a three-stage Studio walkthrough.
+- Adds connected stage creation, undo/redo for unsaved edits, automatic canvas
+  layout, and a permanent workflow-settings entry.
+- Moves advanced stage settings into a collapsible section, suggests available
+  validator inputs, and links validation findings to the affected stage.
+- Shows setup steps and a copyable Codex continuation prompt after activation.
+- Preserves artifact handoffs when inserting stages, invalidates checks after
+  refreshing Skills, and improves compact-screen and short-window layouts.
+- Adds digest-checked Official v1 snapshot updates with a single progress event
+  and consistent next-action handoff, while preserving validity and rule status.
+- Preserves literal paths and nested rule fields in progress updates, rejects
+  linked or special progress files, and bounds reads before taking further action.
+- Shares a read-only execution-progress summary between the custom CLI and its
+  Markdown projection, and exposes recovery with explicit interruption confirmation.
+- Keeps user-accepted artifacts in versioned snapshots with a compact confirmation
+  index and type-organized current copies, while preserving original working files
+  and existing receipt bindings. Adoption records actual verification evidence
+  and a user decision separately from progress updates and task completion.
+- Adds metadata-only artifact status, hash-verified snapshot resolution,
+  withdrawal without fallback, and explicit backup of edited views during repair.
+- Documents the short resume path through mode, current progress, and confirmed
+  artifacts, with historical detail retrieved when needed.
+
 ## v1.1.0
 
 This release adds an optional visual editor for advanced users while retaining

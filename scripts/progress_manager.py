@@ -10,10 +10,11 @@ authority for scientific content; this script protects the state file.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
-import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -23,6 +24,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 SECTIONS = [
@@ -65,7 +69,12 @@ ALLOWED_HUB_STATUS = {"ready", "degraded", "missing", "not_applicable"}
 ALLOWED_EVENT_TYPES = {"milestone", "experience", "error", "decision", "risk", "recovery", "warning"}
 MAX_SCALAR = 4000
 MAX_ID_DIGITS = 18
+MAX_PROGRESS_BYTES = 8 * 1024 * 1024
 REPLACE_RETRIES = 8
+SNAPSHOT_TEXT_FIELDS = (
+    "research_question", "selected_direction", "current_status", "completed_milestones",
+    "next_action", "blockers", "last_stage_receipt",
+)
 EVENT_LINE_RE = re.compile(
     r"^-\s+(EVT-(\d+)):\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(.+)\s+\[([^\]]*)\]\s*$"
 )
@@ -97,6 +106,11 @@ def canonical_text(value: str) -> str:
     if value.startswith("\ufeff"):
         value = value[1:]
     return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def document_sha256(text: str) -> str:
+    """Identify the normalized text returned by the progress reader."""
+    return hashlib.sha256(canonical_text(text).encode("utf-8")).hexdigest()
 
 
 def validate_scalar(value: str, label: str, *, required: bool = True) -> str:
@@ -155,9 +169,80 @@ def template(project_id: str, target_venue: str = "", document_format: str = "")
 """
 
 
+def _file_path(value: str | Path) -> Path:
+    """Normalize the parent without resolving an unsafe leaf into its target."""
+    path = Path(value)
+    return path.parent.resolve() / path.name
+
+
+def _require_plain_file(value: os.stat_result, path: Path) -> None:
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (not stat.S_ISREG(value.st_mode) or value.st_nlink != 1
+            or getattr(value, "st_file_attributes", 0) & reparse):
+        raise ProgressError(f"progress path is not a single-link regular file: {path}")
+
+
+def _check_file_identity(path: Path, descriptor: int, before: os.stat_result,
+                         *, stable: bool = False) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    named = path.lstat()
+    _require_plain_file(opened, path)
+    _require_plain_file(named, path)
+    identity = (before.st_dev, before.st_ino)
+    if ((opened.st_dev, opened.st_ino) != identity
+            or (named.st_dev, named.st_ino) != identity):
+        raise ProgressError(f"progress path changed while open: {path}")
+    if stable and any(
+        (value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        != (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        for value in (opened, named)
+    ):
+        raise ProgressError(f"progress file changed while being read: {path}")
+    return opened
+
+
+@contextmanager
+def _open_plain_file(path: Path, *, create: bool = False):
+    """Open without blocking on special files or writing through hard links."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            raise
+        before = None
+    if before is not None:
+        _require_plain_file(before, path)
+    flags = (os.O_RDWR | os.O_CREAT) if create else os.O_RDONLY
+    flags |= (getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+              | getattr(os, "O_BINARY", 0))
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        _check_file_identity(path, descriptor, before if before is not None else opened)
+        yield descriptor, opened
+    finally:
+        os.close(descriptor)
+
+
+def _read_bytes(path: Path) -> bytes:
+    with _open_plain_file(path) as (descriptor, opened):
+        if opened.st_size > MAX_PROGRESS_BYTES:
+            raise ProgressError(f"progress file exceeds {MAX_PROGRESS_BYTES} bytes: {path}")
+        chunks = bytearray()
+        while len(chunks) <= MAX_PROGRESS_BYTES:
+            chunk = os.read(descriptor, min(1024 * 1024, MAX_PROGRESS_BYTES + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if len(chunks) > MAX_PROGRESS_BYTES:
+            raise ProgressError(f"progress file exceeds {MAX_PROGRESS_BYTES} bytes: {path}")
+        _check_file_identity(path, descriptor, opened, stable=True)
+        return bytes(chunks)
+
+
 def read_text(path: Path) -> str:
     try:
-        return canonical_text(path.read_text(encoding="utf-8"))
+        return canonical_text(_read_bytes(path).decode("utf-8"))
     except FileNotFoundError as exc:
         raise ProgressError(f"progress file not found: {path}") from exc
     except UnicodeError as exc:
@@ -200,8 +285,10 @@ def _section(text: str, heading: str, bounds: dict[str, tuple[int, int]] | None 
     return text[start:end]
 
 
-def _section_field(section: str, name: str) -> str:
-    match = re.search(rf"^[ \t]*-[ \t]+{re.escape(name)}[ \t]*:[ \t]*(.*)$", section, re.MULTILINE)
+def _section_field(section: str, name: str, *, nested: bool = False) -> str:
+    """Read the declared field level, never an example from another level."""
+    indentation = r"[ \t]+" if nested else ""
+    match = re.search(rf"^{indentation}-[ \t]+{re.escape(name)}[ \t]*:[ \t]*(.*)$", section, re.MULTILINE)
     return match.group(1).strip() if match else ""
 
 
@@ -288,8 +375,8 @@ def _active_rule_summaries(text: str) -> list[str]:
     section = _section(text, "## Error Avoidance Rules")
     active: list[str] = []
     for rule_id, body in _rule_blocks(section):
-        status = _section_field(body, "status")
-        rule = _section_field(body, "prevention_rule")
+        status = _section_field(body, "status", nested=True)
+        rule = _section_field(body, "prevention_rule", nested=True)
         if status == "active":
             active.append(f"{rule_id} — {rule or 'active rule without summary'}")
     return active
@@ -371,14 +458,14 @@ def _validate_structure(text: str) -> tuple[list[str], list[str]]:
         elif int(number_text) <= 0:
             errors.append(f"entry ID must be positive: {entry_id}")
     for rule_id, body in _rule_blocks(_section(text, "## Error Avoidance Rules", bounds)):
-        status = _section_field(body, "status")
+        status = _section_field(body, "status", nested=True)
         if status not in ALLOWED_RULE_STATUS:
             errors.append(f"{rule_id} has invalid status: {status or '<missing>'}")
         errors.extend(_validate_nested_fields(body, rule_id, ("error", "cause", "impact", "severity", "blocking", "prevention_rule", "required_check", "applicable_stages", "status")))
-        severity = _section_field(body, "severity")
+        severity = _section_field(body, "severity", nested=True)
         if severity and severity not in ALLOWED_RULE_SEVERITY:
             errors.append(f"{rule_id} has invalid severity: {severity}")
-        blocking = _section_field(body, "blocking")
+        blocking = _section_field(body, "blocking", nested=True)
         if blocking and blocking not in ALLOWED_BLOCKING:
             errors.append(f"{rule_id} has invalid blocking value: {blocking}")
         if severity == "critical" and blocking != "true":
@@ -399,7 +486,7 @@ def _validate_structure(text: str) -> tuple[list[str], list[str]]:
             errors.append("malformed decision entry: " + line.strip()[:120])
     for decision_id, body in _decision_blocks(decisions_section):
         errors.extend(_validate_nested_fields(body, decision_id, ("question", "chosen_option", "rejected_options", "decision_owner", "evidence")))
-        owner = _section_field(body, "decision_owner")
+        owner = _section_field(body, "decision_owner", nested=True)
         if owner and owner not in {"user", "main-model", "evidence"}:
             errors.append(f"{decision_id} has invalid decision_owner: {owner}")
 
@@ -455,7 +542,7 @@ def _validate_structure(text: str) -> tuple[list[str], list[str]]:
         errors.append("Handoff Card must_not_repeat is stale while no active rules are present")
     active_blockers = [
         rule_id for rule_id, body in _rule_blocks(_section(text, "## Error Avoidance Rules", bounds))
-        if _section_field(body, "status") == "active" and _section_field(body, "blocking") == "true"
+        if _section_field(body, "status", nested=True) == "active" and _section_field(body, "blocking", nested=True) == "true"
     ]
     if active_blockers and validity_status != "blocked":
         errors.append("active blocking rules require Current Snapshot validity_status: blocked")
@@ -479,53 +566,49 @@ def progress_lock(path: Path, timeout: float = 20.0):
     lock_path = _lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    handle = None
-    while handle is None:
+    with _open_plain_file(lock_path, create=True) as (descriptor, opened):
+        # Windows byte-range locks need a byte to lock. Validate the opened
+        # name and link count before this first write as well as after waiting.
+        if opened.st_size == 0:
+            _check_file_identity(lock_path, descriptor, opened)
+            os.write(descriptor, b"0")
+            os.fsync(descriptor)
+        while True:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (OSError, BlockingIOError):
+                if time.monotonic() - started >= timeout:
+                    raise ProgressError(f"timed out waiting for progress lock: {lock_path}")
+                time.sleep(0.05)
         try:
-            handle = lock_path.open("a+b")
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
-                os.fsync(handle.fileno())
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, BlockingIOError):
-            if handle is not None:
-                handle.close()
-                handle = None
-            if time.monotonic() - started >= timeout:
-                raise ProgressError(f"timed out waiting for progress lock: {lock_path}")
-            time.sleep(0.05)
-    try:
-        yield
-    finally:
-        try:
-            if os.name == "nt":
-                import msvcrt
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _check_file_identity(lock_path, descriptor, opened)
+            yield
+            _check_file_identity(lock_path, descriptor, opened)
         finally:
-            handle.close()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.name == "nt":
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
+    contents = _read_bytes(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_name: str | None = None
     try:
-        with source.open("rb") as source_handle, tempfile.NamedTemporaryFile(
+        with tempfile.NamedTemporaryFile(
             mode="wb", dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp", delete=False
         ) as target_handle:
             temp_name = target_handle.name
-            shutil.copyfileobj(source_handle, target_handle)
+            target_handle.write(contents)
             target_handle.flush()
             os.fsync(target_handle.fileno())
         _replace_with_retry(temp_name, destination)
@@ -554,6 +637,8 @@ def atomic_write(path: Path, text: str, *, keep_backup: bool = True) -> None:
     """Write UTF-8 text with a same-directory temp file and atomic replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized = canonical_text(text)
+    if len(normalized.encode("utf-8")) > MAX_PROGRESS_BYTES:
+        raise ProgressError(f"progress file exceeds {MAX_PROGRESS_BYTES} bytes: {path}")
     if keep_backup and path.exists():
         _atomic_copy(path, Path(str(path) + ".bak"))
     temp_name: str | None = None
@@ -609,7 +694,7 @@ def _replace_handoff(text: str) -> str:
         raise ProgressError("required handoff field not found: must_not_repeat")
     handoff = re.sub(
         r"^-\s+must_not_repeat:.*$",
-        f"- must_not_repeat: {value}",
+        lambda _match: f"- must_not_repeat: {value}",
         handoff,
         count=1,
         flags=re.MULTILINE,
@@ -621,7 +706,7 @@ def _replace_handoff(text: str) -> str:
     if re.search(r"^-\s+last_updated:", metadata, re.MULTILINE):
         metadata = re.sub(
             r"^-\s+last_updated:.*$",
-            f"- last_updated: {utc_now()}",
+            lambda _match: f"- last_updated: {utc_now()}",
             metadata,
             count=1,
             flags=re.MULTILINE,
@@ -630,11 +715,12 @@ def _replace_handoff(text: str) -> str:
     return text
 
 
-def _insert_before_section(text: str, heading: str, block: str) -> str:
+def _append_to_section(text: str, heading: str, block: str) -> str:
+    """Append inside the named section, before any following extension."""
     bounds = _section_bounds(text)
     if heading not in bounds:
         raise ProgressError(f"required section not found: {heading}")
-    index = bounds[heading][0]
+    index = bounds[heading][1]
     prefix = text[:index].rstrip("\n")
     suffix = text[index:]
     return prefix + "\n\n" + block.rstrip() + "\n\n" + suffix
@@ -658,10 +744,10 @@ def _upsert_field(text: str, heading: str, name: str, value: str) -> str:
     bounds = _section_bounds(text)
     start, end = bounds[heading]
     section = text[start:end]
-    field_pattern = rf"^[ \t]*-[ \t]+{re.escape(name)}[ \t]*:.*$"
+    field_pattern = rf"^-[ \t]+{re.escape(name)}[ \t]*:.*$"
     replacement = f"- {name}: {value}"
     if re.search(field_pattern, section, re.MULTILINE):
-        section = re.sub(field_pattern, replacement, section, count=1, flags=re.MULTILINE)
+        section = re.sub(field_pattern, lambda _match: replacement, section, count=1, flags=re.MULTILINE)
     else:
         section = section.rstrip("\n") + "\n" + replacement + "\n"
     return text[:start] + section + text[end:]
@@ -696,31 +782,28 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    path = Path(args.file).resolve()
+    path = _file_path(args.file)
     result = validate_text(read_text(path))
     result["file"] = str(path)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["valid"] else 1
 
 
-def cmd_summary(args: argparse.Namespace) -> int:
-    path = Path(args.file).resolve()
-    text = read_text(path)
+def summarize_text(text: str) -> dict[str, object]:
+    """Return a validated snapshot without reading files or modifying state."""
+    text = canonical_text(text)
     validation = validate_text(text)
     if not validation["valid"]:
-        result = {
-            "file": str(path),
+        return {
             "valid": False,
             "validation_errors": validation["errors"],
             "validation_warnings": validation["warnings"],
         }
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 1
     bounds = _section_bounds(text)
     metadata = _section(text, "## Project Metadata", bounds)
     snapshot = _section(text, "## Current Snapshot", bounds)
-    result = {
-        "file": str(path),
+    return {
+        "document_sha256": document_sha256(text),
         "valid": validation["valid"],
         "validation_errors": validation["errors"],
         "validation_warnings": validation["warnings"],
@@ -735,12 +818,87 @@ def cmd_summary(args: argparse.Namespace) -> int:
         "validity_status": _section_field(snapshot, "validity_status"),
         "active_rule_ids": _active_rule_ids(text),
     }
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    path = _file_path(args.file)
+    result = {"file": str(path), **summarize_text(read_text(path))}
+    if path.name == "progress.md" and path.parent.name == ".research":
+        from scripts.confirmed_artifacts import ConfirmedArtifactError, confirmed_artifact_summary
+
+        try:
+            result["confirmed_artifacts"] = confirmed_artifact_summary(path.parent.parent)
+        except (ConfirmedArtifactError, OSError, ValueError) as exc:
+            result["valid"] = False
+            result["validation_errors"].append(f"confirmed artifact catalog is invalid: {exc}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if validation["valid"] else 1
+    return 0 if result["valid"] else 1
+
+
+def cmd_update_snapshot(args: argparse.Namespace) -> int:
+    """Patch declared Official v1 fields against an explicitly read generation."""
+    from scripts.workflow_engine.fs import resolve_project_path
+    from scripts.workflow_engine.store import WorkflowStore
+
+    summary = validate_scalar(args.summary, "summary")
+    refs = validate_scalar(args.refs, "refs")
+    expected_sha256 = validate_scalar(args.expected_sha256, "expected_sha256")
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+        raise ProgressError("expected_sha256 must be a lowercase SHA-256 from the latest summary")
+    if "[" in summary or "]" in summary:
+        raise ProgressError("summary cannot contain '[' or ']' because event records use bracket delimiters")
+
+    updates: list[tuple[str, str, str]] = []
+    fields = (
+        ("current_stage", "## Project Metadata", "current_stage", ALLOWED_STAGES),
+        ("entry_mode", "## Project Metadata", "mode", ALLOWED_MODES),
+        ("hub_status", "## Current Snapshot", "hub_status", ALLOWED_HUB_STATUS),
+        *((name, "## Current Snapshot", name, None) for name in SNAPSHOT_TEXT_FIELDS),
+        ("resume_instruction", "## Handoff Card", "resume_instruction", None),
+    )
+    for argument, heading, name, choices in fields:
+        value = getattr(args, argument, None)
+        if value is None:
+            continue
+        value = validate_scalar(value, argument)
+        if choices is not None and value not in choices:
+            raise ProgressError(f"invalid {argument}: {value}")
+        updates.append((heading, name, value))
+    if not updates:
+        raise ProgressError("update-snapshot requires at least one snapshot or stage field")
+    if getattr(args, "resume_instruction", None) is None:
+        next_action = next((value for _, name, value in updates if name == "next_action"), None)
+        if next_action is not None:
+            updates.append(("## Handoff Card", "resume_instruction", next_action))
+
+    store = WorkflowStore(args.project)
+    # Hold the same mode-selection lock used by activation before taking the
+    # official progress lock, so a custom run cannot start during this write.
+    with store.locked_official():
+        path = resolve_project_path(store.project_root, ".research/progress.md")
+        resolve_project_path(store.project_root, ".research/progress.md.lock")
+        with progress_lock(path):
+            path = resolve_project_path(store.project_root, ".research/progress.md")
+            text = read_text(path)
+            existing = validate_text(text)
+            if not existing["valid"]:
+                raise ProgressError("refusing to modify invalid progress: " + "; ".join(existing["errors"]))
+            if document_sha256(text) != expected_sha256:
+                raise ProgressError("progress changed since it was read; run summary again and use its document_sha256")
+            for heading, name, value in updates:
+                text = _upsert_field(text, heading, name, value)
+            text = _replace_handoff(text)
+            current_stage = _section_field(_section(text, "## Project Metadata"), "current_stage")
+            text = _append_event(text, current_stage, "milestone", summary, refs)
+            resolve_project_path(store.project_root, ".research/progress.md")
+            resolve_project_path(store.project_root, ".research/progress.md.bak")
+            _write_checked(path, text)
+    print(f"updated: {path}")
+    return 0
 
 
 def cmd_record_error(args: argparse.Namespace) -> int:
-    path = Path(args.file).resolve()
+    path = _file_path(args.file)
     values = {
         "stage": validate_scalar(args.stage, "stage"),
         "error": validate_scalar(args.error, "error"),
@@ -781,7 +939,7 @@ def cmd_record_error(args: argparse.Namespace) -> int:
   - required_check: {values['check']}
   - applicable_stages: {values['stages']}
   - status: active"""
-        text = _insert_before_section(text, "## Decisions", block)
+        text = _append_to_section(text, "## Error Avoidance Rules", block)
         text = _replace_handoff(text)
         if values["blocking"] == "true":
             text = _upsert_field(text, "## Current Snapshot", "validity_status", "blocked")
@@ -825,13 +983,13 @@ def _ensure_legacy_rule_fields(text: str) -> str:
 def _legacy_validity_status(text: str) -> str:
     bounds = _section_bounds(text)
     for _, body in _rule_blocks(_section(text, "## Error Avoidance Rules", bounds)):
-        if _section_field(body, "status") == "active" and _section_field(body, "blocking") == "true":
+        if _section_field(body, "status", nested=True) == "active" and _section_field(body, "blocking", nested=True) == "true":
             return "blocked"
     return "pending"
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
-    path = Path(args.file).resolve()
+    path = _file_path(args.file)
     mode = validate_scalar(args.mode, "mode")
     if mode not in ALLOWED_MODES:
         raise ProgressError(f"invalid mode: {mode}")
@@ -900,7 +1058,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
-    path = Path(args.file).resolve()
+    path = _file_path(args.file)
     backup = Path(str(path) + ".bak")
     with progress_lock(path):
         backup_text = read_text(backup)
@@ -938,6 +1096,19 @@ def build_parser() -> argparse.ArgumentParser:
     summary = sub.add_parser("summary", help="print a validated machine-readable snapshot")
     summary.add_argument("--file", required=True)
     summary.set_defaults(func=cmd_summary)
+
+    update = sub.add_parser("update-snapshot", help="update Official v1 progress using a validated generation digest")
+    update.add_argument("--project", required=True, help="project containing .research/progress.md")
+    update.add_argument("--expected-sha256", required=True, help="document_sha256 from the latest summary")
+    update.add_argument("--summary", required=True, help="concise description for the append-only progress event")
+    update.add_argument("--refs", required=True, help="evidence references for this update")
+    update.add_argument("--current-stage", choices=sorted(ALLOWED_STAGES))
+    update.add_argument("--entry-mode", choices=sorted(ALLOWED_MODES), help="Official v1 entry mode, not official/custom selection")
+    update.add_argument("--hub-status", choices=sorted(ALLOWED_HUB_STATUS))
+    for name in SNAPSHOT_TEXT_FIELDS:
+        update.add_argument("--" + name.replace("_", "-"))
+    update.add_argument("--resume-instruction")
+    update.set_defaults(func=cmd_update_snapshot)
 
     error = sub.add_parser("record-error", help="append an error rule and event transactionally")
     error.add_argument("--file", required=True)

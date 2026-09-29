@@ -194,6 +194,32 @@ class WorkflowStudioServerTests(unittest.TestCase):
         self.assertIn("paper_type", validators["paper-section"]["options"])
         self.assertFalse(validators["humanizer-preflight"]["available"])
 
+    def test_catalog_reports_installed_skill_locked_only_while_receipt_matches(self):
+        from scripts.workflow_engine.catalog import tree_sha256
+
+        skill = self.skills / "test-workflow-task"
+        receipt = {
+            "schema_version": "paper-workflow-install-v1", "profile": "core",
+            "skills": {"test-workflow-task": {
+                "tree_hash": tree_sha256(skill),
+                "source": {"name": "test-workflow-task", "source": "bundled",
+                           "path": "companion-skills/test-workflow-task", "license": "MIT"},
+            }},
+        }
+        receipt_path = self.skills / ".paper-workflow-install.json"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        status, data, _ = self.request("GET", "/api/catalog")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["data"]["skills"][0]["locked"])
+        self.assertNotIn("catalog.unlocked_skill", {item["code"] for item in data["warnings"]})
+
+        receipt["skills"]["test-workflow-task"]["tree_hash"] = "sha256:" + "0" * 64
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        status, data, _ = self.request("GET", "/api/catalog")
+        self.assertEqual(status, 200)
+        self.assertFalse(data["data"]["skills"][0]["locked"])
+        self.assertIn("catalog.unlocked_skill", {item["code"] for item in data["warnings"]})
+
     def test_catalog_marks_ambiguous_skill_without_exposing_absolute_paths(self):
         duplicate_root = self.root / "duplicate-skills"
         duplicate = duplicate_root / "test-workflow-task"
@@ -216,9 +242,10 @@ class WorkflowStudioServerTests(unittest.TestCase):
                 "GET", "/api/catalog", port=server.server_address[1]
             )
             self.assertEqual(status, 200)
-            self.assertEqual(data["status"], "blocked")
+            self.assertEqual(data["status"], "pass")
             ambiguous = [item for item in data["data"]["skills"] if item["ambiguous"]]
             self.assertEqual([item["catalog_id"] for item in ambiguous], ["test-workflow-task"])
+            self.assertIn("catalog.ambiguous_skill", {item["code"] for item in data["warnings"]})
             self.assertNotIn(str(self.root), json.dumps(data))
         finally:
             server.shutdown()
@@ -249,7 +276,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
             headers=self.write_headers(),
         )
         self.assertEqual(status, 200, saved)
-        warning_codes = sorted(item["code"] for item in validation["warnings"])
+        warning_codes = validation["data"]["required_warning_codes"]
         activation_request = {
             "workflow_id": workflow["workflow_id"],
             "expected_document_revision": saved["data"]["document_revision"],
@@ -319,9 +346,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
             "workflow_id": workflow["workflow_id"],
             "expected_document_revision": saved["data"]["document_revision"],
             "semantic_sha256": validation["data"]["semantic_sha256"],
-            "acknowledged_warning_codes": sorted(
-                item["code"] for item in validation["warnings"]
-            ),
+            "acknowledged_warning_codes": validation["data"]["required_warning_codes"],
         }
         with mock.patch.object(
             self.server.application.service.store,
@@ -360,9 +385,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
             "workflow_id": workflow["workflow_id"],
             "expected_document_revision": saved["data"]["document_revision"],
             "semantic_sha256": validation["data"]["semantic_sha256"],
-            "acknowledged_warning_codes": sorted(
-                item["code"] for item in validation["warnings"]
-            ),
+            "acknowledged_warning_codes": validation["data"]["required_warning_codes"],
         }
         store = self.server.application.service.store
         original_start = store._start_run_unlocked
@@ -405,9 +428,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
             "workflow_id": workflow["workflow_id"],
             "expected_document_revision": saved["data"]["document_revision"],
             "semantic_sha256": validation["data"]["semantic_sha256"],
-            "acknowledged_warning_codes": sorted(
-                item["code"] for item in validation["warnings"]
-            ),
+            "acknowledged_warning_codes": validation["data"]["required_warning_codes"],
         }
         store = self.server.application.service.store
         original_atomic_json = store._atomic_json
@@ -603,9 +624,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
             "workflow_id": workflow["workflow_id"],
             "expected_document_revision": saved["data"]["document_revision"],
             "semantic_sha256": validation["data"]["semantic_sha256"],
-            "acknowledged_warning_codes": sorted(
-                item["code"] for item in validation["warnings"]
-            ),
+            "acknowledged_warning_codes": validation["data"]["required_warning_codes"],
         }
         changed = json.loads(json.dumps(workflow))
         changed["ui"]["positions"]["directions"]["x"] += 20
@@ -680,9 +699,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
             "workflow_id": workflow["workflow_id"],
             "expected_document_revision": saved["data"]["document_revision"],
             "semantic_sha256": validation["data"]["semantic_sha256"],
-            "acknowledged_warning_codes": sorted(
-                item["code"] for item in validation["warnings"]
-            ),
+            "acknowledged_warning_codes": validation["data"]["required_warning_codes"],
         }
         changed = json.loads(json.dumps(workflow))
         changed["ui"]["positions"]["directions"]["x"] += 20
@@ -742,9 +759,7 @@ class WorkflowStudioServerTests(unittest.TestCase):
             "workflow_id": workflow["workflow_id"],
             "expected_document_revision": saved["data"]["document_revision"],
             "semantic_sha256": validation["data"]["semantic_sha256"],
-            "acknowledged_warning_codes": sorted(
-                item["code"] for item in validation["warnings"]
-            ),
+            "acknowledged_warning_codes": validation["data"]["required_warning_codes"],
         }
 
         entered_start = threading.Event()

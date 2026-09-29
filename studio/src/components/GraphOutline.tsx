@@ -10,7 +10,7 @@ export function GraphOutline({ workflow, selectedNodeId, onSelectNode }: GraphOu
   return (
     <section className="outline-panel" aria-labelledby="outline-title">
       <div className="panel-heading panel-heading--compact">
-        <div><p className="eyebrow">无障碍导航</p><h2 id="outline-title">流程大纲</h2></div>
+        <div><p className="eyebrow">点击阶段即可编辑</p><h2 id="outline-title">流程大纲</h2></div>
         <span className="count-pill">{workflow?.nodes.length ?? 0} 阶段</span>
       </div>
       {!workflow || workflow.nodes.length === 0 ? (
@@ -31,7 +31,7 @@ export function GraphOutline({ workflow, selectedNodeId, onSelectNode }: GraphOu
                   <span className="outline-item__number">{String(index + 1).padStart(2, '0')}</span>
                   <span className="outline-item__main">
                     <strong>{node.display_name}</strong>
-                    <small>{node.type}{outgoing.length ? ` → ${outgoing.join(', ')}` : ' · 结束阶段'}</small>
+                    <small>{{ task: '任务', validator: '验证', condition: '分支', join: '汇合' }[node.type]}{outgoing.length ? ` → ${outgoing.join(', ')}` : ' · 结束阶段'}</small>
                   </span>
                   {!node.enabled && <span className="outline-item__state">停用</span>}
                 </button>

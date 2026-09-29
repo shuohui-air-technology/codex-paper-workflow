@@ -1,0 +1,11 @@
+.skill-description { display: block; padding: 8px 10px; border-radius: 7px; background: #f4f7fc; color: #586d87; font-size: .7rem; line-height: 1.55; overflow-wrap: anywhere; }
+.skill-description summary { cursor: pointer; font-weight: 600; }
+.skill-description p { margin: 8px 0 0; }
+.inspector-stage-actions { grid-column: 1 / -1; padding: 10px; border: 1px solid #e5eaf1; border-radius: 8px; background: #fafbfd; }
+.inspector-stage-actions__buttons { display: flex; flex-wrap: wrap; gap: 12px; }
+.inspector-stage-actions .field { margin: 9px 0; }
+.inspector-stage-actions .field__help { margin: 6px 0 0; }
+.inspector-advanced { grid-column: 1 / -1; border-top: 1px solid #e5eaf1; padding-top: 12px; }
+.inspector-advanced summary { cursor: pointer; color: #4c627f; font-size: .77rem; font-weight: 650; }
+.inspector-advanced summary:focus-visible { outline: 2px solid #5a80c5; outline-offset: 4px; border-radius: 3px; }
+.inspector-advanced > .field__help { margin: 9px 0 12px; }

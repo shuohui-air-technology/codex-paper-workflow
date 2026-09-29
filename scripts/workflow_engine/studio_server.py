@@ -21,7 +21,9 @@ from urllib.parse import unquote_to_bytes, urlsplit
 
 from .catalog import (
     CatalogError,
+    ROOT_CATALOG_FAILURE_CODES,
     discover_skills,
+    load_install_receipts,
     load_validator_registry,
 )
 from .schema import WorkflowError, WorkflowIssue, validator_form_metadata
@@ -362,7 +364,7 @@ class StudioApplication:
         }
 
     def _catalog(self) -> tuple[dict, list[dict], list[dict]]:
-        catalog = discover_skills(self.service.skill_roots, {})
+        catalog = discover_skills(self.service.skill_roots, load_install_receipts(self.service.skill_roots))
         skills = []
         for catalog_id, identity in sorted(catalog.skills.items()):
             name, description = _safe_metadata(identity.root / identity.relative_path / "SKILL.md")
@@ -374,15 +376,11 @@ class StudioApplication:
                 "skill_sha256": identity.skill_sha256,
                 "tree_sha256": identity.tree_sha256,
                 "locked": identity.locked,
-                "ambiguous": False,
+                "ambiguous": catalog_id in catalog.failed_skill_ids,
             })
-        ambiguous_ids = set()
-        for issue in catalog.errors:
-            if issue.code == "catalog.ambiguous_skill":
-                candidate_id = str(issue.message).rsplit(": ", 1)[-1]
-                if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", candidate_id):
-                    ambiguous_ids.add(candidate_id)
-        for catalog_id in sorted(ambiguous_ids):
+        for catalog_id in sorted(catalog.failed_skill_ids - catalog.skills.keys()):
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", catalog_id):
+                continue
             skills.append({
                 "catalog_id": catalog_id,
                 "display_name": catalog_id.replace("-", " ").title(),
@@ -420,11 +418,17 @@ class StudioApplication:
         errors = [
             _validation_issue(item, "catalog", self.project_root, self.service.skill_roots)
             for item in catalog.errors
+            if item.code in ROOT_CATALOG_FAILURE_CODES
         ]
         warnings = [
             _validation_issue(item, "catalog", self.project_root, self.service.skill_roots)
             for item in catalog.warnings
         ]
+        warnings.extend(
+            _validation_issue(item, "catalog", self.project_root, self.service.skill_roots)
+            for item in catalog.errors
+            if item.code not in ROOT_CATALOG_FAILURE_CODES
+        )
         return {"skills": skills, "validators": validator_data}, errors, warnings
 
     def _projection(self) -> dict:

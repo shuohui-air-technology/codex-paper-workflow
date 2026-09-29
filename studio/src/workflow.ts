@@ -152,7 +152,7 @@ function defaultTask(id: string, displayName: string, entry: boolean): WorkflowN
 /** Create a schema-saveable starter draft; the unbound task needs user configuration before activation. */
 export function createBlankWorkflow(workflowId: string): WorkflowDocument {
   assertIdentifier(workflowId, 'workflow_id');
-  const node = defaultTask('step-1', 'New step', true);
+  const node = defaultTask('step-1', '第一个任务阶段', true);
   return {
     schema_version: 'paper-workflow-custom-v1',
     workflow_id: workflowId,
@@ -175,7 +175,7 @@ function uniqueId(base: string, existing: ReadonlySet<string>, fallback: string)
 }
 
 function positionForIndex(index: number): WorkflowPosition {
-  return { x: 120 + (index % 8) * 220, y: 100 + Math.floor(index / 8) * 150 };
+  return { x: 120 + (index % 5) * 300, y: 100 + Math.floor(index / 5) * 190 };
 }
 
 function assertPosition(position: WorkflowPosition): void {
@@ -255,7 +255,8 @@ function triggerFor(node: WorkflowNode): string {
 function legalTriggers(node: WorkflowNode): string[] {
   if (node.type === 'condition') return [...node.condition_cases.map((item) => item.outcome), 'default'];
   if (node.type === 'join') return ['succeeded'];
-  return [...node.outcomes];
+  if (node.type === 'task') return ['succeeded'];
+  return ['pass', 'fail', 'blocked'];
 }
 
 function makeEdge(
@@ -279,20 +280,30 @@ function splitOutputMap(
   inserted: WorkflowNode,
   target: WorkflowNode,
 ): { upstream: Record<string, string>; downstream: Record<string, string> } {
-  const original = Object.keys(oldEdge.output_map).length > 0
-    ? oldEdge.output_map
-    : defaultOutputMap(source, target);
+  const targetAccepted = acceptedArtifacts(target);
+  // Unmapped outputs still travel under their original names, even when other
+  // outputs on the same connection have explicit renames.
+  const original = source.outputs
+    .map((output) => [output, oldEdge.output_map[output] ?? output] as const)
+    .filter(([, destination]) => targetAccepted.has(destination));
   const upstreamAccepted = acceptedArtifacts(inserted);
   const upstream: Record<string, string> = {};
-  for (const [output, destination] of Object.entries(original)) {
-    if (source.outputs.includes(output) && upstreamAccepted.has(destination)) upstream[output] = destination;
-  }
   const downstream: Record<string, string> = {};
-  for (const [oldOutput, destination] of Object.entries(original)) {
+  const missing = new Set<string>();
+  for (const [oldOutput, destination] of original) {
     const possibleOutput = inserted.outputs.includes(oldOutput) ? oldOutput : destination;
-    if (inserted.outputs.includes(possibleOutput) && acceptedArtifacts(target).has(destination)) {
-      downstream[possibleOutput] = destination;
+    if (!upstreamAccepted.has(destination) || !inserted.outputs.includes(possibleOutput)) {
+      missing.add(destination);
+      continue;
     }
+    if (Object.hasOwn(downstream, possibleOutput) && downstream[possibleOutput] !== destination) {
+      throw new WorkflowEditError(`新阶段的输出“${possibleOutput}”无法同时映射到多个目标产物“${downstream[possibleOutput]}”和“${destination}”。请先独立添加阶段，为这些产物配置不同的输出后再连接。`);
+    }
+    upstream[oldOutput] = destination;
+    downstream[possibleOutput] = destination;
+  }
+  if (missing.size > 0) {
+    throw new WorkflowEditError(`原连线传递的产物“${[...missing].join('、')}”无法通过新阶段。请先独立添加阶段，配置相应输入和输出后再连接。`);
   }
   return { upstream, downstream };
 }

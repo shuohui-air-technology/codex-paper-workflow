@@ -47,6 +47,9 @@ import { ValidationPanel } from './components/ValidationPanel';
 import { WorkflowCanvas } from './components/WorkflowCanvas';
 import { RiskAcknowledgementDialog } from './components/RiskAcknowledgementDialog';
 import { RevisionConflictDialog } from './components/RevisionConflictDialog';
+import { appendStage, arrangeWorkflow, createEditorHistory, recordHistory, undoDocument, redoDocument } from './editorTools';
+import { EditorToolbar } from './components/EditorToolbar';
+import { WorkflowGuide } from './components/WorkflowGuide';
 
 interface AppProps {
   api?: ApiClient;
@@ -78,7 +81,7 @@ function nodeFor(type: WorkflowNodeType, id: string, skillRef?: string): Workflo
   return { ...base, type, skill_ref: null, validator_ref: null, validator_config: null, outcomes: [] } satisfies JoinNode;
 }
 
-  function nextNodeId(document: WorkflowDocument): string {
+function nextNodeId(document: WorkflowDocument): string {
   const ids = new Set(document.nodes.map((node) => node.id));
   let index = 1;
   while (ids.has(`stage-${index}`)) index += 1;
@@ -156,6 +159,11 @@ export function App({ api: providedApi }: AppProps) {
   const [riskDialogOpen, setRiskDialogOpen] = useState(false);
   const [revisionConflict, setRevisionConflict] = useState(false);
   const [conflictDialogOpen, setConflictDialogOpen] = useState(false);
+  const [history, setHistory] = useState<ReturnType<typeof createEditorHistory> | null>(null);
+  const [placement, setPlacement] = useState<'after' | 'detached'>('after');
+  const [focusRequest, setFocusRequest] = useState(0);
+  const [layoutRequest, setLayoutRequest] = useState(0);
+  const [handoffCopied, setHandoffCopied] = useState(false);
 
   useEffect(() => {
     if (!api) {
@@ -197,6 +205,7 @@ export function App({ api: providedApi }: AppProps) {
         if (bootstrapResult.data.mode === 'custom' && workflowResult.data.workflow) {
           const next = createWorkflowEditState(workflowResult.data.workflow);
           setEditor(next);
+          setHistory(createEditorHistory(next.document));
           setSelectedNodeId(next.document.nodes[0]?.id ?? null);
         }
       } catch (error) {
@@ -242,10 +251,11 @@ export function App({ api: providedApi }: AppProps) {
     return () => window.clearTimeout(timer);
   }, [editor]);
 
-  function performEdit(operation: (document: WorkflowDocument) => WorkflowDocument) {
-    if (!editor) return;
+  function performEdit(operation: (document: WorkflowDocument) => WorkflowDocument): boolean {
+    if (!editor) return false;
     try {
       const next = applyWorkflowEdit(editor, operation);
+      setHistory(recordHistory(history ?? createEditorHistory(editor.document), editor.document));
       setEditor(next);
       setErrors([]);
       setWarnings([]);
@@ -254,8 +264,10 @@ export function App({ api: providedApi }: AppProps) {
       setAcknowledgedCodes([]);
       setRiskDialogOpen(false);
       setActionMessage(next.lastClassification === 'visual' ? '布局已更新。' : '流程内容已修改，需要重新验证。');
+      return true;
     } catch (error) {
       setActionMessage(safeErrorMessage(error));
+      return false;
     }
   }
 
@@ -263,6 +275,8 @@ export function App({ api: providedApi }: AppProps) {
     const initial = createWorkflowEditState(document);
     const unsaved = applyWorkflowEdit(initial, (current) => current);
     setEditor(unsaved);
+    setHistory(createEditorHistory(document));
+    setLayoutRequest((value) => value + 1);
     setSelectedNodeId(document.nodes[0]?.id ?? null);
     setErrors([]);
     setWarnings([]);
@@ -273,6 +287,8 @@ export function App({ api: providedApi }: AppProps) {
   function openSavedDraft() {
     if (!savedData?.workflow) return;
     setEditor(createWorkflowEditState(savedData.workflow));
+    setHistory(createEditorHistory(savedData.workflow));
+    setLayoutRequest((value) => value + 1);
     setSelectedNodeId(savedData.workflow.nodes[0]?.id ?? null);
     setActionMessage('已载入已保存的自定义草稿。官方流程仍保持原样。');
   }
@@ -281,15 +297,19 @@ export function App({ api: providedApi }: AppProps) {
     if (!editor) return;
     const id = nextNodeId(editor.document);
     const node = nodeFor(type, id, skillRef);
-    performEdit((document) => addNode(document, node));
-    setSelectedNodeId(id);
+    if (skillRef) node.display_name = skillEntries.find((skill) => skill.catalog_id === skillRef)?.display_name ?? skillRef;
+    if (performEdit((document) => placement === 'after' && selectedNodeId
+      ? appendStage(document, selectedNodeId, node)
+      : addNode(document, node))) {
+      setSelectedNodeId(id);
+      setFocusRequest((value) => value + 1);
+    }
   }
 
   function insertWorkflowNode(nodeId: string, type: WorkflowNodeType, direction: 'before' | 'after') {
     if (!editor) return;
     const node = nodeFor(type, nextNodeId(editor.document));
-    performEdit((document) => direction === 'before' ? insertBefore(document, nodeId, node) : insertAfter(document, nodeId, node));
-    setSelectedNodeId(node.id);
+    if (performEdit((document) => direction === 'before' ? insertBefore(document, nodeId, node) : insertAfter(document, nodeId, node))) setSelectedNodeId(node.id);
   }
 
   function connect(source: string, target: string, trigger?: string) {
@@ -369,6 +389,7 @@ export function App({ api: providedApi }: AppProps) {
     setSavedData(result.data);
     setBootstrap((current) => current ? { ...current, document_revision: result.data!.document_revision } : current);
     setEditor(createWorkflowEditState(result.data.workflow));
+    setHistory(createEditorHistory(result.data.workflow));
     setErrors([]);
     setWarnings([]);
     setLastValidation(null);
@@ -393,12 +414,14 @@ export function App({ api: providedApi }: AppProps) {
     } : current);
     setSavedData({ workflow: preview.workflow, document_revision: result.data.document_revision });
     setEditor(createWorkflowEditState(preview.workflow));
+    setHistory(createEditorHistory(preview.workflow));
+    setHandoffCopied(false);
     setWarnings(result.warnings);
     setErrors([]);
     setActivationPreview(null);
     setAcknowledgedCodes([]);
     setRiskDialogOpen(false);
-    setActionMessage(`自定义流程“${result.data.selection.workflow_id}”已启用（语义版本 ${result.data.selection.semantic_revision}）。`);
+    setActionMessage(`自定义流程“${result.data.selection.workflow_id}”已启用（语义版本 ${result.data.selection.semantic_revision}）。请回到同一项目目录的 Codex 对话，要求继续已启用的自定义工作流。`);
   }
 
   async function validateAndActivate() {
@@ -455,8 +478,13 @@ export function App({ api: providedApi }: AppProps) {
   }
 
   async function refreshCatalog() {
-    if (!api) return;
+    if (!api || busy || refreshingCatalog) return;
+    setBusy(true);
     setRefreshingCatalog(true);
+    setLastValidation(null);
+    setActivationPreview(null);
+    setAcknowledgedCodes([]);
+    setRiskDialogOpen(false);
     try {
       const result = await api.getCatalog();
       if (result.data) setCatalog(result.data);
@@ -465,7 +493,7 @@ export function App({ api: providedApi }: AppProps) {
       setActionMessage('本机 Skill 与验证器清单已刷新。');
     } catch (error) {
       setActionMessage(safeErrorMessage(error));
-    } finally { setRefreshingCatalog(false); }
+    } finally { setRefreshingCatalog(false); setBusy(false); }
   }
 
   async function save() {
@@ -492,6 +520,8 @@ export function App({ api: providedApi }: AppProps) {
       setBootstrap(bootstrapResult.data);
       setSavedData(workflowResult.data);
       setEditor(workflowResult.data.workflow ? createWorkflowEditState(workflowResult.data.workflow) : null);
+      setHistory(workflowResult.data.workflow ? createEditorHistory(workflowResult.data.workflow) : null);
+      setLayoutRequest((value) => value + 1);
       setSelectedNodeId(workflowResult.data.workflow?.nodes[0]?.id ?? null);
       setRevisionConflict(false);
       setConflictDialogOpen(false);
@@ -541,6 +571,59 @@ export function App({ api: providedApi }: AppProps) {
     } finally { setBusy(false); }
   }
 
+  function travelHistory(direction: 'undo' | 'redo') {
+    if (!editor || !history || busy) return;
+    const restored = direction === 'undo' ? undoDocument(history, editor.document) : redoDocument(history, editor.document);
+    if (!restored) return;
+    setEditor(applyWorkflowEdit(editor, () => restored.document));
+    setHistory(restored.history);
+    if (!restored.document.nodes.some((node) => node.id === selectedNodeId)) setSelectedNodeId(restored.document.nodes[0]?.id ?? null);
+    setErrors([]);
+    setWarnings([]);
+    setLastValidation(null);
+    setActivationPreview(null);
+    setAcknowledgedCodes([]);
+    setRiskDialogOpen(false);
+    setActionMessage(direction === 'undo' ? '已撤销上一步编辑。' : '已重做上一步编辑。');
+  }
+
+  useEffect(() => {
+    function handleShortcut(event: KeyboardEvent) {
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [role="dialog"]'))) return;
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.key.toLowerCase() !== 'z' || busy || riskDialogOpen || conflictDialogOpen) return;
+      const available = event.shiftKey ? history?.future.length : history?.past.length;
+      if (!available) return;
+      event.preventDefault();
+      travelHistory(event.shiftKey ? 'redo' : 'undo');
+    }
+    window.addEventListener('keydown', handleShortcut);
+    return () => window.removeEventListener('keydown', handleShortcut);
+  });
+
+  function locateIssue(issue: { node_id?: string; edge_id?: string }) {
+    if (!workflow) return;
+    const nodeId = issue.node_id || workflow.edges.find((edge) => edge.id === issue.edge_id)?.target;
+    setSelectedNodeId(nodeId && workflow.nodes.some((node) => node.id === nodeId) ? nodeId : null);
+    setFocusRequest((value) => value + 1);
+  }
+
+  useEffect(() => {
+    if (!focusRequest || !window.matchMedia('(max-width: 1250px)').matches) return;
+    document.querySelector<HTMLElement>('.inspector-panel')?.scrollIntoView({ block: 'nearest' });
+  }, [focusRequest]);
+
+  const handoffPrompt = '使用 paper-workflow-orchestrator 继续我在这个项目中已启用的自定义工作流。先检查当前模式和可执行阶段，告诉我下一阶段需要提供什么，再引导我按流程推进。';
+
+  async function copyHandoff() {
+    try {
+      await navigator.clipboard.writeText(handoffPrompt);
+      setHandoffCopied(true);
+    } catch {
+      setActionMessage('自动复制不可用，请选中下方提示词复制到同一项目的 Codex 对话。');
+    }
+  }
+
   if (loading) return <main className="loading-screen"><div className="loading-mark">P</div><p>正在连接本机工作流…</p></main>;
 
   if (loadError || !bootstrap || !workflow) {
@@ -571,6 +654,8 @@ export function App({ api: providedApi }: AppProps) {
         <span>当前启用：{bootstrap.active_workflow?.workflow_id ?? '自定义流程'} · 语义版本 {bootstrap.active_workflow?.semantic_revision ?? '—'} · 哈希 {bootstrap.active_workflow?.semantic_sha256.slice(0, 12) ?? '—'}…</span>
         <span>修改只影响草稿；保存不会改变当前运行版本。</span>
       </div>}
+      <WorkflowGuide editable={editable} active={bootstrap.mode === 'custom'} dirty={dirty} checked={lastValidation !== null && errors.length === 0} hintCount={advisoryHints.length} />
+      {bootstrap.mode === 'custom' && <details className="handoff-panel" open><summary>下一步：回到 Codex 执行流程</summary><div><p>{handoffPrompt}</p><button type="button" className="button button--quiet" onClick={() => void copyHandoff()}>{handoffCopied ? '提示词已复制' : '复制继续执行提示词'}</button></div></details>}
       {revisionConflict && <div className="conflict-banner" role="status">
         <span>服务器中的流程版本或检查结果已变化。当前本地草稿仍保留，但保存与启用已锁定。</span>
         <button type="button" className="text-button" onClick={() => setConflictDialogOpen(true)}>处理版本冲突</button>
@@ -578,8 +663,9 @@ export function App({ api: providedApi }: AppProps) {
       {bootstrap.mode === 'official' && savedData?.workflow && !editor && <div className="saved-draft-banner"><span>检测到已保存的自定义草稿；默认官方流程仍处于启用状态。</span><button type="button" className="text-button" onClick={openSavedDraft}>打开草稿</button></div>}
       {actionMessage && <div className="action-message" role="status">{actionMessage}</div>}
       <div className="studio-layout">
-        <NodePalette skills={skillEntries} editable={editable && !busy} onAddNode={addWorkflowNode} onRefresh={() => void refreshCatalog()} refreshing={refreshingCatalog} />
+        <NodePalette skills={skillEntries} editable={editable && !busy} onAddNode={addWorkflowNode} onRefresh={() => void refreshCatalog()} refreshing={refreshingCatalog || busy} placement={placement} onPlacementChange={setPlacement} selectedNodeName={selectedNode?.display_name ?? null} />
         <div className="studio-center-column">
+          <EditorToolbar editable={editable} busy={busy} canUndo={Boolean(history?.past.length)} canRedo={Boolean(history?.future.length)} settingsSelected={selectedNodeId === null} onUndo={() => travelHistory('undo')} onRedo={() => travelHistory('redo')} onSettings={() => setSelectedNodeId(null)} onArrange={() => { if (performEdit(arrangeWorkflow)) setLayoutRequest((value) => value + 1); }} />
           <WorkflowCanvas
             workflow={workflow}
             skills={skillEntries}
@@ -587,6 +673,9 @@ export function App({ api: providedApi }: AppProps) {
             selectedNodeId={selectedNodeId}
             readOnly={readOnly || busy}
             onSelectNode={setSelectedNodeId}
+            onDeselect={() => setSelectedNodeId(null)}
+            focusRequest={focusRequest}
+            layoutRequest={layoutRequest}
             onMoveNode={(nodeId, position) => performEdit((document) => moveNode(document, nodeId, position))}
             onConnect={onFlowConnect}
             onDeleteEdges={(deleted: Edge[]) => performEdit((document) => deleted.reduce((current, edge) => disconnectEdge(current, edge.id), document))}
@@ -600,6 +689,7 @@ export function App({ api: providedApi }: AppProps) {
               lastValidated={lastValidation !== null}
               busy={busy}
               advisoryHints={advisoryHints}
+              onLocateIssue={locateIssue}
             />
           </div>
         </div>
@@ -615,8 +705,15 @@ export function App({ api: providedApi }: AppProps) {
           onConnect={connect}
           onDisconnect={(edgeId) => performEdit((document) => disconnectEdge(document, edgeId))}
           onMoveNode={(nodeId, position) => performEdit((document) => moveNode(document, nodeId, position))}
-          onDuplicateNode={(nodeId) => { const next = duplicateNode(workflow, nodeId); performEdit(() => next); setSelectedNodeId(next.nodes.at(-1)?.id ?? null); }}
-          onDeleteNode={(nodeId) => { performEdit((document) => deleteNode(document, nodeId)); setSelectedNodeId(null); }}
+          onDuplicateNode={(nodeId) => {
+            let duplicatedId: string | null = null;
+            if (performEdit((document) => {
+              const next = duplicateNode(document, nodeId);
+              duplicatedId = next.nodes.at(-1)?.id ?? null;
+              return next;
+            })) setSelectedNodeId(duplicatedId);
+          }}
+          onDeleteNode={(nodeId) => { if (performEdit((document) => deleteNode(document, nodeId))) setSelectedNodeId(null); }}
           onInsertBefore={(nodeId, type) => insertWorkflowNode(nodeId, type, 'before')}
           onInsertAfter={(nodeId, type) => insertWorkflowNode(nodeId, type, 'after')}
         />

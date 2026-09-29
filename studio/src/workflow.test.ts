@@ -3,6 +3,7 @@ import {
   addNode,
   applyWorkflowEdit,
   classifyWorkflowEdit,
+  cloneWorkflowDocument,
   cloneProjection,
   connectNodes,
   createBlankWorkflow,
@@ -207,6 +208,7 @@ describe('workflow graph operations', () => {
     expect(original.nodes).toHaveLength(2);
     expect(added.nodes).toHaveLength(3);
     expect(added.ui.positions.third).toEqual({ x: 700, y: 180 });
+    expect(addNode(original, taskNode('auto-positioned')).ui.positions['auto-positioned']).toEqual({ x: 720, y: 100 });
 
     const duplicate = duplicateNode(original, 'first');
     const copied = duplicate.nodes.find((node) => node.id === 'first-copy');
@@ -272,12 +274,12 @@ describe('workflow graph operations', () => {
     expect(() => connectNodes(connected, 'step-1', 'step-1')).toThrow('cycle');
   });
 
-  it('allows connections from declared task outcomes beyond succeeded', () => {
+  it('rejects task outcome triggers that the server compiler cannot execute', () => {
     const starter = createBlankWorkflow('custom-trigger-flow');
     const withOutcome = updateNode(starter, 'step-1', { outcomes: ['succeeded', 'needs_review'] });
     const withTarget = addNode(withOutcome, taskNode('review'));
-    const connected = connectNodes(withTarget, 'step-1', 'review', 'needs_review');
-    expect(connected.edges[0]?.trigger).toBe('needs_review');
+    expect(() => connectNodes(withTarget, 'step-1', 'review', 'needs_review')).toThrow('Trigger needs_review');
+    expect(connectNodes(withTarget, 'step-1', 'review', 'succeeded').edges[0]?.trigger).toBe('succeeded');
   });
 
   it('inserts before and after only on simple one-edge segments and rewires atomically', () => {
@@ -309,6 +311,93 @@ describe('workflow graph operations', () => {
     expect(insertedAfter.edges).toHaveLength(2);
     expect(() => insertBefore(original, 'first', taskNode('other'))).toThrow('exactly one incoming');
     expect(() => insertAfter(original, 'second', taskNode('other'))).toThrow('exactly one outgoing');
+  });
+
+  it.each([
+    { name: 'implicit identity', outputMap: {} },
+    { name: 'explicit identity', outputMap: { draft: 'draft' } },
+  ])('rejects insertion that would discard $name artifact flow, without mutation', ({ outputMap }) => {
+    const original = linearDocument();
+    original.edges[0]!.output_map = outputMap;
+    const before = cloneWorkflowDocument(original);
+    for (const addition of [
+      taskNode('middle'),
+      taskNode('middle', { inputs: ['draft'] }),
+      taskNode('middle', { outputs: ['draft'] }),
+    ]) {
+      const additionBefore = { ...addition, inputs: [...addition.inputs], outputs: [...addition.outputs] };
+      expect(() => insertBefore(original, 'second', addition)).toThrow(/draft.*独立添加.*输入.*输出/);
+      expect(() => insertAfter(original, 'first', addition)).toThrow(/draft.*独立添加.*输入.*输出/);
+      expect(addition).toEqual(additionBefore);
+      expect(original).toEqual(before);
+    }
+  });
+
+  it('protects implicit identity artifacts alongside an explicit rename, and accepts a complete bridge', () => {
+    const original = linearDocument();
+    original.nodes[0]!.outputs = ['raw', 'notes'];
+    original.nodes[1]!.inputs = ['draft', 'notes'];
+    original.edges[0]!.output_map = { raw: 'draft' };
+    const before = cloneWorkflowDocument(original);
+    expect(() => insertAfter(original, 'first', taskNode('middle', {
+      inputs: ['draft'], outputs: ['draft'],
+    }))).toThrow(/notes.*独立添加/);
+    expect(() => insertBefore(original, 'second', taskNode('middle'))).toThrow(/draft.*独立添加/);
+
+    const bridge = taskNode('middle', {
+      inputs: ['draft', 'notes'], outputs: ['draft', 'notes'], write_scopes: ['draft', 'notes'],
+    });
+    for (const result of [insertBefore(original, 'second', bridge), insertAfter(original, 'first', bridge)]) {
+      expect(result.edges).toEqual([
+        expect.objectContaining({ source: 'first', target: 'middle', output_map: { raw: 'draft', notes: 'notes' } }),
+        expect.objectContaining({ source: 'middle', target: 'second', output_map: { draft: 'draft', notes: 'notes' } }),
+      ]);
+      expect(result.document_revision).toBe(original.document_revision);
+      expect(result.semantic_revision).toBe(original.semantic_revision);
+    }
+    expect(original).toEqual(before);
+  });
+
+  it('does not require an inserted node to forward outputs unused by the original target', () => {
+    const original = linearDocument();
+    original.nodes[0]!.outputs.push('unused');
+    const result = insertAfter(original, 'first', taskNode('middle', {
+      inputs: ['draft'], outputs: ['draft'],
+    }));
+    expect(result.edges[0]!.output_map).toEqual({ draft: 'draft' });
+    expect(result.edges[1]!.output_map).toEqual({ draft: 'draft' });
+  });
+
+  it.each([
+    ['a', 'b'],
+    ['b', 'a'],
+  ])('rejects reuse of one inserted output for different destinations (source order %s, %s)', (first, second) => {
+    const original = linearDocument();
+    original.nodes[0]!.outputs = [first, second];
+    original.nodes[1]!.inputs = ['x', 'a'];
+    original.edges[0]!.output_map = { a: 'x', b: 'a' };
+    const addition = taskNode('middle', { inputs: ['x', 'a'], outputs: ['a'] });
+    const before = cloneWorkflowDocument(original);
+    expect(() => insertBefore(original, 'second', addition)).toThrow(/输出.*a.*多个.*产物/);
+    expect(() => insertAfter(original, 'first', addition)).toThrow(/输出.*a.*多个.*产物/);
+    expect(original).toEqual(before);
+    expect(addition.inputs).toEqual(['x', 'a']);
+    expect(addition.outputs).toEqual(['a']);
+  });
+
+  it('retains crossed renames when the inserted stage provides distinct outputs for both destinations', () => {
+    const original = linearDocument();
+    original.nodes[0]!.outputs = ['a', 'b'];
+    original.nodes[1]!.inputs = ['x', 'a'];
+    original.edges[0]!.output_map = { a: 'x', b: 'a' };
+    const addition = taskNode('middle', { inputs: ['x', 'a'], outputs: ['a', 'b'] });
+    const before = cloneWorkflowDocument(original);
+    for (const result of [insertBefore(original, 'second', addition), insertAfter(original, 'first', addition)]) {
+      expect(result.edges[0]!.output_map).toEqual({ a: 'x', b: 'a' });
+      expect(result.edges[1]!.output_map).toEqual({ a: 'x', b: 'a' });
+      expect(Object.values(result.edges[1]!.output_map).sort()).toEqual(['a', 'x']);
+    }
+    expect(original).toEqual(before);
   });
 
   it('updates node and workflow settings immutably with backend-owned revisions unchanged', () => {

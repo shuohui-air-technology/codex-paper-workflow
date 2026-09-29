@@ -6,6 +6,7 @@ import hashlib
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts.workflow_engine.fs import (
@@ -14,6 +15,7 @@ from scripts.workflow_engine.fs import (
     _windows_path_is_within,
     _windows_path_key,
     hash_project_file,
+    read_project_json_object,
 )
 
 
@@ -85,6 +87,38 @@ class ProjectFileHashTests(unittest.TestCase):
         ):
             with self.subTest(parts=parts), self.assertRaises(PathSafetyError):
                 _validate_windows_project_parts(parts)
+
+
+class ProjectJSONTests(unittest.TestCase):
+    def test_unicode_json_object_is_read_without_changing_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "request.json"
+            source.write_text('{"说明":"论文确认"}', encoding="utf-8")
+            before = source.read_bytes()
+            self.assertEqual(read_project_json_object(root, "request.json"), {"说明": "论文确认"})
+            self.assertEqual(source.read_bytes(), before)
+
+    def test_duplicate_nonfinite_and_nonobject_requests_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for value in ('{"x":1,"x":2}', '{"x":NaN}', '[]'):
+                with self.subTest(value=value):
+                    (root / "request.json").write_text(value, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        read_project_json_object(root, "request.json")
+
+    def test_json_size_limit_and_changed_read_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "request.json"
+            source.write_text('{"x":12345}', encoding="utf-8")
+            with mock.patch("scripts.workflow_engine.fs.MAX_JSON_BYTES", 8):
+                with self.assertRaises(PathSafetyError):
+                    read_project_json_object(root, "request.json")
+            with mock.patch("scripts.workflow_engine.fs.hash_project_file", side_effect=["a" * 64, "b" * 64]):
+                with self.assertRaises(PathSafetyError):
+                    read_project_json_object(root, "request.json")
 
 
 if __name__ == "__main__":

@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
-from .catalog import CatalogResult, SkillIdentity, ValidatorIdentity
+from .catalog import CatalogResult, ROOT_CATALOG_FAILURE_CODES, SkillIdentity, ValidatorIdentity
 from .conditions import validate_predicate
 from .risk import control_risk_warnings
 from .schema import (
@@ -269,10 +269,31 @@ def compile_workflow(
     except WorkflowError as exc:
         issue = _issue(exc.code, str(exc), node_id=exc.node_id, edge_id=exc.edge_id)
         return CompileResult(None, (issue,), ())
-    errors = list(catalog.errors)
-    warnings = list(catalog.warnings)
+    # A partial root scan cannot establish that a selected identity is unique.
+    # Individual broken Skills are scoped to their IDs; unrelated diagnostics
+    # stay visible without vetoing this graph.
+    errors = [issue for issue in catalog.errors if issue.code in ROOT_CATALOG_FAILURE_CODES]
+    warnings = [issue for issue in catalog.warnings if issue.code != "catalog.unlocked_skill"]
+    warnings.extend(
+        replace(issue, severity="diagnostic")
+        for issue in catalog.errors
+        if issue.code not in ROOT_CATALOG_FAILURE_CODES
+    )
 
     enabled = {node.id: node for node in document.nodes if node.enabled}
+    for node_id, node in sorted(enabled.items()):
+        if node.type != "task" or node.skill_ref is None:
+            continue
+        identity = catalog.skills.get(node.skill_ref)
+        if (identity is not None and identity.catalog_id == node.skill_ref
+                and node.skill_ref not in catalog.failed_skill_ids and not identity.locked):
+            warnings.append(
+                WorkflowIssue(
+                    "warning", "catalog.unlocked_skill",
+                    f"Selected Skill is not bound by an installation receipt: {node.skill_ref}",
+                    node_id=node_id,
+                )
+            )
     disabled_ids = {node.id for node in document.nodes if not node.enabled}
     edges = tuple(
         edge
@@ -347,6 +368,24 @@ def compile_workflow(
                         edge_id=edge.id,
                     )
                 )
+        # An omitted mapping means an identity route at runtime. Count those
+        # routes too, while ignoring outputs the target does not consume.
+        routed_sources: dict[str, str] = {}
+        for source_output in source.outputs:
+            target_artifact = edge.output_map.get(source_output, source_output)
+            if target_artifact not in target_artifacts:
+                continue
+            previous_source = routed_sources.get(target_artifact)
+            if previous_source is not None and previous_source != source_output:
+                errors.append(
+                    _issue(
+                        "artifact.output_map_collision",
+                        f"two source outputs route to one target artifact: {target_artifact}",
+                        edge_id=edge.id,
+                    )
+                )
+            else:
+                routed_sources[target_artifact] = source_output
 
     edge_tuple = tuple(valid_edges)
     order, incoming, outgoing = _topological_order(enabled, edge_tuple)
@@ -400,6 +439,14 @@ def compile_workflow(
                     _issue(
                         "catalog.skill_required",
                         "task node requires a Skill binding",
+                        node_id=node_id,
+                    )
+                )
+            elif node.skill_ref in catalog.failed_skill_ids:
+                errors.append(
+                    _issue(
+                        "catalog.skill_unsafe",
+                        f"task Skill has an invalid or ambiguous installation: {node.skill_ref}",
                         node_id=node_id,
                     )
                 )

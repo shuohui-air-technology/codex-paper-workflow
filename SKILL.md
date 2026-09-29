@@ -20,6 +20,28 @@ In custom mode, the custom state is the only runtime authority. Do not update
 journal is invalid or conflicting, or the selected custom plan/run/evidence
 cannot be verified, stop and report the issue; never fall back silently.
 
+## Keep working outputs separate from confirmed versions
+
+In both workflow modes, use the compact confirmation-catalog summary on resume.
+Resolve the relevant artifact role with `scripts/artifact_manager.py resolve`
+before preparing a new context pack; use the returned catalog revision and
+verified snapshot path. Treat filename suffixes and modification times as
+working-file information, not confirmation authority.
+
+After the appropriate stage checks pass and the user confirms adoption, use
+`scripts/artifact_manager.py accept` to record the confirmation, preserve an
+immutable multi-file snapshot, and refresh the current-artifact folders. Keep
+working files and existing receipt bindings intact. Read
+[confirmed-artifacts.md](references/confirmed-artifacts.md) for requests,
+version conflicts, withdrawal, and display recovery.
+
+For custom execution, keep every claim's declared input paths authoritative;
+confirmed snapshots become new-run external inputs only through explicit
+registration. For official progress, use the latest summary's document digest
+with `progress_manager.py update-snapshot` for bounded, transactional field
+updates. Read historical progress events and artifact versions only when the
+current snapshot, active rules, or selected task require them.
+
 <!-- OFFICIAL-V1-CONTRACT:BEGIN -->
 # Paper Workflow Orchestrator
 

@@ -78,6 +78,50 @@ def _relative_parts(relative: str | os.PathLike[str]) -> tuple[str, ...]:
     return tuple(posix.parts)
 
 
+def read_project_json_object(root: Path | str, relative: str | os.PathLike[str]) -> dict[str, object]:
+    """Read one bounded, stable project JSON object for command interfaces."""
+    path = resolve_project_path(root, relative)
+    initial = path.lstat()
+    if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1 or initial.st_size > MAX_JSON_BYTES:
+        raise PathSafetyError("JSON input must be a bounded, singly linked regular file")
+    before_hash = hash_project_file(root, relative)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise PathSafetyError("JSON input is not a plain regular file")
+        if opened.st_size > MAX_JSON_BYTES:
+            raise PathSafetyError("JSON input exceeds the size limit")
+        chunks = bytearray()
+        while len(chunks) <= MAX_JSON_BYTES:
+            chunk = os.read(descriptor, min(1024 * 1024, MAX_JSON_BYTES + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+            or len(chunks) > MAX_JSON_BYTES
+        ):
+            raise PathSafetyError("JSON input changed while being read")
+    finally:
+        os.close(descriptor)
+    raw = bytes(chunks)
+    after_hash = hash_project_file(root, relative)
+    if before_hash != after_hash or hashlib.sha256(raw).hexdigest() != after_hash:
+        raise PathSafetyError("JSON input changed while being read")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON input nesting is too deep") from exc
+    if not isinstance(value, dict):
+        raise ValueError("JSON input must be an object")
+    return value
+
+
 def hash_regular_file(path: Path) -> str:
     """Hash a stable, singly linked regular file without following a leaf link."""
     try:

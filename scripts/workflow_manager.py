@@ -8,7 +8,6 @@ import json
 import os
 import re
 import secrets
-import stat
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -17,12 +16,12 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.workflow_engine.catalog import discover_skills, load_validator_registry, resolve_skill_roots
+from scripts.workflow_engine.catalog import ROOT_CATALOG_FAILURE_CODES, discover_skills, load_install_receipts, load_validator_registry, resolve_skill_roots
 from scripts.workflow_engine.compiler import compile_workflow
 from scripts.workflow_engine.fs import (
-    MAX_JSON_BYTES,
     PathSafetyError,
     hash_project_file,
+    read_project_json_object,
     resolve_project_path,
 )
 from scripts.workflow_engine.receipts import (
@@ -30,6 +29,7 @@ from scripts.workflow_engine.receipts import (
     build_claim_evidence, build_invocation, build_stage_receipt,
     canonical_bytes, canonical_result_sha256, parse_result, resolved_identity,
 )
+from scripts.workflow_engine.reporting import summarize_run_progress
 from scripts.workflow_engine.scheduler import (
     ArtifactRuntime, NodeStatus, claim_transition, ready_node_ids, refresh_ready,
     result_transition, retry_transition, stabilize_control_nodes, validator_claim_transition,
@@ -37,9 +37,9 @@ from scripts.workflow_engine.scheduler import (
     validator_retry_transition,
 )
 from scripts.workflow_engine.schema import (
-    WorkflowDocument, WorkflowError, document_sha256, normalize_workflow_document, parse_workflow,
+    WorkflowDocument, WorkflowError, behavior_payload, document_data, document_sha256, normalize_workflow_document, parse_workflow,
 )
-from scripts.workflow_engine.store import StoreError, WorkflowStore, _document_data
+from scripts.workflow_engine.store import StoreError, WorkflowStore
 from scripts.workflow_engine.validators import (
     ValidatorError, ValidatorResult, build_validator_argv,
     run_validator as run_registered_validator, validate_validator_identity,
@@ -68,64 +68,13 @@ class _JSONArgumentParser(argparse.ArgumentParser):
         raise _CLIError("cli.invalid_arguments", message)
 
 
-def _reject_duplicate_json_pairs(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON member: {key}")
-        result[key] = value
-    return result
-
-
-def _reject_nonfinite_json(value):
-    raise ValueError(f"non-finite JSON constant: {value}")
-
-
 def _read_project_json(project_root, relative_path):
     """Read one bounded, plain project file containing a strict JSON object."""
     try:
-        path = resolve_project_path(project_root, relative_path)
-        before_hash = hash_project_file(project_root, relative_path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        descriptor = os.open(path, flags)
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-                raise PathSafetyError("JSON input is not a plain regular file")
-            if opened.st_size > MAX_JSON_BYTES:
-                raise PathSafetyError("JSON input exceeds the size limit")
-            chunks = bytearray()
-            while len(chunks) <= MAX_JSON_BYTES:
-                chunk = os.read(descriptor, min(1024 * 1024, MAX_JSON_BYTES + 1 - len(chunks)))
-                if not chunk:
-                    break
-                chunks.extend(chunk)
-            after = os.fstat(descriptor)
-            if (
-                after.st_size != opened.st_size
-                or after.st_mtime_ns != opened.st_mtime_ns
-                or after.st_ctime_ns != opened.st_ctime_ns
-                or len(chunks) > MAX_JSON_BYTES
-            ):
-                raise PathSafetyError("JSON input changed while being read")
-        finally:
-            os.close(descriptor)
-        after_hash = hash_project_file(project_root, relative_path)
-        raw = bytes(chunks)
-        digest = hashlib.sha256(raw).hexdigest()
-        if before_hash != after_hash or digest != after_hash:
-            raise PathSafetyError("JSON input changed while being read")
-        value = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_json_pairs,
-            parse_constant=_reject_nonfinite_json,
-        )
+        return read_project_json_object(project_root, relative_path)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, PathSafetyError) as exc:
         code = getattr(exc, "code", "cli.invalid_json")
         raise _CLIError(code, str(exc)) from exc
-    if not isinstance(value, dict):
-        raise _CLIError("cli.invalid_json", "JSON input must be an object")
-    return value
 
 
 def _add_cli_common(parser, *, skills=False):
@@ -151,6 +100,13 @@ def _build_cli_parser():
     for command in ("ready", "summary", "deactivate"):
         item = commands.add_parser(command)
         _add_cli_common(item, skills=(command != "deactivate"))
+
+    recover = commands.add_parser("recover")
+    _add_cli_common(recover)
+    recover.add_argument(
+        "--confirm-interrupted", action="store_true", required=True,
+        help="confirm that no previous task or validator process from this run is still executing",
+    )
 
     for command in ("claim", "run-validator", "retry", "rerun-stale"):
         item = commands.add_parser(command)
@@ -237,6 +193,8 @@ def _run_cli(args):
         return service.summary()
     if args.command == "deactivate":
         return service.deactivate()
+    if args.command == "recover":
+        return service.recover(confirmed_interrupted=args.confirm_interrupted)
     if args.command == "claim":
         return service.claim(args.node)
     if args.command == "run-validator":
@@ -306,7 +264,7 @@ class WorkflowService:
             if isinstance(document, WorkflowDocument)
             else parse_workflow(document)
         )
-        catalog = discover_skills(self.skill_roots, {})
+        catalog = discover_skills(self.skill_roots, load_install_receipts(self.skill_roots))
         validators = load_validator_registry(REPOSITORY_ROOT / "references/workflows/validator-registry.v1.json", REPOSITORY_ROOT)
         projection = json.loads((REPOSITORY_ROOT / "references/workflows/official-v1.0-studio-projection.json").read_text())
         return parsed, compile_workflow(parsed, catalog, validators, projection)
@@ -318,10 +276,11 @@ class WorkflowService:
                 "warnings": [asdict(item) for item in compiled.warnings],
                 "document_sha256": document_sha256(parsed),
                 "semantic_sha256": None if compiled.plan is None else compiled.plan.semantic_sha256,
-                "required_warning_codes": sorted({item.code for item in compiled.warnings})}
+                "required_warning_codes": sorted({item.code for item in compiled.warnings
+                                                  if item.severity == "warning"})}
 
     def load_draft(self):
-        return _document_data(self.store.load_draft())
+        return document_data(self.store.load_draft())
 
     def save_draft(self, document, *, expected_document_revision):
         parsed = (
@@ -329,7 +288,7 @@ class WorkflowService:
             if isinstance(document, WorkflowDocument)
             else parse_workflow(document)
         )
-        return _document_data(self.store.save_draft(parsed, expected_document_revision=expected_document_revision))
+        return document_data(self.store.save_draft(parsed, expected_document_revision=expected_document_revision))
 
     def activate(
         self,
@@ -339,11 +298,13 @@ class WorkflowService:
         expected_document_revision=None,
     ):
         parsed, compiled = self._compile(document)
-        if compiled.errors:
+        if compiled.errors or compiled.plan is None:
             raise WorkflowManagerError("activation.validation_blocked", "workflow has blocking validation errors")
-        required = sorted({item.code for item in compiled.warnings})
+        required = sorted({item.code for item in compiled.warnings
+                           if item.severity == "warning"})
         if sorted(acknowledged_warning_codes) != required:
             raise WorkflowManagerError("activation.acknowledgement_mismatch", "acknowledge the exact current warning-code set")
+        initial_plan = compiled.plan
         try:
             previous = self.store.load_draft()
         except Exception as exc:
@@ -367,9 +328,29 @@ class WorkflowService:
                 )
             saved = previous
         _, compiled = self._compile(saved)
+        if compiled.errors or compiled.plan is None:
+            raise WorkflowManagerError("activation.validation_blocked", "workflow has blocking validation errors")
+        current_required = sorted({item.code for item in compiled.warnings
+                                   if item.severity == "warning"})
+        if sorted(acknowledged_warning_codes) != current_required:
+            raise WorkflowManagerError("activation.acknowledgement_mismatch", "acknowledge the exact current warning-code set")
+        # save_draft may legitimately advance semantic_revision, changing the
+        # revision-bound hashes. Compare the actual behavior and resolved plan
+        # instead of the whole CompiledPlan object.
+        if (
+            behavior_payload(parsed) != behavior_payload(saved)
+            or any(
+                getattr(initial_plan, field) != getattr(compiled.plan, field)
+                for field in (
+                    "workflow_id", "external_inputs", "nodes", "edges",
+                    "incoming", "outgoing", "topological_order", "max_parallelism",
+                )
+            )
+        ):
+            raise WorkflowManagerError("activation.validation_changed", "workflow or installed Skill identity changed during activation")
         selection, state = self.store.activate_and_start_run(
             compiled.plan,
-            high_risk_warning_codes=required,
+            high_risk_warning_codes=current_required,
             acknowledged_warning_codes=acknowledged_warning_codes,
             run_id="run-" + secrets.token_hex(16),
         )
@@ -384,9 +365,12 @@ class WorkflowService:
 
     def _identity(self, node):
         if node.type == "task":
-            catalog = discover_skills(self.skill_roots, {})
+            catalog = discover_skills(self.skill_roots, load_install_receipts(self.skill_roots))
             current = catalog.skills.get(node.skill.catalog_id)
-            if current is None or current != node.skill:
+            if (node.skill.catalog_id in catalog.failed_skill_ids
+                    or any(issue.code in ROOT_CATALOG_FAILURE_CODES
+                           for issue in catalog.errors)
+                    or current is None or current != node.skill):
                 raise WorkflowManagerError("runtime.identity_changed", "installed Skill identity differs from activated plan")
         elif node.type == "validator":
             try:
@@ -829,7 +813,13 @@ class WorkflowService:
 
     def summary(self):
         """Resolve mode without repairing its projection, then return a summary."""
+        from scripts.confirmed_artifacts import ConfirmedArtifactError, confirmed_artifact_summary
+
         selection = self.store.read_selection(repair_projection=False)
+        try:
+            confirmed = confirmed_artifact_summary(self.project_root)
+        except ConfirmedArtifactError as exc:
+            raise WorkflowManagerError(exc.code, str(exc)) from exc
         if selection.mode == "official":
             return {
                 "status": "pass",
@@ -839,6 +829,7 @@ class WorkflowService:
                 "artifacts": [],
                 "decisions": {},
                 "project_booleans": {},
+                "confirmed_artifacts": confirmed,
             }
         with self.store.locked_run() as transaction:
             plan, state = self._load(transaction, repair_selection=False)
@@ -850,6 +841,8 @@ class WorkflowService:
                 "semantic_sha256": plan.semantic_sha256,
                 "run_id": state.run_id,
                 "run_status": "active",
+                "progress": summarize_run_progress(state),
+                "confirmed_artifacts": confirmed,
                 "nodes": [
                     {
                         "node_id": node_id,
@@ -879,6 +872,25 @@ class WorkflowService:
         """Stop the active custom run and return the authoritative selection."""
         selection = self.store.deactivate_custom()
         return {"status": "pass", "selection": selection.to_payload()}
+
+    def recover(self, *, confirmed_interrupted=False):
+        """Recover durable records only after the caller confirms work stopped.
+
+        Uncertain active claims become blocked for explicit retry. Recovery
+        does not execute stages or turn interrupted work into successful work.
+        """
+        if confirmed_interrupted is not True:
+            raise WorkflowManagerError(
+                "recovery.confirmation_required",
+                "Confirm that no task or validator from this run is still executing before recovery.",
+            )
+        recovered = self.store.recover()
+        return {
+            "status": "blocked" if recovered.status == "blocked" else "pass",
+            "recovery_status": recovered.status,
+            "recovery_code": recovered.code,
+            "run_id": recovered.state.run_id if recovered.state else None,
+        }
 
 
 if __name__ == "__main__":

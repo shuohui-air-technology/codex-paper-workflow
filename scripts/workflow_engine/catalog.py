@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
+from scripts.install_workflow import is_generated_python_cache_file
+
 from .schema import WorkflowIssue
 
 
@@ -24,6 +26,9 @@ _MAX_SKILL_TREE_FILES = 10_000
 _MAX_SKILL_FILE_BYTES = 32 * 1024 * 1024
 _MAX_SKILL_TREE_BYTES = 512 * 1024 * 1024
 _MAX_SKILL_FRONTMATTER_BYTES = 256 * 1024
+_MAX_INSTALL_RECEIPT_BYTES = 1024 * 1024
+_INSTALL_RECEIPT_NAME = ".paper-workflow-install.json"
+ROOT_CATALOG_FAILURE_CODES = frozenset({"catalog.invalid_root", "catalog.too_many_skills"})
 _ADAPTERS = frozenset(
     {
         "experiment_contract_v1",
@@ -67,6 +72,7 @@ class CatalogResult:
     skills: dict[str, SkillIdentity]
     errors: tuple[WorkflowIssue, ...]
     warnings: tuple[WorkflowIssue, ...]
+    failed_skill_ids: frozenset[str] = frozenset()
 
 
 def _is_link(path: Path) -> bool:
@@ -144,21 +150,26 @@ def _tree_digest_contents(
             raise CatalogError("catalog.tree_too_many_entries", f"Skill tree exceeds the entry limit: {path}")
         if _is_link(candidate):
             raise CatalogError("catalog.symlink_in_tree", f"Skill tree contains a symlink or reparse point: {candidate}")
-        if candidate.is_file():
-            size = candidate.stat().st_size
-            if size > _MAX_SKILL_FILE_BYTES:
-                raise CatalogError("catalog.file_too_large", f"Skill file exceeds the per-file size limit: {candidate}")
-            total_bytes += size
-            if total_bytes > _MAX_SKILL_TREE_BYTES:
-                raise CatalogError("catalog.tree_too_large", f"Skill tree exceeds the total size limit: {path}")
-            files.append((candidate, size))
-            if len(files) > _MAX_SKILL_TREE_FILES:
-                raise CatalogError("catalog.tree_too_many_files", f"Skill tree exceeds the file-count limit: {path}")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            raise CatalogError("catalog.invalid_tree", f"Skill tree contains a non-regular filesystem entry: {candidate}")
+        if is_generated_python_cache_file(candidate.relative_to(root)):
+            continue
+        size = candidate.stat().st_size
+        if size > _MAX_SKILL_FILE_BYTES:
+            raise CatalogError("catalog.file_too_large", f"Skill file exceeds the per-file size limit: {candidate}")
+        total_bytes += size
+        if total_bytes > _MAX_SKILL_TREE_BYTES:
+            raise CatalogError("catalog.tree_too_large", f"Skill tree exceeds the total size limit: {path}")
+        files.append((candidate, size))
+        if len(files) > _MAX_SKILL_TREE_FILES:
+            raise CatalogError("catalog.tree_too_many_files", f"Skill tree exceeds the file-count limit: {path}")
     digest = hashlib.sha256()
     selected_digest = hashlib.sha256() if selected_file is not None else None
     selected_found = selected_file is None
     total_read = 0
-    for candidate, expected_size in sorted(files, key=lambda item: item[0].relative_to(root).as_posix()):
+    for candidate, expected_size in sorted(files, key=lambda item: item[0]):
         relative = candidate.relative_to(root).as_posix().encode("utf-8")
         digest.update(relative + b"\0")
         is_selected = selected_file == candidate
@@ -217,6 +228,62 @@ def _receipt_tree_hash(receipt: object, catalog_id: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate installation receipt key: {key}")
+        result[key] = value
+    return result
+
+
+def load_install_receipts(roots: tuple[Path, ...]) -> dict[Path, object]:
+    """Read bounded installer receipts; malformed or unsafe files confer no lock.
+
+    The receipt is local metadata, not a signature. A Skill is considered locked
+    only when its actual tree digest also matches the receipt entry.
+    """
+    from scripts.install_workflow import _validate_receipt_shape
+
+    receipts: dict[Path, object] = {}
+    for supplied_root in roots:
+        try:
+            root = supplied_root.expanduser().resolve()
+            path = root / _INSTALL_RECEIPT_NAME
+            if _is_link(path):
+                continue
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "rb") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > _MAX_INSTALL_RECEIPT_BYTES:
+                    continue
+                raw = source.read(_MAX_INSTALL_RECEIPT_BYTES + 1)
+                after = os.fstat(source.fileno())
+            current = path.lstat()
+            if (
+                len(raw) != info.st_size
+                or len(raw) > _MAX_INSTALL_RECEIPT_BYTES
+                or _is_link(path)
+                or not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                or (current.st_size, current.st_mtime_ns, current.st_ctime_ns, current.st_nlink)
+                != (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+                or (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink)
+                != (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+            ):
+                continue
+            receipt = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+            _validate_receipt_shape(receipt)
+            receipts[root] = receipt
+        except (OSError, UnicodeError, ValueError, TypeError):
+            # Missing, malformed, redirected, or unreadable receipt: Skills in
+            # this root remain usable but explicitly unlocked.
+            continue
+    return receipts
+
+
 def _issue(severity: str, code: str, message: str) -> WorkflowIssue:
     return WorkflowIssue(severity=severity, code=code, message=message)
 
@@ -230,6 +297,7 @@ def discover_skills(
     errors: list[WorkflowIssue] = []
     warnings: list[WorkflowIssue] = []
     ambiguous: set[str] = set()
+    failed_skill_ids: set[str] = set()
 
     for supplied_root in roots:
         root = supplied_root.expanduser().resolve()
@@ -256,15 +324,18 @@ def discover_skills(
                 candidate = child.resolve()
             except OSError:
                 errors.append(_issue("error", "catalog.invalid_skill", f"Skill path cannot be resolved: {child}"))
+                failed_skill_ids.add(child.name)
                 continue
             if direct_link and not _contains(root, candidate):
                 errors.append(_issue("error", "catalog.symlink_escape", f"Skill directory symlink escapes root: {child}"))
+                failed_skill_ids.add(child.name)
                 continue
             if not candidate.is_dir():
                 continue
             skill_file = candidate / "SKILL.md"
             if _is_link(skill_file):
                 errors.append(_issue("error", "catalog.symlink_in_tree", f"Skill tree contains a symlink or reparse point: {skill_file}"))
+                failed_skill_ids.add(child.name)
                 continue
             if not skill_file.is_file():
                 continue
@@ -277,6 +348,7 @@ def discover_skills(
                     raise CatalogError("catalog.invalid_tree", f"Skill entrypoint is missing from its tree: {skill_file}")
             except CatalogError as exc:
                 errors.append(_issue("error", exc.code, str(exc)))
+                failed_skill_ids.add(child.name)
                 continue
 
             locked = _receipt_tree_hash(receipts.get(root), catalog_id) == tree_hash
@@ -298,8 +370,14 @@ def discover_skills(
             elif (previous.skill_sha256, previous.tree_sha256) != (identity.skill_sha256, identity.tree_sha256):
                 del skills[catalog_id]
                 ambiguous.add(catalog_id)
+                failed_skill_ids.add(catalog_id)
                 errors.append(_issue("error", "catalog.ambiguous_skill", f"Skill ID has different contents across roots: {catalog_id}"))
-    return CatalogResult(skills=skills, errors=tuple(errors), warnings=tuple(warnings))
+    return CatalogResult(
+        skills=skills,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+        failed_skill_ids=frozenset(failed_skill_ids),
+    )
 
 
 def resolve_skill_roots(

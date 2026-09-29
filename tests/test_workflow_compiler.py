@@ -382,6 +382,30 @@ class WorkflowCompilerTests(unittest.TestCase):
         result = self.compile(value)
         self.assertIn("graph.invalid_trigger", self.issue_codes(result))
 
+    def test_all_active_join_rejects_output_collisions_regardless_of_mapping_order(self):
+        for output_map in (
+            {"sources": "evidence_bundle", "extra_source": "evidence_bundle"},
+            {"extra_source": "evidence_bundle", "sources": "evidence_bundle"},
+            {"sources": "evidence_bundle"},
+        ):
+            with self.subTest(output_map=output_map):
+                value = copy.deepcopy(self.value)
+                literature = next(node for node in value["nodes"] if node["id"] == "literature")
+                literature["outputs"] = ["sources", "evidence_bundle"] if len(output_map) == 1 else ["sources", "extra_source"]
+                routed = next(edge for edge in value["edges"] if edge["id"] == "literature-to-join")
+                routed["output_map"] = output_map
+                result = self.compile(value)
+                self.assertIsNone(result.plan)
+                self.assertIn("artifact.output_map_collision", self.issue_codes(result))
+
+    def test_unconsumed_output_does_not_create_a_false_collision(self):
+        value = copy.deepcopy(self.value)
+        literature = next(node for node in value["nodes"] if node["id"] == "literature")
+        literature["outputs"] = ["sources", "unused"]
+        result = self.compile(value)
+        self.assertNotIn("artifact.output_map_collision", self.issue_codes(result))
+        self.assertIsNotNone(result.plan)
+
     def test_edge_with_two_unknown_endpoints_is_not_silently_dropped(self):
         """Catches pruning malformed edges merely because neither endpoint is enabled."""
         value = copy.deepcopy(self.value)
@@ -883,21 +907,76 @@ class WorkflowCompilerTests(unittest.TestCase):
         )
         self.assertIn("validator.identity_mismatch", self.issue_codes(result))
 
-    def test_catalog_errors_block_compilation_and_warnings_are_preserved(self):
-        """Catches activation discarding discovery ambiguity or unlocked-Skill warnings."""
+    def test_unrelated_catalog_errors_are_visible_without_blocking_a_valid_binding(self):
+        """An invalid installed Skill outside this graph must not veto activation."""
         from scripts.workflow_engine.schema import WorkflowIssue
 
         error_catalog = CatalogResult(
             self.catalog.skills,
-            (WorkflowIssue("error", "catalog.ambiguous_skill", "ambiguous"),),
+            (WorkflowIssue("error", "catalog.invalid_frontmatter", "unrelated invalid Skill"),),
             (WorkflowIssue("warning", "catalog.unlocked_skill", "unlocked"),),
         )
         result = compile_workflow(
             parse_workflow(self.value), error_catalog, self.validators, self.projection
         )
+        self.assertIsNotNone(result.plan)
+        self.assertEqual(result.errors, ())
+        self.assertIn(
+            ("catalog.invalid_frontmatter", "diagnostic"),
+            {(issue.code, issue.severity) for issue in result.warnings},
+        )
+        self.assertNotIn("catalog.unlocked_skill", {issue.code for issue in result.warnings})
+
+        unlocked_id = next(node["skill_ref"] for node in self.value["nodes"] if node["skill_ref"])
+        skills = dict(self.catalog.skills)
+        skills[unlocked_id] = replace(skills[unlocked_id], locked=False)
+        selected_unlocked = compile_workflow(
+            parse_workflow(self.value),
+            CatalogResult(skills, (), error_catalog.warnings),
+            self.validators,
+            self.projection,
+        )
+        selected_node_id = next(node["id"] for node in self.value["nodes"] if node["skill_ref"] == unlocked_id)
+        self.assertIn(
+            ("catalog.unlocked_skill", "warning", selected_node_id),
+            {(issue.code, issue.severity, issue.node_id) for issue in selected_unlocked.warnings},
+        )
+
+    def test_selected_ambiguous_skill_still_blocks_compilation(self):
+        """A missing selected binding cannot be rescued by demoting catalog diagnostics."""
+        from scripts.workflow_engine.schema import WorkflowIssue
+
+        selected = next(node["skill_ref"] for node in self.value["nodes"] if node["skill_ref"])
+        skills = dict(self.catalog.skills)
+        del skills[selected]
+        catalog = CatalogResult(
+            skills,
+            (WorkflowIssue("error", "catalog.ambiguous_skill", f"Skill ID has different contents across roots: {selected}"),),
+            (),
+            frozenset({selected}),
+        )
+        result = compile_workflow(
+            parse_workflow(self.value), catalog, self.validators, self.projection
+        )
         self.assertIsNone(result.plan)
-        self.assertIn("catalog.ambiguous_skill", self.issue_codes(result))
-        self.assertIn("catalog.unlocked_skill", {issue.code for issue in result.warnings})
+        self.assertIn("catalog.skill_unsafe", self.issue_codes(result))
+        self.assertIn("catalog.ambiguous_skill", {item.code for item in result.warnings})
+
+    def test_root_wide_catalog_failure_blocks_even_with_a_valid_selected_skill(self):
+        """A skipped root could hide a conflicting copy of a selected Skill."""
+        from scripts.workflow_engine.schema import WorkflowIssue
+
+        catalog = CatalogResult(
+            self.catalog.skills,
+            (WorkflowIssue("error", "catalog.too_many_skills", "root scan skipped"),),
+            (),
+        )
+        result = compile_workflow(
+            parse_workflow(self.value), catalog, self.validators, self.projection
+        )
+        self.assertIsNone(result.plan)
+        self.assertIn("catalog.too_many_skills", self.issue_codes(result))
+        self.assertNotIn("catalog.too_many_skills", {item.code for item in result.warnings})
 
     def test_catalog_mapping_key_must_match_resolved_identity(self):
         """Catches compiling a binding under a different capability's identity payload."""

@@ -6,7 +6,7 @@
 
 **简体中文** | [English](README.md)
 
-![Release: v1.1.0](https://img.shields.io/badge/release-v1.1.0-2EA44F.svg)
+![Version: v1.1.0](https://img.shields.io/badge/version-v1.1.0-2EA44F.svg)
 ![Default workflow: v1.0](https://img.shields.io/badge/default%20workflow-v1.0-5271C4.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
@@ -16,6 +16,18 @@
 Paper Workflow Orchestrator 是一套以 Codex skill 形式提供的科研工作流。它根据研究目标和项目阶段选择合适的专业 skill，并将选题、文献、研究设计、实验、写作、审查与终稿交付组织成一条连续、可追踪的论文生产流程。
 
 它适合需要跨文件、跨会话持续推进的论文项目。你可以从一个模糊想法、已有草稿、已确定的研究方案或实验任务开始；工作流会识别当前阶段，调用相应能力，保存关键依据，并在重要决定处等待确认。
+
+`v1.1.0` 在保留官方 `paper-workflow-orchestrator-v1.0` 默认流程的基础上，加入了可选的本地图形编排器和确认产物管理能力。
+
+## 从这里开始
+
+| 你想做什么 | 下一步 |
+|---|---|
+| 使用默认流程推进论文 | [安装并开始使用](#快速安装)，然后在 Codex 中描述你的研究目标 |
+| 自己安排阶段和 Skill | [打开图形编辑器](#自定义工作流编排)，跟着[三阶段入门示例](docs/workflow-studio-guide.md)建立第一个流程 |
+| 理解代码或参与开发 | 阅读[开发指南](DEVELOPMENT_GUIDE.md)；全部文档见[文档导航](docs/README.md) |
+
+初次使用建议从默认流程开始。需要调整阶段、替换 Skill 或安排分支时，再进入 Workflow Studio。
 
 ## 核心设计：Router Skills
 
@@ -67,6 +79,34 @@ flowchart TD
 
 边界明确的请求可以直接进入专业 skill；需要完整论文流程、持续进度记录或跨阶段协作的任务则进入 Orchestrator。同一套能力体系可以覆盖一次性研究任务和长期论文项目。
 
+## 进度与当前确认产物
+
+长期项目将两类信息分开保存：**进度记录下一步做什么，确认目录记录现在采用哪一版成果**。工作稿可以继续修改；经过检查并确认采用的新版本会自动归档到对应的产物子目录，更新当前版本，同时保留原工作文件和历史确认版本。
+
+你可以直接说：“将这份检查通过的文献矩阵确认为当前版本”，或者“从当前确认的稿件继续修改”。后续任务按确认记录读取文件，避免把旧稿或尚未确认的新草稿当成当前成果。
+
+打开 `artifacts/INDEX.md` 查看当前成果，`artifacts/current/` 按类型和用途分类。多文件成果可以将正文、插图和参考文献一起归档。使用说明见[进度与确认产物指南](docs/progress-and-artifacts-guide.md)。
+
+### 项目状态保存在哪里
+
+仓库存放工作流工具；真正的论文项目目录保存你在使用过程中产生的持续状态：
+
+```text
+论文项目/
+├── 你的工作文件/                       # 继续修改的草稿、数据、代码和笔记
+├── artifacts/
+│   ├── INDEX.md                        # 当前确认成果的可读索引
+│   └── current/<类型>/<产物标识>/       # 最新确认版本的展示副本
+└── .research/
+    ├── progress.md                     # 官方阶段、下一步、风险与继续工作所需信息
+    ├── confirmed-artifacts/
+    │   ├── catalog.json                # 当前版本的权威选择
+    │   └── versions/                   # 不可变的确认快照
+    └── custom-workflow/                # 自定义计划、运行状态、事件与回执
+```
+
+`progress.md` 回答“下一步做什么”；确认目录回答“应该使用哪一版成果”。`current/` 便于阅读和交付，真正用于校验的来源仍由确认目录指向的快照决定。
+
 ## 工作流程
 
 工作流根据项目实际情况选择起点和路径。下面的流程图将内部阶段归纳为五个使用者可理解的部分，并展示实验、审查和修订形成的反馈回路。
@@ -96,20 +136,24 @@ flowchart TD
 
 选题、研究方案、实验范围和终稿采纳等关键决定由用户确认。具体阶段、输入输出和验收规则记录在 [`references/stage-contracts.md`](references/stage-contracts.md) 中。
 
-## 核心能力
+## 功能一览
 
-| 能力 | 使用者获得的结果 | 主要实现 |
+下面按使用场景说明每项功能解决的具体问题，避免把不同能力都概括成“工作流支持”。
+
+| 当你需要…… | 项目提供…… | 对应实现 |
 |---|---|---|
-| 研究任务路由 | 根据研究意图和当前阶段选择一个主 skill | `companion-skills/research-skill-router/` |
-| 完整论文编排 | 从研究想法或已有草稿持续推进到终稿交付 | `SKILL.md`、`references/stage-contracts.md` |
-| 项目连续性 | 保存进度、证据、决定、风险和阶段衔接信息 | `scripts/progress_manager.py`、`references/progress-schema.md` |
-| 研究与实验准备 | 在实验启动前明确研究问题、验证方法和执行范围 | `scripts/experiment_contract_validator.py` |
-| 论文结构检查 | 检查必需章节及其顺序 | `scripts/paper_section_validator.py`、`references/paper-section-contract.md` |
-| 科研图件工作流 | 将图件与数据来源、论文主张和验证记录关联 | `scripts/figure_contract_validator.py`、`references/scientific-visualization-integration.md` |
-| 完整性与同行评审 | 检查引用、数字、主张、可复现性并组织实质修订 | `SKILL.md`、`references/stage-contracts.md` |
-| 终稿编辑 | 统一全文表达并验证受保护内容 | `companion-skills/academic-manuscript-final-editor/` |
-| 语言自然化 | 在科学内容稳定后优化机械化表达并检查内容差异 | `scripts/humanizer_preflight.py`、`references/humanizer-adapter.md` |
-| 可复现安装 | 使用固定来源安装 core、standard 或 full 配置 | `dependencies.lock.json`、`scripts/install_workflow.py` |
+| 把尚不明确的研究请求变成下一项具体任务 | `research-skill-router` 读取研究意图和当前阶段，只选择一个主要专业 skill 保持上下文聚焦 | `companion-skills/research-skill-router/` |
+| 从研究想法或已有草稿推进到完整论文 | Orchestrator 按阶段组织任务，衔接已验收成果，并在关键决定处等待确认 | `SKILL.md`、`references/stage-contracts.md` |
+| 隔了几次会话继续工作 | 紧凑进度摘要保存当前阶段、下一步、风险、规则和继续工作所需信息；事件记录保留审计线索 | `scripts/progress_manager.py`、`references/progress-schema.md` |
+| 防止旧稿被误认为当前成果 | 明确确认后生成不可变版本，更新产物角色的当前指向，同时保留原工作文件继续编辑 | `scripts/artifact_manager.py`、`scripts/confirmed_artifacts.py`、`references/confirmed-artifacts.md` |
+| 判断实验是否已经具备启动条件 | 实验合同验证目标、资源、评估方案和停止条件，再交给后续执行 | `scripts/experiment_contract_validator.py` |
+| 在深入审查前检查论文结构 | 章节验证器解析 Markdown 标题和代码围栏，报告缺失、重复或顺序不当的章节 | `scripts/paper_section_validator.py`、`references/paper-section-contract.md` |
+| 让科研图件与证据保持绑定 | 图件合同记录数据来源、主张关系、结构关系和图片元数据，形成失败即阻断的回执 | `scripts/figure_contract_validator.py`、`references/scientific-visualization-integration.md` |
+| 处理引用、数字和主张问题 | 完整性检查与同行评审模拟把发现转成可执行的实质修订计划 | `SKILL.md`、`references/stage-contracts.md` |
+| 在不破坏受保护内容的前提下统一终稿 | 内置 Final Editor 扫描全文、维护编辑规则，并校验受保护内容回执 | `companion-skills/academic-manuscript-final-editor/` |
+| 科学内容稳定后再改善机械化表达 | Humanizer Preflight 对照受保护内容检查差异，并保存内容变化证据 | `scripts/humanizer_preflight.py`、`references/humanizer-adapter.md` |
+| 不编辑 JSON 就安排阶段 | Workflow Studio 提供本地图形画布，可配置任务、验证器、条件、并行、汇合、输入和输出 | `scripts/workflow_studio.py`、`studio/`、`assets/workflow-studio/` |
+| 在另一台机器复现同一套环境 | 锁定清单记录来源、提交、许可证、备份和安装回执，支持 `core`、`standard`、`full` 三种配置 | `dependencies.lock.json`、`scripts/install_workflow.py` |
 
 编排器核心脚本使用 Python 标准库，适用于 Python 3.10 及以上版本。
 
@@ -147,6 +191,20 @@ py -3 scripts/install_workflow.py
 
 默认安装 `standard` 配置。安装完成后，重新打开 Codex，或重新加载 skills 列表。
 
+接着在 Codex 中打开存放论文材料的项目目录，发送：
+
+```text
+使用 paper-workflow-orchestrator，从当前研究材料开始运行完整论文工作流。先说明当前处于哪个阶段、还需要我提供什么，再引导我完成下一步。
+```
+
+以后在同一项目继续对话即可延续进度。[更多使用示例](#使用方式)涵盖已有草稿、文献比较和实验任务。
+
+如果需要包含自主实验和 ARA 审查 skill 的完整固定清单，请明确安装 `full` 配置：
+
+```bash
+python3 scripts/install_workflow.py --profile full
+```
+
 ### 安装配置
 
 | 配置 | 内容 | 适合场景 |
@@ -177,13 +235,24 @@ python3 scripts/install_workflow.py --profile core --update --prune
 
 科研图件功能使用 Python 3.11+、`uv` 和所选绘图库。完成 skill 安装后，请根据绘图任务配置相应的 Python 运行环境。
 
+### 版本标识如何理解
+
+`v1.1.0` 图标表示项目功能版本；`paper-workflow-orchestrator-v1.0` 表示写入项目进度文件的官方工作流合同。这个版本增加了 Studio 和确认产物管理，但默认流程仍保持为官方 v1.0。
+
 ## 自定义工作流编排
 
-官方 v1.0 流程仍是默认流程，安装后即可直接使用。希望自行安排阶段的进阶用户，可以在论文项目目录中启动图形界面。macOS 和 Linux 使用以下命令。如果安装到了自定义 Codex 主目录，请在启动 Studio 的当前终端中导出同一个 `CODEX_HOME`，这样 Studio 进程也能读取它；安装时设置的值不会自动带入之后的新终端。未设置时，命令会从 `~/.codex` 查找：
+官方 v1.0 流程仍是默认流程，安装后即可直接使用。希望自行安排阶段的进阶用户，可以在论文项目目录中启动图形界面。第一次使用可跟着[Workflow Studio 入门指南](docs/workflow-studio-guide.md)，完成一个“整理文献 → 撰写引言 → 审查草稿”的三阶段流程。
+
+在终端切换到你的论文项目目录后，macOS 和 Linux 使用以下命令：
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
 ```
+
+`--project .` 指当前论文项目目录。浏览器会自动打开；使用期间请保持终端运行。
+
+<details>
+<summary>Windows 与自定义安装目录</summary>
 
 Windows PowerShell 用户可运行：
 
@@ -192,16 +261,30 @@ $skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else {
 py -3 (Join-Path $skillsHome 'paper-workflow-orchestrator\scripts\workflow_studio.py') --project .
 ```
 
-如果使用自定义路径，请在 macOS 或 Linux 的同一终端中先设置路径，再启动 Studio：
+如果安装到了自定义 Codex 主目录，请在启动 Studio 的当前终端中导出同一个 `CODEX_HOME`，这样 Studio 进程也能读取它；安装时设置的值不会自动带入之后的新终端。未设置时，命令会从 `~/.codex` 查找。在 macOS 或 Linux 的同一终端中先设置路径，再启动 Studio：
 
 ```bash
 export CODEX_HOME="/你的 Codex 主目录"
 python3 "$CODEX_HOME/skills/paper-workflow-orchestrator/scripts/workflow_studio.py" --project .
 ```
 
-你可以从官方流程创建副本，也可以新建空白流程；随后在画布上排列阶段、选择已安装的 Skill、连接阶段，并加入条件、并行和汇合步骤。检查流程并查看风险提示后，才可以启用自定义版本。整个过程无需编辑 JSON 文件。Studio 只读取本机已安装的 Skill，不负责安装 Skill；运行界面需要 Python 3.10 或以上版本，不需要 Node.js。
+</details>
+
+你可以从官方流程创建副本，也可以新建空白流程；随后在画布上排列阶段、选择已安装的 Skill、连接阶段，并加入条件、并行和汇合步骤。检查流程并查看风险提示后，才可以启用自定义版本。整个过程无需编辑 JSON 文件；Skill 的安装仍由安装器完成。运行界面需要 Python 3.10 或以上版本，不需要 Node.js。
+
+按照“编辑阶段 → 验证流程 → 保存或启用”的顺序操作。保存草稿会保留修改；启用后，Codex 才按这份自定义流程推进。草稿与当前运行版本的区别、产物如何衔接，以及常见错误的处理方法，都在[入门指南](docs/workflow-studio-guide.md)中。
+
+Studio 显示启用成功后，回到在同一个论文项目目录中打开的 Codex 对话，发送：
+
+```text
+使用 paper-workflow-orchestrator 继续我在这个项目中已启用的自定义工作流。先检查当前模式和可执行阶段，告诉我下一阶段需要提供什么，再引导我按流程推进。
+```
 
 ![Workflow Studio 图形化工作流编排界面](assets/workflow-studio.png)
+
+## 安装补充
+
+通常使用上面的安装器即可。需要自行复制仓库内置 Skill 时，可展开下面的命令；手动复制不会生成安装器回执，Studio 会将相应 Skill 显示为本地版本。
 
 <details>
 <summary>手动安装仓库内置 skills</summary>
@@ -282,13 +365,19 @@ paper-workflow-orchestrator/
 ├── references/
 │   ├── paper-section-contract.md         # 论文章节契约
 │   ├── progress-schema.md                # 项目进度与证据记录格式
+│   ├── confirmed-artifacts.md            # 确认产物的索引、版本与恢复
 │   ├── stage-contracts.md                # 阶段、委派与验收规则
 │   ├── scientific-visualization-integration.md
 │   ├── final-editor-integration.md
 │   └── humanizer-adapter.md
 ├── scripts/
 │   ├── progress_manager.py               # 进度初始化、迁移、记录与恢复
+│   ├── artifact_manager.py               # 确认产物的查询、采纳、撤回与修复
+│   ├── confirmed_artifacts.py            # 版本快照与当前成果目录管理
 │   ├── install_workflow.py               # 跨平台固定版本安装器
+│   ├── workflow_studio.py                # 图形编辑器启动入口
+│   ├── workflow_manager.py               # 自定义流程执行与状态接口
+│   ├── workflow_engine/                  # 校验、调度、存储与本地界面服务
 │   ├── experiment_contract_validator.py  # 实验合同验证
 │   ├── figure_contract_validator.py      # 科研图件验证
 │   ├── paper_section_validator.py        # 论文章节验证
@@ -296,6 +385,7 @@ paper-workflow-orchestrator/
 │   └── humanizer_preflight.py            # 语言自然化预检
 ├── dependencies.lock.json                # 外部 skill 来源与版本清单
 ├── studio/                               # Workflow Studio 前端源码
+├── docs/                                 # 用户教程、开发记录与文档导航
 ├── tests/                                 # 工作流与安装器测试
 └── companion-skills/
     ├── research-skill-router/             # 科研任务路由入口
@@ -321,6 +411,8 @@ paper-workflow-orchestrator/
 欢迎提交问题和改进建议。代码贡献应保持编排器核心脚本仅使用 Python 标准库，并在 Pull Request 中说明验证方式。
 
 准备参与代码贡献？可先阅读[开发指南](DEVELOPMENT_GUIDE.md)，了解仓库结构、测试方法，以及 Python 运行时与 Workflow Studio 前端之间的关系。
+
+用户操作说明与实现合同分别收录在[文档导航](docs/README.md)中，可按目标选择阅读路径。
 
 个人论文、`.research/`、`.paper/`、实验数据、凭据和本机缓存应保留在本地，并由 `.gitignore` 管理。
 

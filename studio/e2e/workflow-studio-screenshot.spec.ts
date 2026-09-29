@@ -12,15 +12,10 @@ test('capture the README screenshot from the real local Studio', async ({ studio
   await page.getByRole('button', { name: /空白任务阶段/ }).click();
   await page.getByLabel('阶段名称').fill('文献发现');
   await page.getByLabel('主要 Skill').selectOption('research-skill-router');
-  await page.getByLabel('从阶段').selectOption('step-1');
-  await page.getByLabel('连接到').selectOption('stage-1');
-  await page.getByRole('button', { name: '添加连接' }).click();
   await page.getByRole('button', { name: /空白任务阶段/ }).click();
   await page.getByLabel('阶段名称').fill('论文结构与写作');
   await page.getByLabel('主要 Skill').selectOption('research-skill-router');
-  await page.getByLabel('从阶段').selectOption('stage-1');
-  await page.getByLabel('连接到').selectOption('stage-2');
-  await page.getByRole('button', { name: '添加连接' }).click();
+  await page.getByRole('button', { name: '自动整理画布' }).click();
   await expect(page.getByRole('region', { name: '可视化工作流图' })).toBeVisible();
   await expect(page.getByText('官方流程映射说明')).toHaveCount(0);
   await expect(page.getByRole('complementary', { name: '添加流程阶段' })).toBeVisible();

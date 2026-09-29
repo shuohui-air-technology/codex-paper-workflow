@@ -145,7 +145,7 @@ class ProgressVersionTests(unittest.TestCase):
                 self.assertIsNone(re.search(r"\bauthors?\b", text, re.IGNORECASE))
         self.assertFalse((skill_root / "references" / "author-style-rules.md").exists())
 
-    def test_public_readmes_distinguish_release_from_default_workflow(self):
+    def test_public_readmes_distinguish_package_version_from_default_workflow(self):
         english = (ROOT / "README.md").read_text(encoding="utf-8")
         chinese = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
         self.assertIn(
@@ -157,7 +157,7 @@ class ProgressVersionTests(unittest.TestCase):
             chinese,
         )
         for text in (english, chinese):
-            self.assertIn("Release: v1.1.0", text)
+            self.assertIn("Version: v1.1.0", text)
             self.assertIn("Default workflow: v1.0", text)
 
     def test_readmes_explain_one_advanced_workflow_studio_entry(self):
