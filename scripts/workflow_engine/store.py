@@ -2831,6 +2831,17 @@ class WorkflowStore:
             try:
                 info = directory.lstat()
             except FileNotFoundError:
+                # Windows also reports a missing component above a non-directory
+                # as ENOENT, so confirm the parent really is a directory before
+                # treating the run directory as absent.
+                try:
+                    parent_info = directory.parent.lstat()
+                except FileNotFoundError:
+                    return
+                if not stat.S_ISDIR(parent_info.st_mode):
+                    raise StoreError(
+                        "receipt.invalid_projection", "receipt run path parent is not a directory"
+                    )
                 return
             if not stat.S_ISDIR(info.st_mode):
                 raise StoreError("receipt.invalid_projection", "receipt run path is not a directory")

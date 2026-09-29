@@ -461,7 +461,8 @@ def _materialize_archive_links(extract_root: Path, links: dict[str, str]) -> Non
 
 def _tree_hash(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
+    # Keep this ordering identical to the catalog digest on every platform.
+    for path in sorted(root.rglob("*"), key=lambda entry: entry.relative_to(root).parts):
         if _is_link(path):
             raise InstallError(f"symlink is not allowed in installed tree: {path}")
         if path.is_dir():

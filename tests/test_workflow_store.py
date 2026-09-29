@@ -1362,7 +1362,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 "validator_path",
                 validator_plan(),
                 lambda raw: raw["nodes"]["validate"]["validator"].__setitem__(
-                    "script", "/changed/validator.py"
+                    "script", "changed/validator.py"
                 ),
             ),
             (

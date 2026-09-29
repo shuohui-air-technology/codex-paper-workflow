@@ -169,7 +169,12 @@ def _tree_digest_contents(
     selected_digest = hashlib.sha256() if selected_file is not None else None
     selected_found = selected_file is None
     total_read = 0
-    for candidate, expected_size in sorted(files, key=lambda item: item[0]):
+    # Path ordering is case-insensitive on Windows, which made the tree digest
+    # depend on the platform. Compare relative parts case-sensitively instead.
+    def _tree_order_key(item):
+        return item[0].relative_to(root).parts
+
+    for candidate, expected_size in sorted(files, key=_tree_order_key):
         relative = candidate.relative_to(root).as_posix().encode("utf-8")
         digest.update(relative + b"\0")
         is_selected = selected_file == candidate
