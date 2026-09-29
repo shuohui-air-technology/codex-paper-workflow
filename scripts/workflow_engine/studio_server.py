@@ -756,7 +756,7 @@ class StudioApplication:
         try:
             resolved = candidate.resolve(strict=True)
             resolved.relative_to(self.asset_root)
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
             descriptor = os.open(resolved, flags)
             try:
                 inspected = os.fstat(descriptor)

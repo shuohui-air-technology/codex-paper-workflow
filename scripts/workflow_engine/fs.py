@@ -85,7 +85,7 @@ def read_project_json_object(root: Path | str, relative: str | os.PathLike[str])
     if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1 or initial.st_size > MAX_JSON_BYTES:
         raise PathSafetyError("JSON input must be a bounded, singly linked regular file")
     before_hash = hash_project_file(root, relative)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
@@ -130,7 +130,7 @@ def hash_regular_file(path: Path) -> str:
         reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or attributes & reparse:
             raise PathSafetyError("artifact is not a plain regular file")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
         descriptor = os.open(path, flags)
         try:
             opened = os.fstat(descriptor)
@@ -469,7 +469,7 @@ def hash_project_file(root: Path | str, relative: str | os.PathLike[str]) -> str
     ):
         raise PathSafetyError("platform cannot hash project artifacts with safe handles")
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     directory = -1
     file_descriptor = -1
     try:
@@ -653,7 +653,7 @@ def _write_bytes_atomic(
     parent_identity = _parent_identity(path.parent)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     descriptor: int | None = None
     try:
         descriptor = os.open(temporary, flags, 0o600)
@@ -770,7 +770,7 @@ def append_event(path: Path | str, event: object) -> None:
     target_existed = _plain_regular_file(target)
     target_identity = _file_identity(target) if target_existed else None
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(target, flags, 0o600)
     except OSError as exc:

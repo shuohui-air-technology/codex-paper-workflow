@@ -123,7 +123,7 @@ def _regular_hash(path: Path) -> str:
         reparse = getattr(before, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or reparse:
             raise ValidatorError("validator.unsafe_path", "Validator input is not a plain regular file.")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         descriptor = os.open(path, flags)
         try:
             with os.fdopen(descriptor, "rb") as handle:

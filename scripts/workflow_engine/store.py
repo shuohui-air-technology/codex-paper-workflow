@@ -1789,7 +1789,7 @@ class WorkflowStore:
             if not stat.S_ISREG(existing_lock.st_mode) or existing_lock.st_nlink != 1:
                 raise StoreError("path.unsafe", "project lock is not a single-name regular file")
         flags = os.O_RDWR | os.O_CREAT
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         try:
             descriptor = os.open(lock_path, flags, 0o600)
         except OSError as exc:
@@ -1990,7 +1990,7 @@ class WorkflowStore:
                 target_stat.st_mtime_ns,
             )
         temporary = parent / f".{checked.name}.tmp-{os.getpid()}-{time.time_ns()}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         descriptor: int | None = None
         try:
             descriptor = os.open(temporary, flags, 0o600)
@@ -2807,7 +2807,7 @@ class WorkflowStore:
                 raise StoreError("receipt.invalid_projection", "receipt projection is not a regular file")
             if info.st_size > limit:
                 raise StoreError("receipt.projection_too_large", "receipt projection exceeds its size limit")
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
             descriptor = os.open(path, flags)
             try:
                 opened = os.fstat(descriptor)
