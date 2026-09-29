@@ -235,6 +235,8 @@ python3 scripts/install_workflow.py --profile core --update --prune
 
 科研图件功能使用 Python 3.11+、`uv` 和所选绘图库。完成 skill 安装后，请根据绘图任务配置相应的 Python 运行环境。
 
+## 自定义工作流编排
+
 官方 v1.0 流程仍是默认流程，安装后即可直接使用。希望自行安排阶段的进阶用户，可以在论文项目目录中启动图形界面。第一次使用可跟着[Workflow Studio 入门指南](docs/workflow-studio-guide.md)，完成一个“整理文献 → 撰写引言 → 审查草稿”的三阶段流程。
 
 在终端切换到你的论文项目目录后，macOS 和 Linux 使用以下命令：
