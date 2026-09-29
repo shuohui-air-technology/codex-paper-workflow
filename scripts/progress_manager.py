@@ -197,7 +197,12 @@ def _check_file_identity(path: Path, descriptor: int, before: os.stat_result,
         != (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
         for value in (opened, named)
     ):
-        raise ProgressError(f"progress file changed while being read: {path}")
+        raise ProgressError(
+            f"progress file changed while being read: {path} "
+            f"[before={before.st_size}/{before.st_mtime_ns}/{before.st_ctime_ns} "
+            f"opened={opened.st_size}/{opened.st_mtime_ns}/{opened.st_ctime_ns} "
+            f"named={named.st_size}/{named.st_mtime_ns}/{named.st_ctime_ns}]"
+        )
     return opened
 
 
