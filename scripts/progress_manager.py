@@ -192,9 +192,13 @@ def _check_file_identity(path: Path, descriptor: int, before: os.stat_result,
     if ((opened.st_dev, opened.st_ino) != identity
             or (named.st_dev, named.st_ino) != identity):
         raise ProgressError(f"progress path changed while open: {path}")
+    # Windows reports st_ctime inconsistently between path stats and handle
+    # stats (Python 3.13 path stats return the write time), so the metadata
+    # change comparison stays POSIX-only. Content drift is still caught by the
+    # size, mtime, and identity comparisons above.
     if stable and any(
-        (value.st_size, value.st_mtime_ns, value.st_ctime_ns)
-        != (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        (value.st_size, value.st_mtime_ns) != (before.st_size, before.st_mtime_ns)
+        or (os.name != "nt" and value.st_ctime_ns != before.st_ctime_ns)
         for value in (opened, named)
     ):
         raise ProgressError(
