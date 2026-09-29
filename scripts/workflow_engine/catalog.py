@@ -242,6 +242,13 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _observed_metadata(value: os.stat_result) -> tuple[int, ...]:
+    """Compare file metadata without the Windows st_ctime path/handle drift."""
+    if os.name == "nt":
+        return (value.st_size, value.st_mtime_ns, value.st_nlink)
+    return (value.st_size, value.st_mtime_ns, value.st_ctime_ns, value.st_nlink)
+
+
 def load_install_receipts(roots: tuple[Path, ...]) -> dict[Path, object]:
     """Read bounded installer receipts; malformed or unsafe files confer no lock.
 
@@ -273,10 +280,8 @@ def load_install_receipts(roots: tuple[Path, ...]) -> dict[Path, object]:
                 or _is_link(path)
                 or not stat.S_ISREG(current.st_mode)
                 or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
-                or (current.st_size, current.st_mtime_ns, current.st_ctime_ns, current.st_nlink)
-                != (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
-                or (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink)
-                != (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+                or _observed_metadata(current) != _observed_metadata(info)
+                or _observed_metadata(after) != _observed_metadata(info)
             ):
                 continue
             receipt = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)

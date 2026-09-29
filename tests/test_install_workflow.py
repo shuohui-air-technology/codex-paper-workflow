@@ -315,10 +315,6 @@ class InstallerContractTests(unittest.TestCase):
                 ],
                 cwd=tmp, env=environment, capture_output=True, text=True, timeout=15,
             )
-            from scripts.install_workflow import _tree_hash as _installer_tree_hash
-            from scripts.workflow_engine.catalog import tree_sha256 as _catalog_tree_hash
-            print("DIAG unlock parity:", _installer_tree_hash(installed) == _catalog_tree_hash(installed),
-                  _installer_tree_hash(installed)[:24], _catalog_tree_hash(installed)[:24])
             self.assertEqual(launched.returncode, 0, launched.stderr + launched.stdout)
             validation = json.loads(launched.stdout)
             self.assertEqual(validation["status"], "pass", validation)
