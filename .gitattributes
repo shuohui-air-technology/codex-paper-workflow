@@ -1,0 +1,2 @@
+# Keep text files byte-identical across platforms so SHA-256 contracts hold.
+* text=auto eol=lf
