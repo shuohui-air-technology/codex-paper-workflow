@@ -235,10 +235,6 @@ The `core` profile supports offline installation. The `standard` and `full` prof
 
 The scientific-figure workflow uses Python 3.11+, `uv`, and the plotting libraries selected for the task. Configure that Python runtime after installing the skills.
 
-### Version labels
-
-The `v1.1.0` badge names the packaged feature release. The `paper-workflow-orchestrator-v1.0` badge names the official workflow contract used in project progress files. The release adds Studio and artifact management without silently replacing the default workflow.
-
 ## Custom workflow editor
 
 The official v1.0 workflow remains the default and is ready to use after installation. Advanced users who want to arrange their own stages can open the visual editor from a paper-project directory. The [Workflow Studio guide (Chinese)](docs/workflow-studio-guide.md) walks through a three-stage workflow: organize literature, draft an introduction, and review the draft.
