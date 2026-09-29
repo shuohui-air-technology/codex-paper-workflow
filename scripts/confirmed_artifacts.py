@@ -550,6 +550,13 @@ class ConfirmedArtifactStore:
                 _fail("source_changed", "Source changed during the confirmation copy.")
             if digest.hexdigest() != expected_sha256:
                 _fail("source_hash_mismatch", "Source bytes do not match the requested SHA-256.")
+            # Release both handles before re-reading by path: Windows refuses the
+            # read-only shared open while this process still holds the write handle
+            # on the freshly written snapshot (ERROR_SHARING_VIOLATION).
+            os.close(target_fd)
+            target_fd = None
+            os.close(source_fd)
+            source_fd = None
             if hash_project_file(self.root, source) != expected_sha256 or hash_project_file(self.root, destination) != expected_sha256:
                 _fail("source_changed", "Source or snapshot changed before confirmation.")
             _fsync_directory(target.parent)
