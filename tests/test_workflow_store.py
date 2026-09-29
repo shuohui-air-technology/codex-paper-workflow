@@ -793,13 +793,14 @@ class WorkflowStoreTests(unittest.TestCase):
     def test_directory_fsync_errors_propagate_and_new_entries_sync_their_parent(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with mock.patch.object(
-                workflow_fs.os,
-                "fsync",
-                side_effect=OSError(errno.EIO, "injected directory sync failure"),
-            ):
-                with self.assertRaises(OSError):
-                    workflow_fs._fsync_directory(root)
+            if hasattr(os, "O_DIRECTORY"):
+                with mock.patch.object(
+                    workflow_fs.os,
+                    "fsync",
+                    side_effect=OSError(errno.EIO, "injected directory sync failure"),
+                ):
+                    with self.assertRaises(OSError):
+                        workflow_fs._fsync_directory(root)
 
             with mock.patch.object(
                 workflow_fs,
@@ -1329,9 +1330,8 @@ class WorkflowStoreTests(unittest.TestCase):
                 self.assertEqual(snapshot["plan_sha256"], asserted)
                 self.assertEqual(started["payload"]["plan_sha256"], asserted)
                 mutation(raw_plan)
-                store.paths.plan.write_text(
-                    json.dumps(raw_plan, sort_keys=True, separators=(",", ":")) + "\n",
-                    encoding="utf-8",
+                store.paths.plan.write_bytes(
+                    (json.dumps(raw_plan, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
                 )
                 evidence = store.paths.plan.read_bytes()
                 result = store.recover()
@@ -1378,9 +1378,8 @@ class WorkflowStoreTests(unittest.TestCase):
                 store.start_run(plan, "run-plan-field-digest")
                 raw_plan = json.loads(store.paths.plan.read_text(encoding="utf-8"))
                 mutation(raw_plan)
-                store.paths.plan.write_text(
-                    json.dumps(raw_plan, sort_keys=True, separators=(",", ":")) + "\n",
-                    encoding="utf-8",
+                store.paths.plan.write_bytes(
+                    (json.dumps(raw_plan, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
                 )
                 self.assertEqual(store.recover().code, "plan.digest_mismatch")
 
@@ -2159,6 +2158,7 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "events.invalid_event")
             self.assertEqual(store.paths.events.read_bytes(), before)
 
+    @unittest.skipIf(os.name == "nt", "Windows cannot rename a lock file the store holds open")
     def test_named_lock_replacement_invalidates_old_lease_before_another_write(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

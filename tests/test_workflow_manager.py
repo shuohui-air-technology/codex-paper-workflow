@@ -1021,7 +1021,7 @@ class ValidatorManagerTests(unittest.TestCase):
         skill.mkdir(parents=True)
         (skill / "SKILL.md").write_text("---\nname: test-workflow-task\ndescription: Test task\n---\nRun the test task.\n", encoding="utf-8")
         self.service = WorkflowService(self.project, skill_roots=(self.skill_root,))
-        (self.project / "paper.md").write_text(self.PAPER, encoding="utf-8")
+        (self.project / "paper.md").write_bytes(self.PAPER.encode("utf-8"))
 
     def document(self, *, validity_status="clear", with_routes=False):
         value = json.loads((Path(__file__).parent / "fixtures/workflow_valid_linear.json").read_text())

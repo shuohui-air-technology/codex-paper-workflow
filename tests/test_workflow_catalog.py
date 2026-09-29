@@ -24,9 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def write_skill(root: Path, name: str, body: str = "instructions") -> Path:
     path = root / name
     path.mkdir(parents=True)
-    path.joinpath("SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: test skill\n---\n\n{body}\n",
-        encoding="utf-8",
+    path.joinpath("SKILL.md").write_bytes(
+        f"---\nname: {name}\ndescription: test skill\n---\n\n{body}\n".encode("utf-8"),
     )
     return path
 
@@ -253,7 +252,7 @@ class WorkflowCatalogTests(unittest.TestCase):
             root = Path(temporary) / "skills"
             skill = write_skill(root, "locked")
             skill.joinpath("references").mkdir()
-            skill.joinpath("references/note.txt").write_text("pine\n", encoding="utf-8")
+            skill.joinpath("references/note.txt").write_bytes(b"pine\n")
             expected = "sha256:6c86f439621beb7e9c6427d7e94bd9e76a06527c71e50b324c32d2cd59660630"
             self.assertEqual(tree_sha256(skill), expected)
             receipt = {"skills": {"locked": {"tree_hash": expected}}}

@@ -87,7 +87,7 @@ class ConfirmedArtifactTests(unittest.TestCase):
             self.assertEqual((self.root / item["snapshot_path"]).read_bytes(), raw)
             self.assertEqual((self.root / item["current_path"]).read_bytes(), raw)
             self.assertEqual((self.root / item["source_path"]).read_bytes(), raw)
-        self.assertIn("current/manuscripts/main-paper/paper.tex", self.store.index_path.read_text())
+        self.assertIn("current/manuscripts/main-paper/paper.tex", self.store.index_path.read_text(encoding="utf-8"))
         self.assertEqual(self.store.status(verify=True)["verification"], "current_verified")
 
     def test_readonly_status_only_checks_metadata_even_when_content_changed(self):
@@ -507,7 +507,7 @@ class ConfirmedArtifactTests(unittest.TestCase):
         self.accept()
         first = self.store.resolve("main-paper")
         self.accept(self.request(revision=1, operation="second", files={"paper.md": b"version two"}))
-        catalog = json.loads(self.store.catalog_path.read_text())
+        catalog = json.loads(self.store.catalog_path.read_text(encoding="utf-8"))
         catalog["artifacts"]["main-paper"]["current_version"] = first["version_id"]
         self.store.catalog_path.write_text(json.dumps(catalog))
         self.assertCode("invalid_catalog", self.store.status)

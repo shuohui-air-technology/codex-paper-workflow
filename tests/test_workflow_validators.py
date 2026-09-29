@@ -274,7 +274,7 @@ class ValidatorAdapterTests(unittest.TestCase):
             "## Discussion\nThe mechanism explains scope and limitations.\n"
             "## Conclusion\nConclusion.\n## References\nReference.\n"
         )
-        (self.project / "paper.md").write_text(manuscript, encoding="utf-8")
+        (self.project / "paper.md").write_bytes(manuscript.encode("utf-8"))
         receipt = {
             "status": "pass", "schema_version": 1, "verifier_id": "independent-checker",
             "verifier_receipt_path": "../outside.json", "verifier_receipt_sha256": "sha256:" + "0" * 64,

@@ -266,7 +266,7 @@ class WorkflowService:
         )
         catalog = discover_skills(self.skill_roots, load_install_receipts(self.skill_roots))
         validators = load_validator_registry(REPOSITORY_ROOT / "references/workflows/validator-registry.v1.json", REPOSITORY_ROOT)
-        projection = json.loads((REPOSITORY_ROOT / "references/workflows/official-v1.0-studio-projection.json").read_text())
+        projection = json.loads((REPOSITORY_ROOT / "references/workflows/official-v1.0-studio-projection.json").read_text(encoding="utf-8"))
         return parsed, compile_workflow(parsed, catalog, validators, projection)
 
     def validate_document(self, document):
