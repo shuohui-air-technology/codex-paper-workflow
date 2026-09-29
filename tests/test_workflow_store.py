@@ -1361,8 +1361,11 @@ class WorkflowStoreTests(unittest.TestCase):
             (
                 "validator_path",
                 validator_plan(),
+                # A separator-free spelling keeps the tamper platform-neutral:
+                # Windows would normalize a POSIX-style path and reject the plan
+                # as structurally invalid before the digest comparison.
                 lambda raw: raw["nodes"]["validate"]["validator"].__setitem__(
-                    "script", "changed/validator.py"
+                    "script", "changed-validator.py"
                 ),
             ),
             (
