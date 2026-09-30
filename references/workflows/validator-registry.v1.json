@@ -19,7 +19,7 @@
     },
     "final-edit-receipt": {
       "script": "scripts/final_edit_receipt_validator.py",
-      "sha256": "ea7db7b02f22625adc8e60aa5d689ae5977c94b85bbbbcac4ad6ac23c2ac9246",
+      "sha256": "3f9bf4bd9a346b35c37a4b09c60f30447e75fa8a5b448849557d55f042151a62",
       "adapter": "final_edit_receipt_v1",
       "input_schema": "final_edit_receipt_v1",
       "control_tags": [],

@@ -37,6 +37,7 @@ Create these only when the stage is selected:
 ```text
 .research/editorial_style_ledger.yml
 .research/editorial_scan.json
+.research/editorial_scan_dispositions.json   # itemized decisions bound to the scan report
 .research/final_edit_receipt.json
 .research/final_edit_audit_receipt.json   # only after a later Humanizer pass
 ```
@@ -45,7 +46,27 @@ The editorial-style ledger records the original wording, revised wording, inferr
 
 The scanner is a candidate locator, not an editor, complete DOCX parser, or acceptance oracle. Every finding needs a disposition. A high-severity candidate may be retained when it is scientifically or procedurally necessary, but the reason must be recorded. DOCX comments, tracked changes, fields, headers, footnotes, text boxes, and layout require the document workflow; PDF layout requires the PDF workflow.
 
-The scan report must bind the canonical absolute path and before/after hashes. Bind a complete dispositions file to the scan-report hash and finding count. For DOCX, require separately hashed document-workflow and page-render receipts; `main-document-text-only` scanner coverage can never satisfy the DOCX gate by itself.
+The scan report must bind the canonical absolute path and before/after hashes. Every scanner finding carries a content-derived `finding_id`: `fnd-` plus the first 20 hex digits of the SHA-256 over the finding's `path`, `line`, `rule_id`, and `evidence`. The validator recomputes that ID from the report, so a receipt can never cite a forged, renumbered, or stale finding.
+
+Bind an itemized dispositions file to the scan-report hash and finding count:
+
+```json
+{
+  "status": "pass",
+  "scanner_report_sha256": "sha256:...",
+  "finding_count": 24,
+  "disposed_count": 24,
+  "dispositions": [
+    {"finding_id": "fnd-0123456789abcdef0123", "decision": "accept", "evidence_refs": ["..."], "reason": "optional"}
+  ]
+}
+```
+
+`decision` is one of `accept` (the finding is a real defect and the edit or recorded rule is applied), `reject` (the candidate is not a defect), `defer` (valid but outside this round), or `not_applicable` (outside the scanner's coverage or the document type), the same vocabulary the post-Humanizer voice-drift dispositions use. Finding IDs must be unique and form an exact one-to-one set with the scanner report, every disposition must carry a decision and non-empty evidence references, and counts must agree with both arrays, so a count-only summary cannot substitute for itemized evidence. A candidate that is deliberately kept needs its reason recorded here or in the editorial-style ledger.
+
+The final-editor skill ships `scripts/check_scan_dispositions.py`, which writes the skeleton and applies these rules before the stage returns; the validator stays the gate. Receipts written before itemization stay valid. A scan report without finding IDs paired with a dispositions file without a `dispositions` array is the count-only legacy tier: it still validates against the hash and count bindings, and the weaker evidence tier is visible in the two artifacts themselves. The tiers may not be mixed — a report that identifies findings requires itemized dispositions, and itemized dispositions cannot cover a report that does not identify findings.
+
+For DOCX, require separately hashed document-workflow and page-render receipts; `main-document-text-only` scanner coverage can never satisfy the DOCX gate by itself.
 
 ## Protected scientific comparison
 

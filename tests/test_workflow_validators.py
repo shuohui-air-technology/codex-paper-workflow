@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -32,6 +35,19 @@ PAPER_OPTIONS = {
     "method_profile": "method-first", "validity_status": "clear",
     "discussion_integrated": False,
 }
+SCANNER = ROOT / "companion-skills/academic-manuscript-final-editor/scripts/scan_manuscript_style.py"
+
+
+def scan_report(path: Path) -> dict:
+    """Run the real editorial scanner so finding IDs come from their producer."""
+    spec = importlib.util.spec_from_file_location("scan_manuscript_style", SCANNER)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        module.main(["--json", str(path)])
+    return json.loads(output.getvalue())
 
 
 class ValidatorAdapterTests(unittest.TestCase):
@@ -176,7 +192,8 @@ class ValidatorAdapterTests(unittest.TestCase):
             normal_pass = {"status": "pass", "receipt": str(paths["receipt"]), "mode": mode, "errors": []}
             self.assertEqual(normalize_validator_output(node, 0, json.dumps(normal_pass).encode(), paths).outcome, "pass")
 
-    def test_real_final_edit_learn_pass(self):
+    def final_edit_receipt(self, *, manuscript="# Manuscript\nText.\n", scan_findings=None, dispositions=None):
+        """Build one complete learn-mode receipt and return its normalized outcome."""
         from scripts.final_edit_receipt_validator import CHECKS, calc_scope
 
         def write(name, value):
@@ -186,7 +203,7 @@ class ValidatorAdapterTests(unittest.TestCase):
             return "sha256:" + hashlib.sha256(raw).hexdigest()
 
         canonical = self.project / "canonical.md"
-        canonical_sha = write("canonical.md", "# Manuscript\nText.\n")
+        canonical_sha = write("canonical.md", manuscript)
         editor_sha = write("editor.md", "---\nname: academic-manuscript-final-editor\nmetadata:\n  version: 2.1.0\n  capability_schema: final-editor-v1\n---\n")
         checks = {name: "pass" for name in CHECKS}
         scope = calc_scope(canonical_sha, ["canonical.md"], ["all"], "learn")
@@ -194,12 +211,21 @@ class ValidatorAdapterTests(unittest.TestCase):
         auth_sha = write("auth.json", {"status": "confirmed", "approved_by": "user", "canonical_sha256": canonical_sha,
                                        "scope_hash": scope, "mode": "learn",
                                        "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()})
-        scanner_sha = write("scanner.json", {"schema_version": 1, "scanner_version": "test-v1", "finding_count": 0,
-                                             "files": [{"path": str(canonical), "sha256_before": canonical_sha,
-                                                        "sha256_after": canonical_sha, "unchanged": True}]})
+        report = {"schema_version": 1, "scanner_version": "test-v1", "finding_count": len(scan_findings or []),
+                  "files": [{"path": str(canonical), "sha256_before": canonical_sha,
+                             "sha256_after": canonical_sha, "unchanged": True}]}
+        if scan_findings is not None:
+            report["findings"] = scan_findings
+        scanner_sha = write("scanner.json", report)
         ledger_sha = write("ledger.json", {"rule_count": 1, "rules": ["style"]})
-        dispositions_sha = write("dispositions.json", {"status": "pass", "scanner_report_sha256": scanner_sha,
-                                                       "finding_count": 0, "disposed_count": 0})
+        if dispositions is None:
+            dispositions = {"status": "pass", "finding_count": report["finding_count"],
+                            "disposed_count": report["finding_count"]}
+        dispositions.setdefault("status", "pass")
+        dispositions.setdefault("finding_count", report["finding_count"])
+        dispositions.setdefault("disposed_count", report["finding_count"])
+        dispositions["scanner_report_sha256"] = scanner_sha
+        dispositions_sha = write("dispositions.json", dispositions)
         script = ROOT / "scripts/final_edit_receipt_validator.py"
         verifier_sha = write("verifier.json", {"status": "pass", "canonical_sha256": canonical_sha,
                                                  "verifier_id": "test-verifier", "evidence_refs": ["test"],
@@ -231,9 +257,56 @@ class ValidatorAdapterTests(unittest.TestCase):
             receipt[name + "_path"] = path
             receipt[name + "_sha256"] = sha
         write("input.json", receipt)
-        result = run_validator(self.node("final-edit-receipt", {"receipt": "a"}),
-                               self.claims(a="input.json"), self.project, ROOT)
+        return run_validator(self.node("final-edit-receipt", {"receipt": "a"}),
+                             self.claims(a="input.json"), self.project, ROOT)
+
+    def test_real_final_edit_learn_pass(self):
+        """A count-only legacy receipt keeps validating unchanged."""
+        result = self.final_edit_receipt()
         self.assertEqual(result.outcome, "pass", result)
+
+    def test_itemized_findings_require_itemized_dispositions(self):
+        manuscript = "# Manuscript\n门禁 internal gate narration.\n三组指标可作为环境分层抽样和后续模拟的参考。\n"
+        canonical = self.project / "canonical.md"
+        canonical.write_text(manuscript, encoding="utf-8")
+        items = scan_report(canonical)["findings"]
+        self.assertGreaterEqual(len(items), 2)
+        self.assertTrue(all(item["finding_id"] for item in items))
+        accepted = {"dispositions": [{"finding_id": item["finding_id"], "decision": "accept",
+                                      "evidence_refs": ["editorial note"]} for item in items]}
+        self.assertEqual(self.final_edit_receipt(manuscript=manuscript, scan_findings=items,
+                                                 dispositions=dict(accepted)).outcome, "pass")
+
+        incomplete = {"dispositions": accepted["dispositions"][:-1]}
+        self.assertEqual(self.final_edit_receipt(manuscript=manuscript, scan_findings=items,
+                                                 dispositions=incomplete).outcome, "blocked")
+
+        forged = {"dispositions": [{**item, "finding_id": "fnd-" + "0" * 20} for item in accepted["dispositions"]]}
+        self.assertEqual(self.final_edit_receipt(manuscript=manuscript, scan_findings=items,
+                                                 dispositions=forged).outcome, "blocked")
+
+        silent = {"dispositions": [{**item, "evidence_refs": []} for item in accepted["dispositions"]]}
+        self.assertEqual(self.final_edit_receipt(manuscript=manuscript, scan_findings=items,
+                                                 dispositions=silent).outcome, "blocked")
+
+        bad_decision = {"dispositions": [{**item, "decision": "looks fine"} for item in accepted["dispositions"]]}
+        self.assertEqual(self.final_edit_receipt(manuscript=manuscript, scan_findings=items,
+                                                 dispositions=bad_decision).outcome, "blocked")
+
+        count_only = self.final_edit_receipt(manuscript=manuscript, scan_findings=items)
+        self.assertEqual(count_only.outcome, "blocked", count_only)
+
+    def test_itemized_dispositions_cannot_cover_a_report_without_finding_ids(self):
+        manuscript = "# Manuscript\n门禁 internal gate narration.\n"
+        canonical = self.project / "canonical.md"
+        canonical.write_text(manuscript, encoding="utf-8")
+        stripped = [{key: value for key, value in item.items() if key != "finding_id"}
+                    for item in scan_report(canonical)["findings"][:1]]
+        dispositions = {"finding_count": 1, "disposed_count": 1,
+                        "dispositions": [{"finding_id": "fnd-" + "0" * 20, "decision": "accept",
+                                          "evidence_refs": ["editorial note"]}]}
+        result = self.final_edit_receipt(manuscript=manuscript, scan_findings=stripped, dispositions=dispositions)
+        self.assertEqual(result.outcome, "blocked", result)
 
     def test_identity_symlink_and_path_tamper(self):
         node = self.node("experiment-contract", {"contract": "a"})

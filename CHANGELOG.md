@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Flags evidence-free rigor, unexplained anomalies, and cross-section restatements in the
+  final-editor scanner with auditable signal vectors, direction-aware anomaly detection,
+  document-level probes, and one report per defect instead of one per sentence: a
+  paragraph dominated by framing is signalled on its sentences rather than counted again.
+- Catches paraphrased cross-section restatements through containment and a low-severity
+  possible-paraphrase band, and presentation narration such as "结果均按数值区间报告".
+  Chinese manuscripts are compared on their Chinese content skeleton, so shared identifiers
+  and table fragments no longer look like restatements, and headings, cross-references,
+  definition lead-ins, definitions, and abstracts are not compared at all.
+- Adds a final-editor dispositions helper that writes the per-finding skeleton and self-checks
+  decisions, evidence, IDs, and bindings before the orchestrator gate runs.
+- Gives every scanner finding a content-derived `finding_id` and requires itemized
+  dispositions with a decision and evidence per finding; count-only legacy receipts still
+  validate as a separate tier and the two tiers cannot be mixed.
 - Organizes the documentation around default use, visual customization, and
   development, with a three-stage Studio walkthrough.
 - Adds connected stage creation, undo/redo for unsaved edits, automatic canvas

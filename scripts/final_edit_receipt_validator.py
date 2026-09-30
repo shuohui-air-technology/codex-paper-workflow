@@ -39,6 +39,55 @@ def canonical_json_sha(value:Any)->str:
     raw=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")
     return "sha256:"+hashlib.sha256(raw).hexdigest()
 
+FINDING_ID_PREFIX="fnd-"
+DISPOSITION_DECISIONS={"accept","reject","defer","not_applicable"}
+
+def finding_id(item:dict[str,Any])->str:
+    """Recompute a scanner finding ID instead of trusting its declaration.
+
+    The scheme is a contract with ``scan_manuscript_style.py``; see
+    final-editor-integration.md. Both sides change together.
+    """
+    payload={key:item.get(key) for key in ("path","line","rule_id","evidence")}
+    raw=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")
+    return FINDING_ID_PREFIX+hashlib.sha256(raw).hexdigest()[:20]
+
+def scanner_finding_ids(report:dict[str,Any])->tuple[list[str],str]:
+    """Return the report's finding IDs and its tier: itemized, legacy, or invalid.
+
+    A report without any declared ID is the count-only legacy tier, so receipts
+    produced before itemization still validate. A report that declares IDs must
+    declare IDs the validator can recompute from the finding content.
+    """
+    items=report.get("findings",[])
+    if not isinstance(items,list) or not all(isinstance(item,dict) for item in items): return [],"invalid"
+    declared=[item.get("finding_id") for item in items]
+    if not any(declared): return [],"legacy"
+    if not all(isinstance(value,str) and value for value in declared): return [],"invalid"
+    ids:list[str]=[]; counts:Counter=Counter()
+    for item in items:
+        base=finding_id(item); counts[base]+=1
+        expected=base if counts[base]==1 else f"{base}-{counts[base]}"
+        if item.get("finding_id")!=expected: return [],"invalid"
+        ids.append(expected)
+    return ids,"itemized"
+
+def itemized_dispositions_mismatch(dispositions:dict[str,Any],ids:list[str])->str|None:
+    """Describe the first violation in an itemized dispositions receipt, if any."""
+    items=dispositions.get("dispositions")
+    if not isinstance(items,list): return "dispositions must be a list"
+    if dispositions.get("disposed_count")!=len(items): return "disposed_count must equal the disposition list"
+    seen:list[str]=[]
+    for index,item in enumerate(items):
+        if not isinstance(item,dict) or not {"finding_id","decision","evidence_refs"}<=set(item) or set(item)-{"finding_id","decision","evidence_refs","reason"}: return f"dispositions[{index}] must contain finding_id, decision, evidence_refs, and an optional reason"
+        if item.get("decision") not in DISPOSITION_DECISIONS: return f"dispositions[{index}].decision is invalid"
+        refs=item.get("evidence_refs")
+        if not isinstance(refs,list) or not refs or not all(isinstance(ref,str) and ref for ref in refs): return f"dispositions[{index}].evidence_refs must be non-empty"
+        seen.append(item.get("finding_id"))
+    if len(set(seen))!=len(seen): return "disposition finding_id values must be unique"
+    if set(seen)!=set(ids): return "disposition finding_id set must equal the scanner report's finding IDs"
+    return None
+
 def docx_text_and_parts(path:Path)->tuple[str,list[str],list[str]]:
     texts:list[str]=[]; parts:list[str]=[]; revisions:list[str]=[]
     with zipfile.ZipFile(path) as archive:
@@ -221,6 +270,14 @@ def validate(receipt:Path)->dict[str,Any]:
     if dispositions and scanner:
         q,s=load(dispositions),load(scanner)
         if q.get("status")!="pass" or q.get("scanner_report_sha256")!=digest(scanner) or q.get("finding_count")!=s.get("finding_count") or q.get("disposed_count")!=s.get("finding_count"): errors.append("finding dispositions are incomplete or unbound")
+        else:
+            ids,tier=scanner_finding_ids(s)
+            if tier=="invalid": errors.append("scanner report finding IDs are missing, duplicated, or forged")
+            elif tier=="legacy":
+                if isinstance(q.get("dispositions"),list): errors.append("finding dispositions identify findings the scanner report does not")
+            else:
+                mismatch=itemized_dispositions_mismatch(q,ids)
+                if mismatch is not None: errors.append("finding dispositions: "+mismatch)
     if verifier:
         q=load(verifier)
         if q.get("status")!="pass" or q.get("canonical_sha256")!=canonical_sha or not q.get("verifier_id") or not q.get("evidence_refs"): errors.append("protected verifier is invalid")

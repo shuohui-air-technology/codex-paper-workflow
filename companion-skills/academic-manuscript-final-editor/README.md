@@ -13,7 +13,8 @@ academic-manuscript-final-editor/
 ├── agents/openai.yaml                   # agent 接口配置(显示名、默认提示词、隐式调用策略)
 ├── references/editorial-style-rules.md  # 全稿修订的编辑决策规则参考(供 agent 在全稿任务时阅读)
 └── scripts/
-    └── scan_manuscript_style.py         # 风格候选定位脚本(只定位,不改文件)
+    ├── scan_manuscript_style.py         # 风格候选定位脚本(只定位,不改文件)
+    └── check_scan_dispositions.py       # 逐条处置骨架生成与校验前自检
 ```
 
 运行依赖:Python 3.9+(仅标准库,无需安装任何第三方包)。
@@ -62,7 +63,7 @@ academic-manuscript-final-editor/
 
 ## 风格扫描脚本
 
-`scripts/scan_manuscript_style.py` 用于在 Markdown / 纯文本 / DOCX 中定位风格审查候选(内部工作流残留、重复防御性表述等)。**脚本只定位候选,绝不自动改写**——每条发现都需要编辑判断。
+`scripts/scan_manuscript_style.py` 用于在 Markdown / 纯文本 / DOCX 中定位风格审查候选(内部工作流残留、重复防御性表述等)。**脚本只定位候选,绝不自动改写**——每条发现都需要编辑判断。JSON 输出中每条发现都带 `finding_id`(由 path/line/rule_id/evidence 派生的内容指纹,校验器会自行重算);终稿编辑回执需要逐条给出决定(accept/reject/defer/not_applicable)与证据引用,不能只统计数量。
 
 DOCX 扫描仅覆盖 `word/document.xml` 中的正文文本，并在 JSON 中标记 `coverage_status: main-document-text-only`。批注、修订记录、域、页眉页脚、脚注、文本框和布局必须由文档工作流及逐页渲染收据检查，不能以本扫描器的结果代替。
 
@@ -83,6 +84,20 @@ python3 scripts/scan_manuscript_style.py --context 100 manuscript.md
 # CI 用:发现 medium/high 级问题时以非零退出码结束
 python3 scripts/scan_manuscript_style.py --fail-on high manuscript.md
 ```
+
+终稿编辑要求**逐条处置**:报告的每条发现都带 `finding_id`,处置记录必须逐条给出决定与证据。
+
+```bash
+# 生成骨架(覆盖报告中每个 finding_id,决定与证据留空)
+python3 scripts/check_scan_dispositions.py --scan editorial_scan.json \
+    --template-out editorial_scan_dispositions.json
+
+# 填好后做校验前自检(决定词表、证据引用、ID 一一对应、计数一致、哈希绑定)
+python3 scripts/check_scan_dispositions.py --scan editorial_scan.json \
+    --dispositions editorial_scan_dispositions.json
+```
+
+自检与编排器 `final_edit_receipt_validator.py` 使用同一套规则(后者会重算每个 `finding_id`);无 ID 的旧报告配 count-only 处置属旧层,两层不得混用。
 
 ## 核心规则速览
 
