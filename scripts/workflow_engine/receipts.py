@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Mapping
 
-from .fs import hash_regular_file
+from .fs import hash_regular_file, reject_duplicate_pairs
 
 
 INVOCATION_SCHEMA = "node-invocation-v1"
@@ -48,12 +48,10 @@ def _fail(message: str) -> None:
 
 
 def _pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            _fail("duplicate JSON key")
-        result[key] = value
-    return result
+    try:
+        return reject_duplicate_pairs(pairs)
+    except ValueError as exc:
+        _fail(str(exc))
 
 
 def _plain(value: object) -> object:

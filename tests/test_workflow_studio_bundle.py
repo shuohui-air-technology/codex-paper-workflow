@@ -77,7 +77,7 @@ class WorkflowStudioBundleTests(unittest.TestCase):
                 encoding="utf-8",
             )
             result = verify_bundle(root)
-            self.assertTrue(any("duplicate JSON field: schema_version" in error for error in result["errors"]))
+            self.assertTrue(any("duplicate JSON member: schema_version" in error for error in result["errors"]))
 
     def test_manifest_rejects_paths_that_are_unsafe_on_windows(self):
         with tempfile.TemporaryDirectory() as temporary:

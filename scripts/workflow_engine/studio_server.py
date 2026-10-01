@@ -29,7 +29,7 @@ from .catalog import (
 from .schema import WorkflowError, WorkflowIssue, validator_form_metadata
 from .store import StoreError
 from .validators import ValidatorError
-from .fs import PathSafetyError
+from .fs import PathSafetyError, reject_duplicate_pairs, reject_nonfinite_constant
 from scripts.workflow_manager import WorkflowService
 from scripts.workflow_engine.receipts import ReceiptError
 
@@ -142,19 +142,6 @@ def _canonical_json(value: object) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
-
-
-def _reject_duplicate_pairs(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
-def _reject_nonfinite(value):
-    raise ValueError("non-finite JSON number")
 
 
 def _constant_time_equal_ascii(actual: str, expected: str) -> bool:
@@ -433,7 +420,11 @@ class StudioApplication:
 
     def _projection(self) -> dict:
         raw = _PROJECTION_PATH.read_bytes()
-        value = json.loads(raw.decode("utf-8"))
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_pairs,
+            parse_constant=reject_nonfinite_constant,
+        )
         return {"projection": value, "sha256": hashlib.sha256(_canonical_json(value)).hexdigest()}
 
     @staticmethod
@@ -1015,8 +1006,8 @@ class _StudioRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError("JSON nesting exceeds the configured limit")
             value = json.loads(
                 raw.decode("utf-8"),
-                object_pairs_hook=_reject_duplicate_pairs,
-                parse_constant=_reject_nonfinite,
+                object_pairs_hook=reject_duplicate_pairs,
+                parse_constant=reject_nonfinite_constant,
             )
             if not isinstance(value, dict):
                 raise ValueError("JSON request must be an object")

@@ -21,7 +21,7 @@ class PathSafetyError(RuntimeError):
     """Raised when a filesystem operation cannot prove project containment."""
 
 
-def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     value: dict[str, object] = {}
     for key, item in pairs:
         if key in value:
@@ -30,7 +30,7 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
     return value
 
 
-def _reject_constant(value: str) -> object:
+def reject_nonfinite_constant(value: str) -> object:
     raise ValueError(f"non-finite JSON constant: {value}")
 
 
@@ -114,7 +114,7 @@ def read_project_json_object(root: Path | str, relative: str | os.PathLike[str])
     if before_hash != after_hash or hashlib.sha256(raw).hexdigest() != after_hash:
         raise PathSafetyError("JSON input changed while being read")
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs, parse_constant=_reject_constant)
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_pairs, parse_constant=reject_nonfinite_constant)
     except RecursionError as exc:
         raise ValueError("JSON input nesting is too deep") from exc
     if not isinstance(value, dict):
@@ -708,8 +708,8 @@ def atomic_write_json(path: Path | str, value: object) -> None:
                 raise ValueError("persisted JSON exceeds the bounded input size")
             json.loads(
                 old_bytes.decode("utf-8"),
-                object_pairs_hook=_reject_duplicate_pairs,
-                parse_constant=_reject_constant,
+                object_pairs_hook=reject_duplicate_pairs,
+                parse_constant=reject_nonfinite_constant,
             )
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise PathSafetyError(f"refusing to replace invalid JSON evidence: {target}") from exc
@@ -723,8 +723,8 @@ def atomic_write_json(path: Path | str, value: object) -> None:
                     raise ValueError("persisted JSON backup exceeds the bounded input size")
                 json.loads(
                     backup_bytes.decode("utf-8"),
-                    object_pairs_hook=_reject_duplicate_pairs,
-                    parse_constant=_reject_constant,
+                    object_pairs_hook=reject_duplicate_pairs,
+                    parse_constant=reject_nonfinite_constant,
                 )
             except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
                 raise PathSafetyError(f"refusing to replace invalid JSON backup: {backup}") from exc

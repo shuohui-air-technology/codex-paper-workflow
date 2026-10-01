@@ -35,6 +35,8 @@ from .fs import (
     atomic_write_json,
     ensure_project_directory,
     hash_project_file,
+    reject_duplicate_pairs,
+    reject_nonfinite_constant,
     resolve_project_path,
 )
 from .scheduler import (
@@ -153,24 +155,11 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
-def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON member: {key}")
-        value[key] = item
-    return value
-
-
-def _reject_constant(value: str) -> object:
-    raise ValueError(f"non-finite JSON constant: {value}")
-
-
 def _strict_json_loads(value: str | bytes) -> object:
     parsed = json.loads(
         value,
-        object_pairs_hook=_reject_duplicate_pairs,
-        parse_constant=_reject_constant,
+        object_pairs_hook=reject_duplicate_pairs,
+        parse_constant=reject_nonfinite_constant,
     )
     stack: list[tuple[object, int]] = [(parsed, 1)]
     while stack:
