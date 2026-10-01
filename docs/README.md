@@ -44,7 +44,4 @@
 
 这些文件记录实现时的决策与当时的检查结果，适合回溯设计原因。当前功能和用法以 README、用户教程及现有代码为准。
 
-- [自定义工作流设计](superpowers/specs/2026-08-31-custom-workflow-studio-design.md)
-- [工作流引擎实施计划](superpowers/plans/2026-08-31-custom-workflow-engine.md)
-- [Studio 实施计划](superpowers/plans/2026-08-31-workflow-studio.md)
 - [v1.1.0 验证记录](release-verification-v1.1.0.md)
