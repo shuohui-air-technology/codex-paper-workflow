@@ -551,6 +551,7 @@ class TaskProtocolTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "receipt.token_disclosure")
         self.assertEqual(self.service.store.paths.events.read_bytes(), before)
 
+    @unittest.skipIf(os.name == "nt", "symlink creation requires platform privileges")
     def test_changed_skill_and_symlink_outputs_are_rejected_without_writes(self):
         invocation = self.service.claim("directions")
         result = self.result(invocation)

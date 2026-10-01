@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -308,6 +309,7 @@ class ValidatorAdapterTests(unittest.TestCase):
         result = self.final_edit_receipt(manuscript=manuscript, scan_findings=stripped, dispositions=dispositions)
         self.assertEqual(result.outcome, "blocked", result)
 
+    @unittest.skipIf(os.name == "nt", "symlink creation requires platform privileges")
     def test_identity_symlink_and_path_tamper(self):
         node = self.node("experiment-contract", {"contract": "a"})
         changed = replace(node.validator, sha256="0" * 64)

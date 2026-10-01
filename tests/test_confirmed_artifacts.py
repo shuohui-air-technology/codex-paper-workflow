@@ -439,6 +439,7 @@ class ConfirmedArtifactTests(unittest.TestCase):
                 ca.normalize_request({**request, "evidence": evidence})
         self.assertCode("invalid_json", self.store.accept, request, lambda request: {"confidence": float("nan")})
 
+    @unittest.skipIf(os.name == "nt", "symlink creation requires platform privileges")
     def test_sources_reject_leaf_and_parent_links_hardlinks_and_fifo(self):
         request = self.request()
         source = self.root / "work/paper.md"
@@ -462,6 +463,7 @@ class ConfirmedArtifactTests(unittest.TestCase):
         self.assertCode("unsafe_path", self.accept, request)
         self.assertFalse(self.store.catalog_path.exists())
 
+    @unittest.skipIf(os.name == "nt", "symlink creation requires platform privileges")
     def test_current_nested_link_is_preserved_by_explicit_backup(self):
         self.accept()
         external = self.write("outside-note.txt", b"not a view")
