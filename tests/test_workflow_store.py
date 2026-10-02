@@ -57,6 +57,10 @@ from tests.test_workflow_scheduler import (
 
 
 ZERO_HASH = "0" * 64
+# The store rejects a persisted Skill root that is not absolute on the running
+# platform, so the fixture cannot use a POSIX-only literal such as
+# /installed/skills, which Windows reads as relative.
+INSTALLED_SKILLS = Path(__file__).resolve().parents[1] / "installed-skills"
 
 
 def sha256_bytes(value):
@@ -108,7 +112,7 @@ def compiled_node(
     failure_policy="block",
 ):
     if node_type == "task" and skill is None:
-        skill = SkillIdentity("test-skill", Path("/installed/skills"), "test-skill",
+        skill = SkillIdentity("test-skill", INSTALLED_SKILLS, "test-skill",
                               sha256_bytes(b"skill"), "sha256:" + sha256_bytes(b"tree"), True)
     return CompiledNode(
         id=node_id,
@@ -130,7 +134,7 @@ def compiled_node(
 def task_plan(*, workflow_id="stored-flow", semantic_revision=1, failure_policy="block"):
     skill = SkillIdentity(
         catalog_id="test-skill",
-        root=Path("/installed/skills"),
+        root=INSTALLED_SKILLS,
         relative_path="test-skill",
         skill_sha256=sha256_bytes(b"skill"),
         tree_sha256="sha256:" + sha256_bytes(b"tree"),
