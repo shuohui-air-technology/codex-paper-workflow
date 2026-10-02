@@ -49,6 +49,7 @@ from .scheduler import (
     RunState,
     _complete_control,
     _edge_outputs,
+    approval_state,
     condition_facts,
     initial_run,
     mark_descendants_stale,
@@ -64,7 +65,7 @@ from .scheduler import (
     validator_retry_transition,
 )
 from .receipts import (
-    MAX_ENVELOPE_BYTES, ReceiptError, build_claim_evidence, build_stage_receipt, canonical_bytes,
+    MAX_ENVELOPE_BYTES, RECEIPT_SCHEMA_V3, ReceiptError, build_claim_evidence, build_stage_receipt, canonical_bytes,
     validate_stage_receipt,
 )
 from .schema import (
@@ -597,7 +598,7 @@ def _validator_data(value: ValidatorIdentity | None) -> object:
 
 def _plan_data(plan: CompiledPlan) -> dict[str, object]:
     return {
-        "schema_version": "compiled-plan-v1",
+        "schema_version": plan.schema_version,
         "workflow_id": plan.workflow_id,
         "semantic_revision": plan.semantic_revision,
         "document_sha256": plan.document_sha256,
@@ -618,6 +619,7 @@ def _plan_data(plan: CompiledPlan) -> dict[str, object]:
                 "failure_policy": node.failure_policy,
                 "condition_cases": _json_value(node.condition_cases),
                 "join_mode": node.join_mode,
+                **({"approval_source": node.approval_source} if plan.schema_version == "compiled-plan-v2" else {}),
             }
             for node_id, node in sorted(plan.nodes.items())
         },
@@ -651,9 +653,12 @@ def _skill_from_data(value: object) -> SkillIdentity | None:
     item = _exact_mapping(value, fields, "plan.invalid")
     if type(item["locked"]) is not bool:
         raise StoreError("plan.invalid", "persisted Skill lock flag is invalid")
+    root = Path(_plain_string(item["root"], "plan.invalid"))
+    if not root.is_absolute():
+        raise StoreError("plan.invalid", "persisted Skill root must be absolute")
     return SkillIdentity(
         _plain_string(item["catalog_id"], "plan.invalid"),
-        Path(_plain_string(item["root"], "plan.invalid")),
+        root,
         _plain_string(item["relative_path"], "plan.invalid"),
         _plain_string(item["skill_sha256"], "plan.invalid"),
         _plain_string(item["tree_sha256"], "plan.invalid"),
@@ -697,8 +702,9 @@ def _plan_from_data(value: object) -> CompiledPlan:
         }
     )
     item = _exact_mapping(value, fields, "plan.invalid")
-    if item["schema_version"] != "compiled-plan-v1":
+    if item["schema_version"] not in {"compiled-plan-v1", "compiled-plan-v2"}:
         raise StoreError("plan.invalid", "compiled plan version is invalid")
+    plan_schema_version = item["schema_version"]
     raw_nodes = item["nodes"]
     raw_edges = item["edges"]
     if not isinstance(raw_nodes, Mapping) or not isinstance(raw_edges, Mapping):
@@ -711,7 +717,7 @@ def _plan_from_data(value: object) -> CompiledPlan:
     )
     nodes: dict[str, CompiledNode] = {}
     for node_id, raw in raw_nodes.items():
-        node = _exact_mapping(raw, node_fields, "plan.invalid")
+        node = _exact_mapping(raw, node_fields | ({"approval_source"} if plan_schema_version == "compiled-plan-v2" else set()), "plan.invalid")
         if node_id != node["id"] or type(node["entry"]) is not bool:
             raise StoreError("plan.invalid", "compiled node identity is invalid")
         cases = node["condition_cases"]
@@ -720,6 +726,11 @@ def _plan_from_data(value: object) -> CompiledPlan:
         validator = _validator_from_data(node["validator"])
         skill = _skill_from_data(node["skill"])
         node_type = _plain_string(node["type"], "plan.invalid")
+        approval_source = node.get("approval_source")
+        if approval_source is not None:
+            approval_source = _plain_string(approval_source, "plan.invalid")
+            if node_type != "condition":
+                raise StoreError("plan.invalid", "approval source belongs to a condition node")
         inputs = _string_list(node["inputs"], "plan.invalid")
         if node_type == "validator":
             if validator is None or skill is not None:
@@ -749,6 +760,7 @@ def _plan_from_data(value: object) -> CompiledPlan:
             _plain_string(node["failure_policy"], "plan.invalid"),
             tuple(_freeze_json(case) for case in cases),
             _plain_string(node["join_mode"], "plan.invalid"),
+            approval_source,
         )
     edge_fields = frozenset({"id", "source", "target", "trigger", "output_map"})
     edges: dict[str, CompiledEdge] = {}
@@ -782,6 +794,7 @@ def _plan_from_data(value: object) -> CompiledPlan:
         MappingProxyType({str(key): _string_list(items, "plan.invalid") for key, items in outgoing.items()}),
         _string_list(item["topological_order"], "plan.invalid"),
         _integer(item["max_parallelism"], "plan.invalid", minimum=1),
+        plan_schema_version,
     )
     if set(plan.nodes) != set(plan.incoming) or set(plan.nodes) != set(plan.outgoing):
         raise StoreError("plan.invalid", "compiled plan node and adjacency keys differ")
@@ -1159,6 +1172,64 @@ def _validate_edge_and_winner_state(plan: CompiledPlan, state: RunState) -> None
             for edge_id in plan.outgoing[node_id]
         ):
             raise StoreError("join.winner_invalid", f"stale join retains a live outgoing route: {node_id}")
+    _validate_approval_routes(plan, state)
+
+
+def _validate_approval_routes(plan: CompiledPlan, state: RunState) -> None:
+    """Keep confirmation sidecars as a dependency, never as a file shortcut."""
+    for gate_id, gate in plan.nodes.items():
+        if gate.approval_source is None:
+            continue
+        source_id = gate.approval_source
+        source = plan.nodes.get(source_id)
+        if source is None:
+            raise StoreError("approval.route_invalid", f"approval source is unknown: {gate_id}")
+        gate_runtime = state.nodes[gate_id]
+        source_runtime = state.nodes[source_id]
+        gate_inbound = [
+            candidate_id for candidate_id in plan.incoming[gate_id]
+            if plan.edges[candidate_id].source == source_id
+        ]
+        if len(gate_inbound) != 1:
+            raise StoreError("approval.route_invalid", f"approval gate has no unique source route: {gate_id}")
+        source_trigger = plan.edges[gate_inbound[0]].trigger
+        for edge_id in plan.outgoing[gate_id]:
+            edge_runtime = state.edges[edge_id]
+            target_id = plan.edges[edge_id].target
+            direct = [
+                candidate_id for candidate_id in plan.incoming[target_id]
+                if (plan.edges[candidate_id].source == source_id
+                    and plan.edges[candidate_id].trigger == source_trigger)
+            ]
+            if len(direct) != 1:
+                raise StoreError(
+                    "approval.route_invalid",
+                    f"approval gate target has no unique original route: {gate_id}",
+                )
+            direct_runtime = state.edges[direct[0]]
+            if gate_runtime.status is NodeStatus.SUCCEEDED:
+                if gate_runtime.outcome != "approved" or edge_runtime.status is not EdgeStatus.SATISFIED:
+                    raise StoreError("approval.route_invalid", f"completed approval gate has an invalid route: {gate_id}")
+                if direct_runtime.status is not EdgeStatus.SATISFIED:
+                    raise StoreError(
+                        "approval.route_invalid",
+                        f"approval route bypasses its original source edge: {gate_id}",
+                    )
+            elif gate_runtime.status is NodeStatus.SKIPPED:
+                if edge_runtime.status is not EdgeStatus.INACTIVE or direct_runtime.status is not EdgeStatus.INACTIVE:
+                    raise StoreError("approval.route_invalid", f"skipped approval gate retains a live route: {gate_id}")
+            elif gate_runtime.status is NodeStatus.BLOCKED:
+                if edge_runtime.status is not EdgeStatus.FAILED or direct_runtime.status is not EdgeStatus.FAILED:
+                    raise StoreError("approval.route_invalid", f"blocked approval gate retains a live route: {gate_id}")
+            elif gate_runtime.status is NodeStatus.FAILED:
+                raise StoreError("approval.route_invalid", f"approval gates cannot finish as failed: {gate_id}")
+            else:
+                if edge_runtime.status is not EdgeStatus.WAITING:
+                    raise StoreError("approval.route_invalid", f"uncompleted approval gate has an active route: {gate_id}")
+                # Once the source has completed, the original file route may be
+                # satisfied while the sidecar waits for the user's decision.
+                if source_runtime.status is NodeStatus.SUCCEEDED and direct_runtime.status is not EdgeStatus.SATISFIED:
+                    raise StoreError("approval.route_invalid", f"approval sidecar lost its source route: {gate_id}")
 
 
 def _validate_completion_transition(
@@ -1214,10 +1285,18 @@ def _validate_completion_transition(
         expected_type = "condition_selected" if node.type == "condition" else "join_succeeded"
         if node.type not in {"condition", "join"} or event_type != expected_type or runtime.status is not NodeStatus.READY:
             raise StoreError("events.invalid_completion", "control completion has the wrong ready source")
-        outcome = (
-            evaluate_condition(node.condition_cases, condition_facts(previous))
-            if node.type == "condition" else "succeeded"
-        )
+        if node.type == "condition" and node.approval_source is not None:
+            if approval_state(plan, previous, node_id) != "approved":
+                raise StoreError(
+                    "events.invalid_completion",
+                    "approval gate completion is missing the current approval",
+                )
+            outcome = "approved"
+        else:
+            outcome = (
+                evaluate_condition(node.condition_cases, condition_facts(previous))
+                if node.type == "condition" else "succeeded"
+            )
         if payload["outcome"] != outcome:
             raise StoreError("events.invalid_completion", "control outcome differs from its declared evaluation")
         expected, transition = _complete_control(plan, previous, node_id, outcome)
@@ -1233,6 +1312,19 @@ def _validate_edge_and_winner_transition(
     payload: Mapping[str, object],
 ) -> None:
     _validate_edge_and_winner_state(plan, current)
+    # Artifact replacement has a more specific authority check below.  Keep
+    # that diagnostic stable while still rejecting forged readiness snapshots
+    # and control states.
+    if event_type != "artifact_registered":
+        try:
+            derived = refresh_ready(plan, current)
+        except WorkflowError as exc:
+            raise StoreError("events.invalid_readiness", str(exc)) from exc
+        if _state_data(derived) != _state_data(current):
+            raise StoreError(
+                "events.invalid_readiness",
+                "runtime state is not the deterministic readiness state for its routes and approvals",
+            )
     if previous is None:
         if _state_data(current) != _state_data(initial_run(plan, current.run_id)):
             raise StoreError("events.invalid_completion", "run start differs from the scheduler's initial state")
@@ -1539,8 +1631,20 @@ def validate_node_evidence_delta(
             claim = matching[0].payload["claim_evidence"]
             if before.nodes[node_id].claim_token_hash != claim["claim_token_sha256"]:
                 raise StoreError("events.invalid_completion", "claim token hash differs from running attempt")
+            if receipt["schema_version"] == RECEIPT_SCHEMA_V3:
+                declared = {
+                    item["id"]: (item["path"], item["sha256"])
+                    for item in claim["input_artifacts"]
+                }
+                for source in receipt["consumed_sources"]:
+                    if declared.get(source["id"]) != (source["path"], source["sha256"]):
+                        raise StoreError(
+                            "events.invalid_completion",
+                            "receipt consumed source is absent from the frozen claim",
+                        )
             expected = build_stage_receipt(plan, after, node_id, claim, summary=receipt["summary"],
-                                           uncertainties=receipt["uncertainties"], completed_at=receipt["completed_at"], error=receipt["error"])
+                                           uncertainties=receipt["uncertainties"], completed_at=receipt["completed_at"],
+                                           error=receipt["error"], consumed_sources=receipt.get("consumed_sources"))
             if receipt != expected or not digest:
                 raise StoreError("events.invalid_completion", "receipt differs from claim and post-state")
     except (ReceiptError, WorkflowError, KeyError, TypeError, ValueError) as exc:

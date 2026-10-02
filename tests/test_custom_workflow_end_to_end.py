@@ -122,7 +122,7 @@ class CustomWorkflowEndToEndTests(unittest.TestCase):
     def submit_text_result(self, service, invocation, node_id, artifact_id, path, text):
         (service.project_root / path).write_text(text, encoding="utf-8")
         return service.submit_result({
-            "schema_version": "node-result-v1",
+            "schema_version": "node-result-v2",
             "run_id": invocation["run_id"],
             "node_id": node_id,
             "attempt": invocation["attempt"],
@@ -131,6 +131,7 @@ class CustomWorkflowEndToEndTests(unittest.TestCase):
             "outcome": "succeeded",
             "summary": f"Created {artifact_id} test evidence.",
             "artifacts": [{"id": artifact_id, "path": path}],
+            "consumed_sources": [],
             "uncertainties": [],
         })
 

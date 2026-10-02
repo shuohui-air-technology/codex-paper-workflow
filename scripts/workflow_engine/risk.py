@@ -86,8 +86,13 @@ def _adjacency_compatible(
     edges: Sequence[EdgeSpec],
     projected_nodes: Mapping[str, Mapping[str, object]],
     projected_edges: Sequence[Mapping[str, object]],
+    approval_ids: frozenset[str] = frozenset(),
 ) -> bool:
-    actual = [edge for edge in edges if edge.source == node.id or edge.target == node.id]
+    # Approval sidecars add control dependencies while retaining the original
+    # data edge. They do not replace a projected capability or artifact route.
+    actual = [edge for edge in edges
+              if (edge.source == node.id or edge.target == node.id)
+              and edge.source not in approval_ids and edge.target not in approval_ids]
     reverse_origins = {custom.id: origin for origin, custom in origins.items()}
     actual_signatures: list[tuple[object, ...]] = []
     for edge in actual:
@@ -176,6 +181,9 @@ def control_risk_warnings(
         for node in nodes
         if node.origin_projection_node_id is not None
     }
+    approval_ids = frozenset(
+        node.id for node in nodes if node.approval_source is not None
+    )
     fixed_coverage = {
         tag
         for node in nodes
@@ -189,7 +197,7 @@ def control_risk_warnings(
         and _binding_compatible(node, projected_nodes[origin])
         and _shape_compatible(node, projected_nodes[origin])
         and _adjacency_compatible(
-            node, origins, edges, projected_nodes, projected_edges
+            node, origins, edges, projected_nodes, projected_edges, approval_ids
         )
     }
     warnings: list[WorkflowIssue] = []
@@ -220,4 +228,30 @@ def control_risk_warnings(
                     f"projected {tag} control is not covered by the enabled custom graph",
                 )
             )
+    checkpoint_projection_ids = {
+        "topic", "design", "experiments", "venue-outline",
+        "final-editorial-audit", "finalize",
+    }
+    if origins and checkpoint_projection_ids.issubset(projected_nodes):
+        origin_to_id = {origin: node.id for origin, node in origins.items()}
+        requirements = (
+            ("topic", "topic", "design", 1),
+            ("design", "design", "venue-outline", 1),
+            ("experiment", "design", "experiments", 2),
+            ("delivery", "final-editorial-audit", "finalize", 1),
+        )
+        for label, source_origin, target_origin, count in requirements:
+            source_id = origin_to_id.get(source_origin)
+            target_id = origin_to_id.get(target_origin)
+            if source_id is None or target_id is None:
+                warnings.append(_warning(f"risk.approval_removed.{label}", f"projected {label} decision lacks an approval gate"))
+                continue
+            matching = {
+                gate.id for gate in nodes
+                if gate.approval_source == source_id
+                and any(edge.source == source_id and edge.target == gate.id for edge in edges)
+                and any(edge.source == gate.id and edge.target == target_id and edge.trigger == "approved" for edge in edges)
+            }
+            if len(matching) < count:
+                warnings.append(_warning(f"risk.approval_removed.{label}", f"projected {label} decision lacks an approval gate", node_id=source_id))
     return tuple(warnings)

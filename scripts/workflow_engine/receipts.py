@@ -18,7 +18,10 @@ from .fs import hash_regular_file, reject_duplicate_pairs
 
 INVOCATION_SCHEMA = "node-invocation-v1"
 RESULT_SCHEMA = "node-result-v1"
+INVOCATION_SCHEMA_V2 = "node-invocation-v2"
+RESULT_SCHEMA_V2 = "node-result-v2"
 RECEIPT_SCHEMA = "stage-receipt-v2"
+RECEIPT_SCHEMA_V3 = "stage-receipt-v3"
 MAX_ENVELOPE_BYTES = 1024 * 1024
 MAX_TEXT = 4000
 MAX_ITEMS = 1000
@@ -29,12 +32,14 @@ _RESULT_FIELDS = frozenset({
     "schema_version", "run_id", "node_id", "attempt", "idempotency_token",
     "status", "outcome", "summary", "artifacts", "uncertainties",
 })
+_RESULT_V2_FIELDS = _RESULT_FIELDS | {"consumed_sources"}
 _RECEIPT_FIELDS = frozenset({
     "schema_version", "workflow_id", "semantic_revision", "semantic_sha256",
     "run_id", "node_id", "node_type", "attempt", "claim_token_sha256",
     "resolved_identity", "input_artifacts", "output_artifacts", "status", "outcome",
     "started_at", "completed_at", "summary", "uncertainties", "error",
 })
+_RECEIPT_V3_FIELDS = _RECEIPT_FIELDS | {"consumed_sources"}
 
 
 class ReceiptError(ValueError):
@@ -168,16 +173,20 @@ def _report(value: dict[str, object]) -> None:
 
 def parse_result(value: object) -> dict[str, object]:
     result = _decode(value)
-    if set(result) not in (_RESULT_FIELDS, _RESULT_FIELDS | {"error"}):
-        _fail("result fields do not match node-result-v1")
-    if result["schema_version"] != RESULT_SCHEMA:
+    schema = result.get("schema_version")
+    if not isinstance(schema, str) or schema not in {RESULT_SCHEMA, RESULT_SCHEMA_V2}:
         _fail("unsupported result schema")
+    fields = _RESULT_V2_FIELDS if schema == RESULT_SCHEMA_V2 else _RESULT_FIELDS
+    if set(result) not in (fields, fields | {"error"}):
+        _fail("result fields do not match the declared node-result schema")
     for key in ("run_id", "node_id"):
         _identifier(result[key])
     _positive(result["attempt"])
     _text(result["idempotency_token"])
     _text(result["outcome"], empty=True)
     _artifacts(result["artifacts"], hashed=False)
+    if schema == RESULT_SCHEMA_V2:
+        _artifacts(result["consumed_sources"])
     _report(result)
     if result["status"] == "succeeded":
         if not result["outcome"] or result.get("error") is not None:
@@ -221,9 +230,12 @@ def _identity(identity: object, node_type: str) -> None:
 
 
 def validate_stage_receipt(value: object) -> dict[str, object]:
-    receipt = _exact(_decode(value), _RECEIPT_FIELDS)
-    if receipt["schema_version"] != RECEIPT_SCHEMA:
+    raw = _decode(value)
+    schema = raw.get("schema_version")
+    if not isinstance(schema, str) or schema not in {RECEIPT_SCHEMA, RECEIPT_SCHEMA_V3}:
         _fail("unsupported receipt schema")
+    fields = _RECEIPT_V3_FIELDS if schema == RECEIPT_SCHEMA_V3 else _RECEIPT_FIELDS
+    receipt = _exact(raw, fields)
     for key in ("workflow_id", "run_id", "node_id"):
         _identifier(receipt[key])
     for key in ("attempt", "semantic_revision"):
@@ -234,6 +246,10 @@ def validate_stage_receipt(value: object) -> dict[str, object]:
     _identity(identity, receipt["node_type"])
     _artifacts(receipt["input_artifacts"], inputs=True)
     _artifacts(receipt["output_artifacts"])
+    if schema == RECEIPT_SCHEMA_V3:
+        if receipt["node_type"] != "task":
+            _fail("stage-receipt-v3 is reserved for task results")
+        _artifacts(receipt["consumed_sources"])
     _report(receipt)
     _text(receipt["status"])
     _text(receipt["outcome"], empty=True)
@@ -254,13 +270,23 @@ def validate_stage_receipt(value: object) -> dict[str, object]:
 
 
 def validate_invocation(value: object) -> dict[str, object]:
-    invocation = _exact(_decode(value), {
+    invocation = _decode(value)
+    schema = invocation.get("schema_version")
+    if not isinstance(schema, str) or schema not in {INVOCATION_SCHEMA, INVOCATION_SCHEMA_V2}:
+        _fail("unsupported invocation schema")
+    fields = {
         "schema_version", "run_id", "semantic_sha256", "node_id", "attempt",
         "claim_token_sha256", "resolved_identity", "input_artifacts", "expected_outputs",
         "outcomes", "started_at", "idempotency_token", "allowed_project_root",
-    })
-    if invocation["schema_version"] != INVOCATION_SCHEMA:
-        _fail("unsupported invocation schema")
+    }
+    if invocation.get("schema_version") == INVOCATION_SCHEMA_V2:
+        fields |= {"result_schema", "skill_root"}
+    invocation = _exact(invocation, fields)
+    if invocation["schema_version"] == INVOCATION_SCHEMA_V2:
+        if invocation["result_schema"] != RESULT_SCHEMA_V2:
+            _fail("invalid invocation result schema")
+        if not Path(_text(invocation["skill_root"])).is_absolute():
+            _fail("invocation Skill root must be absolute")
     for key in ("run_id", "node_id"):
         _identifier(invocation[key])
     _positive(invocation["attempt"])
@@ -287,8 +313,11 @@ def validate_invocation(value: object) -> dict[str, object]:
     return invocation
 
 
-def build_invocation(claim: Mapping[str, object], token: str, project_root: Path) -> dict[str, object]:
-    return validate_invocation({"schema_version": INVOCATION_SCHEMA, **claim,
+def build_invocation(claim: Mapping[str, object], token: str, project_root: Path,
+                     *, skill_root: Path | None = None) -> dict[str, object]:
+    version = INVOCATION_SCHEMA_V2 if skill_root is not None else INVOCATION_SCHEMA
+    extras = {"result_schema": RESULT_SCHEMA_V2, "skill_root": str(skill_root)} if skill_root is not None else {}
+    return validate_invocation({"schema_version": version, **claim, **extras,
                                 "idempotency_token": token, "allowed_project_root": str(project_root)})
 
 
@@ -349,14 +378,24 @@ def build_claim_evidence(plan, state, node_id, witnesses, started_at) -> dict[st
 
 
 def build_stage_receipt(plan, state, node_id, claim, *, summary, uncertainties,
-                        completed_at, error=None) -> dict[str, object]:
+                        completed_at, error=None, consumed_sources=None) -> dict[str, object]:
     runtime = state.nodes[node_id]
     outputs = [
         {"id": artifact_id, "path": state.artifacts[artifact_id].path, "sha256": state.artifacts[artifact_id].sha256}
         for artifact_id in sorted(plan.nodes[node_id].outputs)
     ] if runtime.status.value == "succeeded" and plan.nodes[node_id].type == "task" else []
-    return validate_stage_receipt({
-        "schema_version": RECEIPT_SCHEMA, "workflow_id": plan.workflow_id,
+    v3 = getattr(plan, "schema_version", "compiled-plan-v1") == "compiled-plan-v2" and plan.nodes[node_id].type == "task"
+    # Store replay and older in-process callers reconstructing a receipt may
+    # omit the new field. Preserve that API by treating every frozen input as
+    # the declared source in this fallback; the manager's node-result-v2 path
+    # always passes the executor's explicit (possibly smaller) list.
+    if v3 and consumed_sources is None:
+        consumed_sources = [
+            {"id": item["id"], "path": item["path"], "sha256": item["sha256"]}
+            for item in claim.get("input_artifacts", [])
+        ]
+    payload = {
+        "schema_version": RECEIPT_SCHEMA_V3 if v3 else RECEIPT_SCHEMA, "workflow_id": plan.workflow_id,
         "semantic_revision": plan.semantic_revision, "semantic_sha256": plan.semantic_sha256,
         "run_id": state.run_id, "node_id": node_id, "node_type": plan.nodes[node_id].type,
         "attempt": runtime.attempt, "claim_token_sha256": claim["claim_token_sha256"],
@@ -364,4 +403,7 @@ def build_stage_receipt(plan, state, node_id, claim, *, summary, uncertainties,
         "output_artifacts": outputs, "status": runtime.status.value, "outcome": runtime.outcome,
         "started_at": claim["started_at"], "completed_at": completed_at,
         "summary": summary, "uncertainties": uncertainties, "error": error,
-    })
+    }
+    if v3:
+        payload["consumed_sources"] = consumed_sources
+    return validate_stage_receipt(payload)

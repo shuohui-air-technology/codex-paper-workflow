@@ -28,6 +28,7 @@ interface NodeBase {
   failure_policy: FailurePolicy;
   condition_cases: ConditionCase[];
   join_mode: JoinMode;
+  approval_source?: string | null;
 }
 
 export interface TaskNode extends NodeBase {
@@ -177,11 +178,13 @@ export interface ApiEnvelope<T> {
 
 export interface BootstrapData {
   project_label: string;
+  project_root?: string;
   mode: 'official' | 'custom';
   active_workflow: ActiveWorkflowSummary | null;
   document_revision: number;
   csrf_token: string;
   max_json_body_bytes: number;
+  approvals?: Array<{ node_id: string; source_node_id: string; state: string }>;
 }
 
 export interface ActiveWorkflowSummary {

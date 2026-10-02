@@ -19,6 +19,10 @@ from scripts.workflow_engine.scheduler import (
     condition_facts,
     initial_run,
     mark_descendants_stale,
+    approval_decision_name,
+    approval_fingerprint,
+    approval_state,
+    record_condition_fact_transition,
     ready_node_ids,
     refresh_ready,
     result_transition,
@@ -54,7 +58,7 @@ def task(node_id, *, entry=False, inputs=(), outputs=(), failure_policy="block")
     }
 
 
-def condition(node_id, *, entry=False, cases=()):
+def condition(node_id, *, entry=False, cases=(), approval_source=None):
     return {
         "id": node_id,
         "type": "condition",
@@ -71,6 +75,7 @@ def condition(node_id, *, entry=False, cases=()):
         "failure_policy": "block",
         "condition_cases": list(cases),
         "join_mode": "all_active",
+        "approval_source": approval_source,
     }
 
 
@@ -200,6 +205,87 @@ class WorkflowSchedulerTests(unittest.TestCase):
         updated = dict(state.artifacts)
         updated.update({artifact.artifact_id: artifact for artifact in artifacts})
         return replace(state, artifacts=MappingProxyType(updated))
+
+    def test_approval_gate_waits_then_releases_only_after_bound_source_approval(self):
+        nodes = [
+            task("source", entry=True, outputs=("draft",)),
+            condition("gate", approval_source="source"),
+            task("target", inputs=("draft",)),
+        ]
+        edges = [
+            edge("source-target", "source", "target", output_map={"draft": "draft"}),
+            edge("source-gate", "source", "gate"),
+            edge("gate-target", "gate", "target", trigger="approved"),
+        ]
+        plan = self.compile(nodes, edges)
+        state = initial_run(plan, "approval-run")
+        self.assertEqual(ready_node_ids(plan, state), ("source",))
+        state = self.complete(
+            plan,
+            state,
+            "source",
+            outputs={"draft": "draft.md"},
+            artifacts=(self.artifact("draft", "draft.md", node="source", attempt=1),),
+        )
+        self.assertEqual(state.nodes["gate"].status, NodeStatus.PENDING)
+        self.assertEqual(state.nodes["target"].status, NodeStatus.PENDING)
+        self.assertEqual(approval_state(plan, state, "gate"), "awaiting_confirmation")
+
+        fingerprint = approval_fingerprint(plan, state, "gate")
+        self.assertIsNotNone(fingerprint)
+        approved = record_condition_fact_transition(
+            plan,
+            state,
+            approval_decision_name("gate"),
+            "approved:" + fingerprint,
+            decision=True,
+        )
+        approved, transitions = stabilize_control_nodes(plan, approved)
+        self.assertEqual([item.node_id for item in transitions], ["gate"])
+        self.assertEqual(approved.nodes["gate"].status, NodeStatus.SUCCEEDED)
+        self.assertEqual(ready_node_ids(plan, approved), ("target",))
+
+    def test_revision_invalidates_source_and_old_approval_cannot_release_new_attempt(self):
+        nodes = [
+            task("source", entry=True, outputs=("draft",)),
+            condition("gate", approval_source="source"),
+            task("target", inputs=("draft",)),
+        ]
+        edges = [
+            edge("source-target", "source", "target", output_map={"draft": "draft"}),
+            edge("source-gate", "source", "gate"),
+            edge("gate-target", "gate", "target", trigger="approved"),
+        ]
+        plan = self.compile(nodes, edges)
+        state = self.complete(
+            plan,
+            initial_run(plan, "revision-run"),
+            "source",
+            outputs={"draft": "draft.md"},
+            artifacts=(self.artifact("draft", "draft.md", node="source", attempt=1),),
+        )
+        old = approval_fingerprint(plan, state, "gate")
+        state = record_condition_fact_transition(
+            plan,
+            state,
+            approval_decision_name("gate"),
+            "revise:" + old,
+            decision=True,
+        )
+        self.assertEqual(state.nodes["source"].status, NodeStatus.STALE)
+        self.assertEqual(approval_state(plan, state, "gate"), "revision_requested")
+        state, affected = rerun_stale_transition(plan, state, "source")
+        self.assertIn("source", affected)
+        self.assertEqual(ready_node_ids(plan, state), ("source",))
+        state = self.complete(
+            plan,
+            state,
+            "source",
+            outputs={"draft": "draft-v2.md"},
+            artifacts=(self.artifact("draft", "draft-v2.md", node="source", attempt=2),),
+        )
+        self.assertNotEqual(old, approval_fingerprint(plan, state, "gate"))
+        self.assertEqual(approval_state(plan, state, "gate"), "awaiting_confirmation")
 
     def complete(self, plan, state, node_id, *, outputs=None, artifacts=()):
         claimed = claim_transition(plan, refresh_ready(plan, state), node_id, f"token-{node_id}")

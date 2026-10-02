@@ -24,10 +24,10 @@ from scripts.workflow_engine.receipts import (
 
 def task_result():
     return {
-        "schema_version": "node-result-v1", "run_id": "run-1",
+        "schema_version": "node-result-v2", "run_id": "run-1",
         "node_id": "produce", "attempt": 1, "idempotency_token": "secret-token",
         "status": "succeeded", "outcome": "succeeded", "summary": "Created draft.",
-        "artifacts": [{"id": "draft", "path": "draft.md"}], "uncertainties": [],
+        "artifacts": [{"id": "draft", "path": "draft.md"}], "uncertainties": [], "consumed_sources": [],
     }
 
 
@@ -56,6 +56,40 @@ class ReceiptCodecTests(unittest.TestCase):
         self.assertEqual(actual, receipt)
         self.assertNotIn("secret-token", json.dumps(actual))
         self.assertEqual(actual["input_artifacts"][0]["source_id"], "original")
+
+    def test_node_result_v2_requires_and_canonicalizes_consumed_sources(self):
+        result = task_result()
+        result.update(schema_version="node-result-v2", consumed_sources=[
+            {"id": "source", "path": "source.md", "sha256": "d" * 64},
+        ])
+        parsed = parse_result(result)
+        self.assertEqual(parsed["consumed_sources"][0]["id"], "source")
+        # The pure codec checks shape and hashes; claim agreement belongs to
+        # WorkflowService/store, which has the frozen input context.
+        self.assertEqual(parse_result(dict(result, consumed_sources=[
+            {"id": "undeclared", "path": "source.md", "sha256": "d" * 64},
+        ]))["consumed_sources"][0]["id"], "undeclared")
+        missing = dict(result)
+        missing.pop("consumed_sources")
+        with self.assertRaises(ReceiptError):
+            parse_result(missing)
+        with self.assertRaises(ReceiptError):
+            parse_result(dict(result, schema_version=[]))
+
+    def test_stage_receipt_v3_binds_reported_sources_and_keeps_v1_compatible(self):
+        legacy = task_receipt()
+        self.assertEqual(validate_stage_receipt(legacy)["schema_version"], "stage-receipt-v2")
+        current = dict(legacy, schema_version="stage-receipt-v3", consumed_sources=[
+            {"id": "source", "path": "source.md", "sha256": "d" * 64},
+        ])
+        self.assertEqual(validate_stage_receipt(current)["schema_version"], "stage-receipt-v3")
+        validator = dict(current, node_type="validator", output_artifacts=[], outcome="pass", resolved_identity={
+            "kind": "validator", "validator_id": "figure-contract", "script": "scripts/figure_contract_validator.py",
+            "sha256": "a" * 64, "adapter": "figure_contract_v1", "input_schema": "figure_contract_v1",
+            "outcomes": ["pass", "fail", "blocked"],
+        })
+        with self.assertRaises(ReceiptError):
+            validate_stage_receipt(validator)
 
     def test_validator_receipt_codec_only_accepts_declared_domain_outcomes(self):
         receipt = task_receipt()
@@ -1168,11 +1202,11 @@ class ValidatorManagerTests(unittest.TestCase):
 
         invocation = self.service.claim("left")
         self.service.submit_result({
-            "schema_version": "node-result-v1", "run_id": invocation["run_id"],
+            "schema_version": "node-result-v2", "run_id": invocation["run_id"],
             "node_id": "left", "attempt": invocation["attempt"],
             "idempotency_token": invocation["idempotency_token"],
             "status": "succeeded", "outcome": "succeeded", "summary": "Completed the selected branch.",
-            "artifacts": [], "uncertainties": [],
+            "artifacts": [], "uncertainties": [], "consumed_sources": [],
         })
         changed = self.service.record_fact("route", False, "The input evidence changed.")
         self.assertEqual(changed["registration_status"], "recorded")
@@ -1705,11 +1739,11 @@ class WorkflowManagerCLITests(unittest.TestCase):
         self.assertEqual((code, invocation["node_id"]), (0, "directions"))
 
         result = {
-            "schema_version": "node-result-v1", "run_id": invocation["run_id"],
+            "schema_version": "node-result-v2", "run_id": invocation["run_id"],
             "node_id": invocation["node_id"], "attempt": invocation["attempt"],
             "idempotency_token": invocation["idempotency_token"], "status": "succeeded",
             "outcome": "succeeded", "summary": "Completed the CLI test node.",
-            "artifacts": [], "uncertainties": [],
+            "artifacts": [], "uncertainties": [], "consumed_sources": [],
         }
         self._write_json("result.json", result)
         code, receipt = self._run("module", "submit-result", *self._common(), "--result", "result.json")

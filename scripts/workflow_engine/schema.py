@@ -53,6 +53,7 @@ _NODE_FIELDS = frozenset(
         "failure_policy",
         "condition_cases",
         "join_mode",
+        "approval_source",
     }
 )
 _EDGE_FIELDS = frozenset({"id", "source", "target", "trigger", "output_map"})
@@ -125,6 +126,7 @@ class NodeSpec:
     failure_policy: str
     condition_cases: tuple[Mapping[str, Any], ...]
     join_mode: str
+    approval_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -407,6 +409,9 @@ def _validator_config(
 
 def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
     preliminary = _object(value, "node")
+    # v1 drafts predate approval gates. Normalize them when they are next saved.
+    if "approval_source" not in preliminary:
+        preliminary = {**preliminary, "approval_source": None}
     node_id = _identifier(preliminary.get("id"), "node.id") if "id" in preliminary else ""
     item = _exact_fields(
         preliminary,
@@ -444,6 +449,9 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
     join_mode = _scalar(item["join_mode"], "node.join_mode", node_id=node_id)
     if join_mode not in _JOIN_MODES:
         _fail("schema.invalid_join_mode", "node.join_mode is not supported", node_id=node_id)
+    approval_source = _optional_identifier(item["approval_source"], "node.approval_source", node_id=node_id)
+    if approval_source is not None and node_type != "condition":
+        _fail("schema.approval_on_noncondition", "approval_source is only valid on a condition node", node_id=node_id)
 
     if node_type == "task":
         if item["validator_config"] is not None:
@@ -479,11 +487,13 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
             _fail("schema.control_validator_forbidden", "control nodes cannot bind a validator", node_id=node_id)
         if declared_outcomes:
             _fail("schema.condition_outcomes_derived", "condition outcomes must be derived from condition cases", node_id=node_id)
-        if not condition_cases:
+        if approval_source is not None and condition_cases:
+            _fail("schema.approval_cases_forbidden", "approval gates do not use ordinary condition cases", node_id=node_id)
+        if approval_source is None and not condition_cases:
             _fail("schema.condition_cases_required", "condition nodes require at least one named case", node_id=node_id)
         if join_mode != "all_active":
             _fail("schema.condition_join_mode_forbidden", "condition nodes cannot select a join mode", node_id=node_id)
-        outcomes = tuple(case["outcome"] for case in condition_cases) + ("default",)
+        outcomes = ("approved",) if approval_source is not None else tuple(case["outcome"] for case in condition_cases) + ("default",)
     else:
         if item["validator_config"] is not None:
             _fail("schema.nonvalidator_config_forbidden", "non-validator nodes cannot carry validator configuration", node_id=node_id)
@@ -514,6 +524,7 @@ def _node(value: object, derived_from: Mapping[str, Any] | None) -> NodeSpec:
         failure_policy=failure_policy,
         condition_cases=condition_cases,
         join_mode=join_mode,
+        approval_source=approval_source,
     )
 
 
@@ -667,6 +678,7 @@ def document_data(document: WorkflowDocument) -> dict[str, object]:
                 "failure_policy": node.failure_policy,
                 "condition_cases": _json_value(node.condition_cases),
                 "join_mode": node.join_mode,
+                "approval_source": node.approval_source,
             }
             for node in document.nodes
         ],
@@ -723,6 +735,7 @@ def behavior_payload(document: WorkflowDocument) -> dict[str, object]:
                 "failure_policy": node.failure_policy,
                 "condition_cases": _json_value(node.condition_cases),
                 "join_mode": node.join_mode,
+                **({"approval_source": node.approval_source} if node.approval_source is not None else {}),
             }
             for node in sorted(document.nodes, key=lambda item: item.id)
         ],

@@ -270,6 +270,21 @@ Start from a copy of the official workflow or create a blank one. Arrange stages
 
 Follow the sequence: edit stages, validate, then save or activate. Saving preserves a draft; activation selects the workflow that Codex will follow. The [guide (Chinese)](docs/workflow-studio-guide.md) explains saved drafts, active versions, artifact connections, and common errors.
 
+When you copy the official workflow, four high-impact checkpoints are added as
+waiting gates: topic lock, study-design confirmation, experiment authorization,
+and final delivery. A gate keeps the original artifact edges in place, but the
+downstream stage stays unavailable until you explicitly approve the exact
+upstream attempt. A revision request preserves the old receipt and makes the
+source closure stale; use the manager's explicit `rerun-stale` command after
+reviewing it.
+
+New custom activations also use a fixed Skill root and the `node-result-v2`
+source declaration. A task must report the project-relative files it actually
+used and their SHA-256 hashes. The manager checks those entries against the
+frozen claim and stores them in `stage-receipt-v3` for recovery replay. This is
+an auditable declaration of reported inputs; without OS-level file-access
+isolation it cannot prove that an executor did not read an unreported file.
+
 After Studio confirms activation, return to a Codex conversation in the same paper-project directory and send:
 
 ```text

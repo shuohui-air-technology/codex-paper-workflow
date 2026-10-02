@@ -731,6 +731,37 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(store.read_selection().mode, "official")
             self.assertFalse(root.joinpath(".research/custom-workflow").exists())
 
+    def test_v3_receipt_rejects_consumed_source_outside_frozen_claim(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "draft.txt").write_bytes(b"draft")
+            plan = replace(task_plan(), schema_version="compiled-plan-v2")
+            store = WorkflowStore(root)
+            store.start_run(plan, "run-v3-source-check")
+            with store.locked_run() as transaction:
+                _, state = transaction.load_active_run()
+                running = claim_transition(plan, state, "produce", "v3-token")
+                claim_event = commit_claim(transaction, running)
+                completed = result_transition(plan, running, {
+                    "node_id": "produce", "attempt": 1, "status": "succeeded",
+                    "outcome": "succeeded", "outputs": {"draft": "draft.txt"},
+                    "artifacts": [ArtifactRuntime(
+                        "draft", "draft.txt", sha256_bytes(b"draft"), "verified", "produce", 1,
+                    )],
+                })
+                receipt = build_stage_receipt(
+                    plan, completed, "produce", claim_event.payload["claim_evidence"],
+                    summary="Fixture completion.", uncertainties=[],
+                    completed_at="2026-09-23T00:00:01Z",
+                    consumed_sources=[{"id": "undeclared", "path": "extra.txt", "sha256": "0" * 64}],
+                )
+                with self.assertRaises(StoreError) as caught:
+                    transaction.commit_receipted_transition(
+                        "node_result_recorded", completed, receipt,
+                        result_sha256="f" * 64, claim_event_seq=claim_event.event_seq,
+                    )
+                self.assertEqual(caught.exception.code, "events.invalid_completion")
+
     def test_resolve_project_path_rejects_absolute_traversal_and_symlink_parents(self):
         with TemporaryDirectory() as temporary, TemporaryDirectory() as outside:
             root = Path(temporary)

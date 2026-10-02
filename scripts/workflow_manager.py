@@ -31,7 +31,8 @@ from scripts.workflow_engine.receipts import (
 )
 from scripts.workflow_engine.reporting import summarize_run_progress
 from scripts.workflow_engine.scheduler import (
-    ArtifactRuntime, NodeStatus, claim_transition, ready_node_ids, refresh_ready,
+    ArtifactRuntime, NodeStatus, approval_decision_name, approval_fingerprint, approval_state,
+    claim_transition, ready_node_ids, refresh_ready,
     result_transition, retry_transition, stabilize_control_nodes, validator_claim_transition,
     validator_result_transition, record_condition_fact_transition,
     validator_retry_transition,
@@ -121,6 +122,7 @@ def _build_cli_parser():
         ("register-artifact", "--artifact"),
         ("record-decision", "--decision"),
         ("record-fact", "--fact"),
+        ("record-approval", "--approval"),
     ):
         item = commands.add_parser(command)
         _add_cli_common(item, skills=True)
@@ -217,6 +219,11 @@ def _run_cli(args):
         if set(payload) != {"name", "value", "provenance_summary"}:
             raise _CLIError("cli.invalid_json", "decision input must contain exactly name, value, and provenance_summary")
         return service.record_decision(payload["name"], payload["value"], payload["provenance_summary"])
+    if args.command == "record-approval":
+        payload = _read_project_json(project, args.approval)
+        if set(payload) != {"node_id", "action", "provenance_summary"}:
+            raise _CLIError("cli.invalid_json", "approval input must contain node_id, action, and provenance_summary")
+        return service.record_approval(payload["node_id"], payload["action"], payload["provenance_summary"])
     if args.command == "record-fact":
         payload = _read_project_json(project, args.fact)
         if set(payload) not in ({"name", "value"}, {"name", "value", "provenance_summary"}):
@@ -256,7 +263,9 @@ class WorkflowService:
     def __init__(self, project_root: Path, *, skill_roots: tuple[Path, ...] = ()):
         self.store = WorkflowStore(project_root)
         self.project_root = self.store.project_root
-        self.skill_roots = resolve_skill_roots(skill_roots, None, dict(os.environ))
+        local_skills = self.project_root / ".agents" / "skills"
+        roots = (local_skills,) + skill_roots if local_skills.is_dir() and not local_skills.is_symlink() else skill_roots
+        self.skill_roots = resolve_skill_roots(roots, None, dict(os.environ))
 
     def _compile(self, document):
         parsed = (
@@ -365,7 +374,15 @@ class WorkflowService:
 
     def _identity(self, node):
         if node.type == "task":
-            catalog = discover_skills(self.skill_roots, load_install_receipts(self.skill_roots))
+            # The activated plan owns the selected root. A later CLI process
+            # need not repeat Studio's --skills-root argument.
+            if node.skill is None or not node.skill.root.is_absolute():
+                raise WorkflowManagerError(
+                    "runtime.identity_changed",
+                    "activated task has no absolute Skill root",
+                )
+            pinned_roots = (node.skill.root,)
+            catalog = discover_skills(pinned_roots, load_install_receipts(pinned_roots))
             current = catalog.skills.get(node.skill.catalog_id)
             if (node.skill.catalog_id in catalog.failed_skill_ids
                     or any(issue.code in ROOT_CATALOG_FAILURE_CODES
@@ -558,7 +575,10 @@ class WorkflowService:
             updated = claim_transition(plan, state, node_id, token)
             claim = build_claim_evidence(plan, updated, node_id, transaction.input_witnesses(), _now())
             self._hash_inputs(claim["input_artifacts"])
-            invocation = build_invocation(claim, token, self.project_root)
+            invocation = build_invocation(
+                claim, token, self.project_root,
+                skill_root=plan.nodes[node_id].skill.root if plan.schema_version == "compiled-plan-v2" else None,
+            )
             transaction.commit_transition("node_claimed", updated, {"claim_evidence": claim})
         return invocation
 
@@ -571,6 +591,9 @@ class WorkflowService:
         token_hash = hashlib.sha256(result["idempotency_token"].encode()).hexdigest()
         with self.store.locked_run() as transaction:
             plan, state = self._load(transaction)
+            required_result_schema = "node-result-v2" if plan.schema_version == "compiled-plan-v2" else "node-result-v1"
+            if result["schema_version"] != required_result_schema:
+                raise WorkflowManagerError("receipt.result_version", f"active run requires {required_result_schema}")
             node_id = result["node_id"]
             runtime = state.nodes.get(node_id)
             if runtime is None or result["run_id"] != state.run_id or runtime.attempt != result["attempt"] or runtime.claim_token_hash != token_hash or runtime.status.value == "stale":
@@ -591,6 +614,17 @@ class WorkflowService:
             claim_event = claims[0]
             claim = claim_event.payload["claim_evidence"]
             self._hash_inputs(claim["input_artifacts"])
+            if required_result_schema == "node-result-v2":
+                declared = {
+                    item["id"]: (item["path"], item["sha256"])
+                    for item in claim["input_artifacts"]
+                }
+                for source in result["consumed_sources"]:
+                    if declared.get(source["id"]) != (source["path"], source["sha256"]):
+                        raise WorkflowManagerError(
+                            "receipt.undeclared_source",
+                            "consumed project file was not a claimed input; declare it and rerun the stage",
+                        )
             artifacts = []
             for artifact in result["artifacts"]:
                 try:
@@ -605,7 +639,8 @@ class WorkflowService:
                 "status": result["status"], "outcome": result["outcome"],
                 "outputs": {item["id"]: item["path"] for item in result["artifacts"]}, "artifacts": artifacts})
             receipt = build_stage_receipt(plan, updated, node_id, claim, summary=result["summary"],
-                uncertainties=result["uncertainties"], completed_at=_now(), error=result.get("error"))
+                uncertainties=result["uncertainties"], completed_at=_now(), error=result.get("error"),
+                consumed_sources=result.get("consumed_sources"))
             transaction.commit_receipted_transition("node_result_recorded", updated, receipt,
                 result_sha256=digest, claim_event_seq=claim_event.event_seq)
             self._stabilize(transaction, plan, updated)
@@ -782,9 +817,28 @@ class WorkflowService:
 
     def record_decision(self, name, value, provenance_summary):
         """Record one bounded decision value and invalidate dependent conditions."""
+        if isinstance(name, str) and name.startswith("__approval__."):
+            raise WorkflowManagerError("runtime.reserved_decision", "use record-approval for an approval gate")
         return self._record_condition_value(
             "decision_recorded", name, value, provenance_summary
         )
+
+    def record_approval(self, node_id, action, provenance_summary):
+        if action not in {"approve", "revise"} or not isinstance(node_id, str):
+            raise WorkflowManagerError("runtime.invalid_approval", "approval action must be approve or revise")
+        with self.store.locked_run() as transaction:
+            plan, state = self._load(transaction)
+            gate = plan.nodes.get(node_id)
+            if gate is None or gate.approval_source is None:
+                raise WorkflowManagerError("runtime.invalid_approval", "node is not an approval gate")
+            fingerprint = approval_fingerprint(plan, state, node_id)
+            if fingerprint is None:
+                raise WorkflowManagerError("runtime.invalid_approval", "approval source is not currently complete")
+        value = ("approved:" if action == "approve" else "revise:") + fingerprint
+        recorded = self._record_condition_value(
+            "decision_recorded", approval_decision_name(node_id), value, provenance_summary
+        )
+        return {**recorded, "node_id": node_id, "action": action}
 
     def retry(self, node_id):
         """Retry one failed, interrupted, or execution-skipped node without advancing its attempt."""
@@ -850,6 +904,9 @@ class WorkflowService:
                         "status": state.nodes[node_id].status.value,
                         "attempt": state.nodes[node_id].attempt,
                         "outcome": state.nodes[node_id].outcome,
+                        **({"approval_source": plan.nodes[node_id].approval_source,
+                            "approval_state": approval_state(plan, state, node_id)}
+                           if plan.nodes[node_id].approval_source is not None else {}),
                     }
                     for node_id in sorted(plan.nodes)
                 ],

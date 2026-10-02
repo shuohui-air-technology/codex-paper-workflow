@@ -28,15 +28,22 @@ class CustomWorkflowContractTests(unittest.TestCase):
             "register-artifact",
             "record-decision",
             "record-fact",
+            "record-approval",
             "retry",
             "rerun-stale",
+            "recover",
             "deactivate",
         ):
             with self.subTest(command=command):
                 self.assertIn(f"workflow_manager.py {command}", contract)
-        for receipt in ("node-invocation-v1", "node-result-v1", "stage-receipt-v2"):
+        for receipt in (
+            "node-invocation-v1", "node-invocation-v2", "node-result-v1",
+            "node-result-v2", "stage-receipt-v2", "stage-receipt-v3",
+        ):
             with self.subTest(receipt=receipt):
                 self.assertIn(receipt, contract)
+        self.assertIn("consumed_sources", contract)
+        self.assertIn("unreported file", contract)
 
     def test_custom_mode_fails_closed_and_preserves_official_default(self):
         contract = (ROOT / "references" / "custom-workflow-contract.md").read_text(

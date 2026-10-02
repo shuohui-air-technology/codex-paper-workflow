@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { NodeInspector } from './NodeInspector';
-import { addNode, connectNodes, createBlankWorkflow, updateNode } from '../workflow';
+import { addApprovalGate, addNode, connectNodes, createBlankWorkflow, updateNode } from '../workflow';
 import type { ValidatorCatalogEntry, WorkflowDocument, WorkflowNode } from '../types';
 
 afterEach(() => cleanup());
@@ -163,6 +163,24 @@ describe('NodeInspector guided editing', () => {
 });
 
 describe('NodeInspector connection contracts', () => {
+  it('keeps approval gates structural and prevents editing their artifact fields', () => {
+    const start = createBlankWorkflow('approval-gate-inspector');
+    const source = updateNode(start, 'step-1', { outputs: ['draft'] });
+    const target = { ...source.nodes[0]!, id: 'next', display_name: '下一阶段', entry: false, inputs: ['draft'] };
+    const connected = connectNodes(addNode(source, target), 'step-1', 'next');
+    const gated = addApprovalGate(connected, 'step-1', ['next']);
+    const gate = gated.nodes.find((node) => node.approval_source === 'step-1')!;
+    render(<NodeInspector {...inspectorProps(gated, gate)} />);
+
+    expect(screen.getAllByText('等待用户确认').length).toBeGreaterThan(0);
+    expect(screen.getByText('产物连线保持原样')).toBeVisible();
+    expect(screen.queryByLabelText('输入产物')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('输出产物')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '添加连接' })).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /启用此阶段/ })).toBeDisabled();
+    expect(screen.getByLabelText('写入范围')).toBeDisabled();
+  });
+
   it('offers only the executable task trigger and edits join output mapping as a form', async () => {
     const user = userEvent.setup();
     const start = createBlankWorkflow('join-routing');

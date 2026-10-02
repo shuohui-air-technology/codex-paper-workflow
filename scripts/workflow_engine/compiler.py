@@ -43,6 +43,7 @@ class CompiledNode:
     failure_policy: str
     condition_cases: tuple[Mapping[str, object], ...]
     join_mode: str
+    approval_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class CompiledPlan:
     outgoing: Mapping[str, tuple[str, ...]]
     topological_order: tuple[str, ...]
     max_parallelism: int
+    schema_version: str = "compiled-plan-v1"
 
 
 @dataclass(frozen=True)
@@ -509,7 +511,7 @@ def compile_workflow(
                 for edge_id in outgoing[node_id]
                 if edge_by_id[edge_id].trigger == "default"
             ]
-            if len(default_edges) != 1:
+            if node.approval_source is None and len(default_edges) != 1:
                 errors.append(
                     _issue(
                         "condition.default_edge",
@@ -517,6 +519,24 @@ def compile_workflow(
                         node_id=node_id,
                     )
                 )
+            if node.approval_source is not None:
+                source = enabled.get(node.approval_source)
+                source_edges = [edge_by_id[edge_id] for edge_id in incoming[node_id]]
+                guarded_edges = [edge_by_id[edge_id] for edge_id in outgoing[node_id]]
+                expected_trigger = "pass" if source is not None and source.type == "validator" else "succeeded"
+                if (node.entry or node.inputs or node.outputs or node.write_scopes
+                        or source is None or source.type not in {"task", "validator"}
+                        or len(source_edges) != 1 or source_edges[0].source != node.approval_source
+                        or source_edges[0].trigger != expected_trigger or source_edges[0].output_map
+                        or not guarded_edges
+                        or any(edge.trigger != "approved" or edge.output_map for edge in guarded_edges)):
+                    errors.append(_issue("approval.invalid_shape", "approval gate must depend on one completed source and guard downstream nodes", node_id=node_id))
+                for edge in guarded_edges:
+                    if not any(
+                        edge_by_id[other].source == node.approval_source
+                        for other in incoming[edge.target]
+                    ):
+                        errors.append(_issue("approval.missing_data_route", "guarded target must retain its direct source route", node_id=node_id, edge_id=edge.id))
             predecessors = frozenset(incoming_sources[node_id])
             predecessor_outcomes = {
                 predecessor: enabled[predecessor].outcomes for predecessor in predecessors
@@ -627,6 +647,7 @@ def compile_workflow(
             failure_policy=node.failure_policy,
             condition_cases=node.condition_cases,
             join_mode=node.join_mode,
+            approval_source=node.approval_source,
         )
         for node_id, node in sorted(enabled.items())
     }
@@ -655,5 +676,6 @@ def compile_workflow(
         outgoing=MappingProxyType(outgoing),
         topological_order=order,
         max_parallelism=document.max_parallelism,
+        schema_version="compiled-plan-v2",
     )
     return CompileResult(plan, (), tuple(warnings))

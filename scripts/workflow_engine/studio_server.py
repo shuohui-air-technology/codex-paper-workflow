@@ -334,6 +334,7 @@ class StudioApplication:
         draft = self._read_draft_if_present()
         return {
             "project_label": self.project_root.name,
+            "project_root": str(self.project_root),
             "mode": summary["mode"],
             "active_workflow": (
                 {
@@ -348,6 +349,11 @@ class StudioApplication:
             "document_revision": 0 if draft is None else draft["document_revision"],
             "csrf_token": self.config.csrf_token,
             "max_json_body_bytes": MAX_JSON_BODY,
+            "approvals": [
+                {"node_id": item["node_id"], "source_node_id": item["approval_source"],
+                 "state": item["approval_state"]}
+                for item in summary.get("nodes", ()) if "approval_state" in item
+            ],
         }
 
     def _catalog(self) -> tuple[dict, list[dict], list[dict]]:

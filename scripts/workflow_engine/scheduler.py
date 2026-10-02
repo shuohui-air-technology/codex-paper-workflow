@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -19,6 +20,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_FACT_ITEMS = 1_000
 _MAX_FACT_STRING = 4_000
 _MAX_DECISION_INTEGER = 2**63 - 1
+_APPROVAL_PREFIX = "__approval__."
 
 
 class NodeStatus(str, Enum):
@@ -192,6 +194,85 @@ def _replace_state(
         edges=MappingProxyType(dict(state.edges if edges is None else edges)),
         artifacts=MappingProxyType(dict(state.artifacts if artifacts is None else artifacts)),
     )
+
+
+def approval_decision_name(node_id: str) -> str:
+    return _APPROVAL_PREFIX + node_id
+
+
+def approval_fingerprint(plan: CompiledPlan, state: RunState, gate_id: str) -> str | None:
+    """Bind one approval to the current producer attempt and all current evidence.
+
+    A validator has no file outputs, so its attempt alone is insufficient to
+    identify what was reviewed.  Its selected input paths are resolved back to
+    exactly one verified artifact and included in the fingerprint as well.
+    """
+    gate = plan.nodes.get(gate_id)
+    if gate is None or gate.type != "condition":
+        return None
+    source_id = gate.approval_source
+    if source_id is None:
+        return None
+    source = state.nodes.get(source_id)
+    if source is None:
+        return None
+    if source.status is not NodeStatus.SUCCEEDED:
+        return None
+    inputs: list[tuple[str, str, str, str, int]] = []
+    for input_id, path in sorted(source.selected_inputs.items()):
+        candidates = [
+            artifact for artifact in state.artifacts.values()
+            if artifact.state == "verified" and artifact.path == path
+        ]
+        direct = state.artifacts.get(input_id)
+        if direct is not None and direct.state == "verified" and direct.path == path:
+            candidates = [direct]
+        if len(candidates) != 1:
+            return None
+        artifact = candidates[0]
+        inputs.append((input_id, artifact.path, artifact.sha256,
+                       artifact.producer_node_id, artifact.producer_attempt))
+    outputs: list[tuple[str, str, str, str, int]] = []
+    for artifact_id in sorted(source.outputs):
+        artifact = state.artifacts.get(artifact_id)
+        if (artifact is None or artifact.state != "verified"
+                or artifact.producer_node_id != source_id
+                or artifact.producer_attempt != source.attempt):
+            return None
+        outputs.append((artifact_id, artifact.path, artifact.sha256,
+                        artifact.producer_node_id, artifact.producer_attempt))
+    payload = (
+        state.run_id, gate_id, source_id, source.attempt, source.outcome,
+        inputs, outputs,
+    )
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def approval_state(plan: CompiledPlan, state: RunState, gate_id: str) -> str:
+    gate = plan.nodes.get(gate_id)
+    if gate is None or gate.approval_source is None:
+        return "waiting_source"
+    value = state.decisions.get(approval_decision_name(gate_id))
+    source = state.nodes.get(gate.approval_source)
+    # A revise decision deliberately stales the source.  Keep that user-facing
+    # state until the source is rerun; the old fingerprint must not approve the
+    # new attempt.
+    if (
+        source is not None
+        and source.status is NodeStatus.STALE
+        and isinstance(value, str)
+        and value.startswith("revise:")
+    ):
+        return "revision_requested"
+    fingerprint = approval_fingerprint(plan, state, gate_id)
+    if fingerprint is None:
+        return "waiting_source"
+    if value == "approved:" + fingerprint:
+        return "approved"
+    if value == "revise:" + fingerprint:
+        return "revision_requested"
+    return "awaiting_confirmation"
 
 
 def _producer_edges_for_input(
@@ -392,6 +473,10 @@ def refresh_ready(plan: CompiledPlan, state: RunState) -> RunState:
                 else:
                     next_status = NodeStatus.PENDING
 
+            if node.approval_source is not None and next_status is NodeStatus.READY:
+                if approval_state(plan, snapshot, node_id) != "approved":
+                    next_status = NodeStatus.PENDING
+
             updated = replace(
                 runtime,
                 status=next_status,
@@ -471,6 +556,13 @@ def _complete_control(
     edges = dict(state.edges)
     runtime = nodes[node_id]
     node = plan.nodes[node_id]
+    if node.approval_source is not None:
+        if outcome != "approved" or approval_state(plan, state, node_id) != "approved":
+            _fail(
+                "runtime.approval_required",
+                "approval gate cannot complete before the current source is approved",
+                node_id=node_id,
+            )
     outputs = runtime.selected_inputs if node.type == "join" else _string_map()
     nodes[node_id] = replace(
         runtime,
@@ -508,7 +600,8 @@ def stabilize_control_nodes(
             if runtime.status is not NodeStatus.READY or node.type not in {"condition", "join"}:
                 continue
             if node.type == "condition":
-                outcome = evaluate_condition(node.condition_cases, condition_facts(current))
+                outcome = ("approved" if node.approval_source is not None
+                           else evaluate_condition(node.condition_cases, condition_facts(current)))
             else:
                 outcome = "succeeded"
             current, transition = _complete_control(plan, current, node_id, outcome)
@@ -993,6 +1086,18 @@ def record_condition_fact_transition(
     ):
         _fail("runtime.unregistered_project_fact", "project boolean is not used by a condition in this workflow")
 
+    approval_gate = None
+    revision_requested = False
+    if decision and name.startswith(_APPROVAL_PREFIX):
+        gate_id = name[len(_APPROVAL_PREFIX):]
+        approval_gate = plan.nodes.get(gate_id)
+        if approval_gate is None or approval_gate.approval_source is None:
+            _fail("runtime.invalid_approval", "approval gate does not exist")
+        fingerprint = approval_fingerprint(plan, state, gate_id)
+        if fingerprint is None or value not in {"approved:" + fingerprint, "revise:" + fingerprint}:
+            _fail("runtime.invalid_approval", "approval does not bind the current source attempt")
+        revision_requested = value == "revise:" + fingerprint
+
     if decision:
         decisions = dict(state.decisions)
         decisions[name] = value
@@ -1019,6 +1124,10 @@ def record_condition_fact_transition(
             for case in node.condition_cases
         )
     }
+    if approval_gate is not None:
+        affected.add(gate_id)
+        if revision_requested:
+            affected.add(approval_gate.approval_source)
 
     def reads_registry_input(node_id: str, artifact_ids: set[str]) -> bool:
         return any(

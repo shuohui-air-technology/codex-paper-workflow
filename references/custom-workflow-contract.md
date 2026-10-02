@@ -27,11 +27,19 @@ activated plan, event history, and state snapshot against one another, checks
 recorded artifact hashes against project files, and verifies stored receipt
 projections against result events. A saved `workflow.json` is an editable Studio
 draft, not authority to execute a workflow. If required state cannot be
-reconciled, execution remains blocked. This release has no general-purpose
-`recover` CLI command. `deactivate` returns to Official v1.0 only when the
-manager can validate the selector and any persisted run state; a failed summary
-does not guarantee that deactivation will succeed. Preserve the evidence and
-stop for a supported recovery procedure rather than editing state files.
+reconciled, execution remains blocked. The supported recovery command is:
+
+```text
+python <orchestrator-root>/scripts/workflow_manager.py recover \
+  --project <project-root> --confirm-interrupted
+```
+
+Use it only after confirming that no task or validator from the run is still
+executing. Recovery replays and validates the durable event log, restores
+receipt projections, and marks uncertain running work as `blocked`; it never
+turns an interrupted attempt into a successful result and never starts a new
+task. A `blocked` recovery result preserves the evidence for inspection. Do not
+edit `.research/custom-workflow/` state, event, or receipt files by hand.
 
 ## Run one task node
 
@@ -41,23 +49,33 @@ For a ready custom run, follow this order:
 workflow_manager.py summary
 workflow_manager.py ready
 workflow_manager.py claim --node <node-id>
-invoke exactly the one Skill named by the returned node-invocation-v1
+invoke exactly the one Skill named by the returned node-invocation-v1 or node-invocation-v2
 workflow_manager.py submit-result --result <project-relative-result.json>
 ```
 
 `ready` is the source of eligible node IDs. Claim only nodes listed there and
-respect the manager-enforced `max_parallelism`. The manager-generated
-`node-invocation-v1` binds the workflow/run, attempt, selected Skill identity,
-declared inputs and outputs, and an attempt-bound idempotency token. For each
-claim, invoke only that Skill; do not disclose the token in reports or receipts,
-and do not invent a result or claim an output file that the Skill did not
-actually create.
+respect the manager-enforced `max_parallelism`. The manager-generated invocation
+binds the workflow/run, attempt, selected Skill
+identity, declared inputs and outputs, and an attempt-bound idempotency token.
+Newly activated plans use `node-invocation-v2`; it also names the activated
+Skill root and requires a `node-result-v2` result. For each claim, invoke only
+that Skill; do not disclose the token in reports or receipts, and do not invent
+a result or claim an output file that the Skill did not actually create.
 
-Write the actual result using the `node-result-v1` schema, then submit it. The
-manager verifies the claim, inputs, output paths and hashes, and writes the
-`stage-receipt-v2`. Do not write or edit run state, receipts, or event logs
-directly. After result submission, ask the manager for readiness again; it
-resolves eligible condition and join nodes from recorded facts and outcomes.
+Write the actual result using the schema named by the invocation. A
+`node-result-v2` task result includes `consumed_sources`, a sorted list of the
+project-relative files actually used, each with its SHA-256 hash. Every listed
+source must be one of the frozen claim inputs with the same path and hash; an
+undeclared or changed source is rejected. The manager persists that list in a
+`stage-receipt-v3`, so recovery can replay the same check. Existing v1 runs
+continue to accept `node-result-v1` and write `stage-receipt-v2`.
+
+This declared-source check records what the executor reports it read. Without
+an OS-level file-access sandbox, it cannot prove that an executor did not read
+an additional unreported file. Do not write or edit run state, receipts, or
+event logs directly. After result submission, ask the manager for readiness
+again; it resolves eligible condition and join nodes from recorded facts and
+outcomes.
 
 ## Run a validator node
 
@@ -87,6 +105,24 @@ bounded JSON values allowed by the condition contract. The manager records
 changes as events and re-evaluates dependent conditions. Repeating the same
 value is idempotent; changing a value invalidates affected downstream work and
 requires the manager to revalidate its lineage.
+
+Approval gates are condition nodes configured to wait for an explicit user
+answer. After the source stage succeeds, the manager keeps the gate waiting
+until the user accepts or requests revision. Record the answer with a JSON file
+containing `node_id`, `action` (`approve` or `revise`), and
+`provenance_summary`, then run:
+
+```text
+workflow_manager.py record-approval --approval <project-relative-approval.json>
+```
+
+The approval is bound to the source stage's attempt and output hashes. A source
+rerun, output change, or revision request invalidates the old approval. To run a
+stale source again, inspect the preserved receipt and explicitly call
+`workflow_manager.py rerun-stale --node <source-node-id>`; the manager refuses
+to reopen a closure while a descendant is running. A gate's approval edge only
+controls readiness; the original artifact edges remain responsible for passing
+files to the downstream stage.
 
 ## Failure, retry, stale work, and exit
 

@@ -47,7 +47,7 @@ class WorkflowRestartTests(unittest.TestCase):
         invocation = self.service.claim("directions")
         self.project.joinpath("idea.md").write_text("Original result.", encoding="utf-8")
         self.service.submit_result({
-            "schema_version": "node-result-v1",
+            "schema_version": "node-result-v2",
             "run_id": invocation["run_id"],
             "node_id": "directions",
             "attempt": invocation["attempt"],
@@ -56,6 +56,7 @@ class WorkflowRestartTests(unittest.TestCase):
             "outcome": "succeeded",
             "summary": "Recorded the original research idea.",
             "artifacts": [{"id": "research_idea_brief", "path": "idea.md"}],
+            "consumed_sources": [],
             "uncertainties": [],
         })
 

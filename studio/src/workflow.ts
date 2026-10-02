@@ -26,6 +26,7 @@ export type NodePropertyPatch = Partial<{
   failure_policy: WorkflowNode['failure_policy'];
   condition_cases: ConditionCase[];
   join_mode: WorkflowNode['join_mode'];
+  approval_source: string | null;
 }>;
 
 export type WorkflowSettingsPatch = Partial<{
@@ -132,6 +133,7 @@ function emptyNodeFields() {
     failure_policy: 'block' as const,
     condition_cases: [] as ConditionCase[],
     join_mode: 'all_active' as const,
+    approval_source: null,
   };
 }
 
@@ -247,13 +249,13 @@ function defaultOutputMap(source: WorkflowNode, target: WorkflowNode): Record<st
 }
 
 function triggerFor(node: WorkflowNode): string {
-  if (node.type === 'condition') return 'default';
+  if (node.type === 'condition') return node.approval_source ? 'approved' : 'default';
   if (node.type === 'validator') return 'pass';
   return 'succeeded';
 }
 
 function legalTriggers(node: WorkflowNode): string[] {
-  if (node.type === 'condition') return [...node.condition_cases.map((item) => item.outcome), 'default'];
+  if (node.type === 'condition') return node.approval_source ? ['approved'] : [...node.condition_cases.map((item) => item.outcome), 'default'];
   if (node.type === 'join') return ['succeeded'];
   if (node.type === 'task') return ['succeeded'];
   return ['pass', 'fail', 'blocked'];
@@ -367,6 +369,34 @@ function projectionNodeToWorkflowNode(node: ProjectionNode, catalog: CatalogData
   };
 }
 
+/** Add a control dependency without altering the direct artifact route. */
+export function addApprovalGate(document: WorkflowDocument, sourceId: string, targetIds: string[], label = '等待用户确认'): WorkflowDocument {
+  const source = document.nodes.find((item) => item.id === sourceId);
+  if (!source || !source.enabled || !['task', 'validator'].includes(source.type)) throw new WorkflowEditError('Choose an enabled task or validator as the approval source.');
+  const targets = [...new Set(targetIds)];
+  if (!targets.length || targets.some((target) => !document.edges.some((edge) => edge.source === sourceId && edge.target === target))) {
+    throw new WorkflowEditError('Approval targets must be direct successors of the selected stage.');
+  }
+  const id = uniqueId(`${sourceId}-approval`, new Set(document.nodes.map((item) => item.id)), 'approval');
+  const gate: WorkflowNode = {
+    ...emptyNodeFields(), id, type: 'condition', display_name: label,
+    skill_ref: null, validator_ref: null, validator_config: null,
+    approval_source: sourceId,
+  };
+  const edges = [
+    ...document.edges.map((edge) => ({ ...edge, output_map: { ...edge.output_map } })),
+    makeEdge(uniqueId(`${sourceId}-to-${id}`, new Set(document.edges.map((edge) => edge.id)), 'approval-edge'), source, gate),
+    ...targets.map((targetId, index) => makeEdge(
+      uniqueId(`${id}-to-${targetId}`, new Set(document.edges.map((edge) => edge.id)), `approval-target-${index}`),
+      gate, document.nodes.find((item) => item.id === targetId)!, 'approved', {},
+    )),
+  ];
+  const nodes = [...document.nodes.map(cloneNode), gate];
+  assertAcyclic(nodes, edges);
+  return { ...cloneWorkflowDocument(document), nodes, edges,
+    ui: { positions: { ...document.ui.positions, [id]: positionForIndex(nodes.length - 1) } } };
+}
+
 function assertAcyclic(nodes: WorkflowNode[], edges: WorkflowEdge[]): void {
   const indegree = new Map(nodes.map((node) => [node.id, 0]));
   for (const edge of edges) {
@@ -428,7 +458,7 @@ export function cloneProjection(
       return source.outputs.some((output) => (edge.output_map[output] ?? output) === input);
     });
   })))].sort();
-  return {
+  const cloned: WorkflowDocument = {
     schema_version: 'paper-workflow-custom-v1',
     workflow_id: workflowId,
     document_revision: 0,
@@ -440,6 +470,18 @@ export function cloneProjection(
     edges,
     ui: { positions: Object.fromEntries(nodes.map((_node, index) => [nodes[index]!.id, positionForIndex(index)])) },
   };
+  const checkpoints = [
+    { source: 'topic', targets: ['design'], label: '确认选题' },
+    { source: 'design', targets: ['venue-outline', 'experiments'], label: '确认研究设计' },
+    { source: 'design', targets: ['experiments'], label: '授权启动实验' },
+    { source: 'final-editorial-audit', targets: ['finalize'], label: '确认终稿交付' },
+  ].filter((item) => {
+    const source = cloned.nodes.find((node) => node.id === item.source);
+    if (!source || !source.enabled || !['task', 'validator'].includes(source.type)) return false;
+    return item.targets.every((target) => cloned.nodes.some((node) => node.id === target)
+      && cloned.edges.some((edge) => edge.source === item.source && edge.target === target));
+  });
+  return checkpoints.reduce((current, item) => addApprovalGate(current, item.source, item.targets, item.label), cloned);
 }
 
 /** Add a detached node. New enabled roots are explicitly marked as entries. */
@@ -666,7 +708,7 @@ export function updateNode(
   const current = nodeById(document, nodeId);
   const allowed = new Set([
     'display_name', 'entry', 'enabled', 'skill_ref', 'validator_ref', 'validator_config',
-    'inputs', 'outputs', 'outcomes', 'write_scopes', 'failure_policy', 'condition_cases', 'join_mode',
+    'inputs', 'outputs', 'outcomes', 'write_scopes', 'failure_policy', 'condition_cases', 'join_mode', 'approval_source',
   ]);
   if (Object.keys(patch).some((key) => !allowed.has(key))) {
     throw new WorkflowEditError('Node identity, type, and projection provenance cannot be edited.');
@@ -734,6 +776,7 @@ function semanticPayload(document: WorkflowDocument): unknown {
       failure_policy: node.failure_policy,
       condition_cases: node.condition_cases,
       join_mode: node.join_mode,
+      ...(node.approval_source ? { approval_source: node.approval_source } : {}),
     })),
     edges: [...document.edges].sort((left, right) => compareCanonicalText(left.id, right.id)).map((edge) => ({
       id: edge.id,

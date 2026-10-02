@@ -32,10 +32,11 @@ interface NodeInspectorProps {
   onDeleteNode: (nodeId: string) => void;
   onInsertBefore: (nodeId: string, type: 'task' | 'condition' | 'join' | 'validator') => void;
   onInsertAfter: (nodeId: string, type: 'task' | 'condition' | 'join' | 'validator') => void;
+  onAddApprovalGate?: (sourceId: string, targetId: string) => void;
 }
 
 function sourceTriggers(node: WorkflowNode): string[] {
-  if (node.type === 'condition') return [...node.condition_cases.map((item) => item.outcome), 'default'];
+  if (node.type === 'condition') return node.approval_source ? ['approved'] : [...node.condition_cases.map((item) => item.outcome), 'default'];
   if (node.type === 'validator') return ['pass', 'fail', 'blocked'];
   return ['succeeded'];
 }
@@ -67,6 +68,7 @@ export function NodeInspector({
   onDeleteNode,
   onInsertBefore,
   onInsertAfter,
+  onAddApprovalGate,
 }: NodeInspectorProps) {
   const artifactSuggestionId = useId();
   const workflowIdHelpId = useId();
@@ -75,8 +77,20 @@ export function NodeInspector({
   const [sourceId, setSourceId] = useState(selectedNode?.id ?? '');
   const [targetId, setTargetId] = useState('');
   const [insertType, setInsertType] = useState<'task' | 'condition' | 'join' | 'validator'>('task');
+  const [approvalTarget, setApprovalTarget] = useState('');
   const sourceNode = workflow?.nodes.find((node) => node.id === sourceId) ?? selectedNode;
   const triggers = sourceNode ? sourceTriggers(sourceNode) : [];
+  const approvalSuccessors = selectedNode && workflow
+    ? workflow.edges.filter((edge) => edge.source === selectedNode.id)
+      .map((edge) => workflow.nodes.find((node) => node.id === edge.target))
+      .filter((node): node is WorkflowNode => Boolean(node))
+      .filter((node) => !(node.type === 'condition' && node.approval_source))
+      .filter((node) => !workflow.nodes
+        .filter((gate) => gate.type === 'condition' && gate.approval_source === selectedNode.id)
+        .some((gate) => workflow.edges.some((edge) => edge.source === gate.id && edge.target === node.id)))
+    : [];
+  const selectedApprovalTarget = approvalSuccessors.some((node) => node.id === approvalTarget)
+    ? approvalTarget : approvalSuccessors[0]?.id ?? '';
   const [trigger, setTrigger] = useState(triggers[0] ?? 'succeeded');
 
   useEffect(() => {
@@ -103,8 +117,10 @@ export function NodeInspector({
   }
 
   const selectedSkill = selectedNode?.type === 'task' ? skills.find((skill) => skill.catalog_id === selectedNode.skill_ref) : undefined;
+  const isApprovalGate = selectedNode?.type === 'condition' && Boolean(selectedNode.approval_source);
   const incoming = workflow.edges.filter((edge) => edge.target === selectedNode?.id);
   const outgoing = workflow.edges.filter((edge) => edge.source === selectedNode?.id);
+  const approvalGateIds = new Set(workflow.nodes.filter((node) => node.type === 'condition' && node.approval_source).map((node) => node.id));
   const beforeReason = incoming.length === 0
     ? '前方没有连接。先添加阶段，再连接到当前阶段。'
     : incoming.length !== 1 || workflow.edges.filter((edge) => edge.source === incoming[0]?.source).length !== 1
@@ -240,7 +256,7 @@ export function NodeInspector({
               );
             })()}
 
-            <label className="check-field check-field--card"><input type="checkbox" checked={selectedNode.enabled} disabled={readOnly} onChange={(event) => updateNode({ enabled: event.target.checked })} /><span><strong>启用此阶段</strong><small>停用后仍保留在草稿中，但不会进入执行计划。</small></span></label>
+            <label className="check-field check-field--card"><input type="checkbox" checked={selectedNode.enabled} disabled={readOnly || Boolean(isApprovalGate)} onChange={(event) => updateNode({ enabled: event.target.checked })} /><span><strong>启用此阶段</strong><small>{isApprovalGate ? '确认关卡必须保持启用；如需移除，请删除整道关卡。' : '停用后仍保留在草稿中，但不会进入执行计划。'}</small></span></label>
 
             {!readOnly && <section className="inspector-stage-actions" aria-label="阶段操作">
               <div className="inspector-stage-actions__buttons">
@@ -256,13 +272,24 @@ export function NodeInspector({
               {afterReason && <p className="field__help" id="insert-after-help">{afterReason}</p>}
             </section>}
 
+            {!readOnly && (selectedNode.type === 'task' || selectedNode.type === 'validator') && approvalSuccessors.length > 0 && (
+              <div className="form-section"><div className="form-section__heading"><strong>确认关卡</strong><small>在指定后续阶段开始前，等待你在 Codex 对话中确认当前产物。</small></div>
+                <label className="field"><span className="field__label">受保护的后续阶段</span><select value={selectedApprovalTarget} onChange={(event) => setApprovalTarget(event.target.value)}>{approvalSuccessors.map((node) => <option key={node.id} value={node.id}>{node.display_name}</option>)}</select></label>
+                <button type="button" className="button button--quiet" disabled={!selectedApprovalTarget || !onAddApprovalGate} onClick={() => onAddApprovalGate?.(selectedNode.id, selectedApprovalTarget)}>添加等待确认</button>
+              </div>
+            )}
+
             {selectedNode.type === 'condition' && (
-              <div className="form-section"><div className="form-section__heading"><strong>条件分支</strong><small>通过可视化表单创建事实判断，不需要编写表达式。</small></div><ConditionCaseEditor cases={selectedNode.condition_cases} nodeIds={workflow.nodes.map((node) => node.id)} disabled={readOnly} onChange={(condition_cases: ConditionCase[]) => updateNode({ condition_cases })} /></div>
+              selectedNode.approval_source
+                ? <div className="form-section"><div className="form-section__heading"><strong>等待用户确认</strong><small>来源阶段：{workflow.nodes.find((node) => node.id === selectedNode.approval_source)?.display_name ?? selectedNode.approval_source}。未确认或退回时，后续阶段保持等待。</small></div></div>
+                : <div className="form-section"><div className="form-section__heading"><strong>条件分支</strong><small>通过可视化表单创建事实判断，不需要编写表达式。</small></div><ConditionCaseEditor cases={selectedNode.condition_cases} nodeIds={workflow.nodes.map((node) => node.id)} disabled={readOnly} onChange={(condition_cases: ConditionCase[]) => updateNode({ condition_cases })} /></div>
             )}
 
             {selectedNode.type === 'join' && <label className="field"><span className="field__label">汇合策略</span><select value={selectedNode.join_mode} disabled={readOnly} onChange={(event) => updateNode({ join_mode: event.target.value as 'all_active' | 'any_success' })}><option value="all_active">等待所有启用分支</option><option value="any_success">任一分支成功即可</option></select><small className="field__help">“任一成功”需要每条输入连线明确映射相同的输出产物。</small></label>}
 
-            {!(selectedNode.type === 'validator' && selectedNode.validator_config) && <div className="form-section">
+            {isApprovalGate
+              ? <div className="form-section"><div className="form-section__heading"><strong>产物连线保持原样</strong><small>确认关卡只控制下游何时可开始，不承载输入或输出产物。请在来源阶段查看和修改产物声明。</small></div></div>
+              : !(selectedNode.type === 'validator' && selectedNode.validator_config) && <div className="form-section">
               <div className="form-section__heading"><strong>数据与产物</strong><small>使用产物 ID 表达阶段之间交换的内容。</small></div>
               {!(selectedNode.type === 'validator' && selectedNode.validator_config) && <TagEditor label="输入产物" values={selectedNode.inputs} disabled={readOnly} help="以逗号分隔；输入需来自上游阶段或外部输入。" onChange={updateInputs} />}
               {selectedNode.type !== 'validator' && <TagEditor label="输出产物" values={selectedNode.outputs} disabled={readOnly} onChange={(outputs) => updateNode({ outputs })} />}
@@ -274,9 +301,10 @@ export function NodeInspector({
                 const from = workflow.nodes.find((item) => item.id === edge.source);
                 const to = workflow.nodes.find((item) => item.id === edge.target);
                 const targets = to ? [...new Set([...to.inputs, ...(to.type === 'join' ? to.outputs : [])])] : [];
+                const approvalEdge = approvalGateIds.has(edge.source) || approvalGateIds.has(edge.target);
                 return <li key={edge.id} className="connection-item">
-                  <div className="connection-item__header"><span><strong>{from?.display_name ?? edge.source}</strong><small>→ {to?.display_name ?? edge.target}</small></span><select aria-label={`${edge.source} 到 ${edge.target} 的触发结果`} value={edge.trigger} disabled={readOnly} onChange={(event) => onUpdateEdge(edge.id, { trigger: event.target.value })}>{[...new Set([...sourceTriggers(from ?? selectedNode), edge.trigger])].map((value) => <option key={value} value={value}>{value === 'default' ? '默认' : value}</option>)}</select><button type="button" className="icon-button" aria-label={`删除连接 ${edge.source} 到 ${edge.target}`} disabled={readOnly} onClick={() => onDisconnect(edge.id)}>×</button></div>
-                  {from && from.outputs.length > 0 && <div className="connection-item__mappings"><small>产物命名映射；保持原名时，仅由声明了同名产物的目标接收。同一连线内，每个目标产物只能对应一个来源{to?.type === 'join' && to.join_mode === 'any_success' ? '；任一成功要求每条入边覆盖全部汇合输出' : ''}。</small>{from.outputs.map((output) => <label className="connection-item__mapping" key={output}><span>{output}</span><select aria-label={`${edge.source} 到 ${edge.target}：${output} 映射到`} value={edge.output_map[output] ?? ''} disabled={readOnly} onChange={(event) => {
+                  <div className="connection-item__header"><span><strong>{from?.display_name ?? edge.source}</strong><small>→ {to?.display_name ?? edge.target}</small></span><select aria-label={`${edge.source} 到 ${edge.target} 的触发结果`} value={edge.trigger} disabled={readOnly || approvalEdge} onChange={(event) => onUpdateEdge(edge.id, { trigger: event.target.value })}>{[...new Set([...sourceTriggers(from ?? selectedNode), edge.trigger])].map((value) => <option key={value} value={value}>{value === 'default' ? '默认' : value}</option>)}</select><button type="button" className="icon-button" aria-label={`删除连接 ${edge.source} 到 ${edge.target}`} disabled={readOnly || approvalEdge} onClick={() => onDisconnect(edge.id)}>×</button></div>
+                  {from && from.outputs.length > 0 && <div className="connection-item__mappings"><small>产物命名映射；保持原名时，仅由声明了同名产物的目标接收。同一连线内，每个目标产物只能对应一个来源{to?.type === 'join' && to.join_mode === 'any_success' ? '；任一成功要求每条入边覆盖全部汇合输出' : ''}。</small>{from.outputs.map((output) => <label className="connection-item__mapping" key={output}><span>{output}</span><select aria-label={`${edge.source} 到 ${edge.target}：${output} 映射到`} value={edge.output_map[output] ?? ''} disabled={readOnly || approvalEdge} onChange={(event) => {
                     const output_map = { ...edge.output_map };
                     if (event.target.value) output_map[output] = event.target.value;
                     else delete output_map[output];
@@ -284,12 +312,12 @@ export function NodeInspector({
                   }}><option value="" disabled={targets.includes(output) && from.outputs.some((other) => other !== output && (edge.output_map[other] ?? other) === output)}>保持原名</option>{targets.map((target) => <option value={target} key={target} disabled={from.outputs.some((other) => other !== output && (edge.output_map[other] ?? other) === target)}>{target}</option>)}</select></label>)}</div>}
                 </li>;
               })}</ul> : <p className="empty-state empty-state--small">此阶段尚未连接其他阶段。</p>}
-              <div className="connection-form">
+              {!isApprovalGate && <div className="connection-form">
                 <label className="field"><span className="field__label">从阶段</span><select value={sourceId} disabled={readOnly} onChange={(event) => {setSourceId(event.target.value); const node = workflow.nodes.find((candidate) => candidate.id === event.target.value); setTrigger(node ? sourceTriggers(node)[0] ?? 'succeeded' : 'succeeded');}}>{workflow.nodes.map((node) => <option value={node.id} key={node.id}>{node.display_name}</option>)}</select></label>
                 <label className="field"><span className="field__label">触发结果</span><select value={trigger} disabled={readOnly} onChange={(event) => setTrigger(event.target.value)}>{triggers.map((item) => <option value={item} key={item}>{item === 'default' ? '默认' : item}</option>)}</select></label>
                 <label className="field"><span className="field__label">连接到</span><select value={targetId} disabled={readOnly} onChange={(event) => setTargetId(event.target.value)}><option value="">选择目标阶段</option>{workflow.nodes.filter((node) => node.id !== sourceId).map((node) => <option value={node.id} key={node.id}>{node.display_name}</option>)}</select></label>
                 <button type="button" className="button button--quiet button--small" disabled={readOnly || !sourceId || !targetId} onClick={() => {onConnect(sourceId, targetId, trigger); setTargetId('');}}>添加连接</button>
-              </div>
+              </div>}
             </section>
 
             <details className="inspector-advanced" key={selectedNode.id}>
@@ -299,10 +327,10 @@ export function NodeInspector({
                 <span className="inspector-identity__id">{selectedNode.id}</span>
                 {selectedNode.origin_projection_node_id && <span className="provenance-chip">源自官方：{selectedNode.origin_projection_node_id}</span>}
               </div>
-              <label className="check-field"><input type="checkbox" checked={selectedNode.entry} disabled={readOnly} onChange={(event) => updateNode({ entry: event.target.checked })} /><span>作为流程入口</span></label>
+              <label className="check-field"><input type="checkbox" checked={selectedNode.entry} disabled={readOnly || Boolean(isApprovalGate)} onChange={(event) => updateNode({ entry: event.target.checked })} /><span>作为流程入口</span></label>
               {selectedNode.type !== 'condition' && selectedNode.type !== 'join' && <label className="field"><span className="field__label">失败时</span><select value={selectedNode.failure_policy} disabled={readOnly} onChange={(event) => updateNode({ failure_policy: event.target.value as 'block' | 'skip_branch' })}><option value="block">阻止后续流程</option><option value="skip_branch">跳过当前分支</option></select></label>}
               {selectedNode.type === 'task' && <TagEditor label="任务结果" values={selectedNode.outcomes} disabled={readOnly} help="结果会写入运行记录；只有 succeeded 会触发任务的下游连线。" onChange={(outcomes) => updateNode({ outcomes })} />}
-              <TagEditor label="写入范围" values={selectedNode.write_scopes} disabled={readOnly} help="并行阶段不能同时修改重叠范围。" onChange={(write_scopes) => updateNode({ write_scopes })} />
+              <TagEditor label="写入范围" values={selectedNode.write_scopes} disabled={readOnly || Boolean(isApprovalGate)} help={isApprovalGate ? '确认关卡不写入产物或共享状态。' : '并行阶段不能同时修改重叠范围。'} onChange={(write_scopes) => updateNode({ write_scopes })} />
               {!readOnly && <section className="layout-controls" aria-labelledby="layout-controls-title">
                 <div className="form-section__heading"><strong id="layout-controls-title">画布位置</strong><small>每次移动 40 像素。</small></div>
                 <div className="layout-controls__grid" role="group" aria-label="键盘调整阶段布局">

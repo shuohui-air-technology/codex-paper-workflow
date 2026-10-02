@@ -201,6 +201,30 @@ describe('workflow graph operations', () => {
     expect(data.projection.projection_notes).toHaveLength(1);
   });
 
+  it('adds both design checkpoints when the official successors share an edge', () => {
+    const data = projectionFixture();
+    const checkpointNodes = [
+      projectionNode('topic', 'task'),
+      projectionNode('design', 'task'),
+      projectionNode('venue-outline', 'task'),
+      projectionNode('experiments', 'task'),
+      projectionNode('final-editorial-audit', 'task'),
+      projectionNode('finalize', 'delivery'),
+    ];
+    data.projection.nodes.push(...checkpointNodes);
+    data.projection.edges.push(
+      { id: 'topic-to-design', source: 'topic', target: 'design', projection_note: '' },
+      { id: 'design-to-venue-outline', source: 'design', target: 'venue-outline', projection_note: '' },
+      { id: 'design-to-experiments', source: 'design', target: 'experiments', projection_note: '' },
+      { id: 'final-audit-to-finalize', source: 'final-editorial-audit', target: 'finalize', projection_note: '' },
+    );
+    const draft = cloneProjection(data, catalog, 'checkpoint-flow');
+    const approvalGates = draft.nodes.filter((node) => node.approval_source);
+    expect(approvalGates).toHaveLength(4);
+    expect(approvalGates.filter((node) => node.approval_source === 'design')).toHaveLength(2);
+    expect(draft.edges.filter((edge) => edge.source === 'design')).toHaveLength(4);
+  });
+
   it('adds and duplicates nodes immutably without copying projection authority or edges', () => {
     const original = linearDocument();
     const added = addNode(original, taskNode('third'), { x: 700, y: 180 });

@@ -71,11 +71,11 @@ class ArtifactManagerTests(unittest.TestCase):
         workflow.activate(document, acknowledged_warning_codes=validated["required_warning_codes"])
         invocation = workflow.claim(node["id"])
         workflow.submit_result({
-            "schema_version": "node-result-v1", "run_id": invocation["run_id"],
+            "schema_version": "node-result-v2", "run_id": invocation["run_id"],
             "node_id": invocation["node_id"], "attempt": invocation["attempt"],
             "idempotency_token": invocation["idempotency_token"],
             "status": "succeeded", "outcome": "succeeded", "summary": "A checked draft was produced.",
-            "artifacts": [{"id": "draft", "path": "work/paper.md"}], "uncertainties": [],
+            "artifacts": [{"id": "draft", "path": "work/paper.md"}], "uncertainties": [], "consumed_sources": [],
         })
         return workflow
 

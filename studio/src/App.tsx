@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { Connection, Edge } from '@xyflow/react';
 import { ApiClient, ApiClientError, consumeSessionToken } from './api';
 import {
+  addApprovalGate,
   addNode,
   applyWorkflowEdit,
   cloneProjection,
@@ -152,6 +153,7 @@ export function App({ api: providedApi }: AppProps) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
+  const [refreshingStatus, setRefreshingStatus] = useState(false);
   const [actionMessage, setActionMessage] = useState('');
   const [loadError, setLoadError] = useState<WorkflowIssue | null>(null);
   const [activationPreview, setActivationPreview] = useState<ActivationPreview | null>(null);
@@ -315,7 +317,7 @@ export function App({ api: providedApi }: AppProps) {
   function connect(source: string, target: string, trigger?: string) {
     if (!editor) return;
     const sourceNode = editor.document.nodes.find((node) => node.id === source);
-    const actualTrigger = trigger ?? (sourceNode?.type === 'condition' ? 'default' : sourceNode?.type === 'validator' ? 'pass' : 'succeeded');
+    const actualTrigger = trigger ?? (sourceNode?.type === 'condition' ? (sourceNode.approval_source ? 'approved' : 'default') : sourceNode?.type === 'validator' ? 'pass' : 'succeeded');
     performEdit((document) => connectNodes(document, source, target, actualTrigger));
   }
 
@@ -496,6 +498,22 @@ export function App({ api: providedApi }: AppProps) {
     } finally { setRefreshingCatalog(false); setBusy(false); }
   }
 
+  async function refreshRuntimeStatus() {
+    if (!api || refreshingStatus) return;
+    setRefreshingStatus(true);
+    try {
+      const result = await api.getBootstrap();
+      if (!result.data) throw new Error('服务器没有返回最新运行状态。');
+      api.setCsrfToken(result.data.csrf_token);
+      setBootstrap(result.data);
+      setActionMessage('运行状态和确认关卡已刷新；当前草稿内容保持不变。');
+    } catch (error) {
+      setActionMessage(safeErrorMessage(error));
+    } finally {
+      setRefreshingStatus(false);
+    }
+  }
+
   async function save() {
     if (!api || !editor || !bootstrap || busy || revisionConflict) return;
     setBusy(true);
@@ -613,7 +631,7 @@ export function App({ api: providedApi }: AppProps) {
     document.querySelector<HTMLElement>('.inspector-panel')?.scrollIntoView({ block: 'nearest' });
   }, [focusRequest]);
 
-  const handoffPrompt = '使用 paper-workflow-orchestrator 继续我在这个项目中已启用的自定义工作流。先检查当前模式和可执行阶段，告诉我下一阶段需要提供什么，再引导我按流程推进。';
+  const handoffPrompt = `使用 paper-workflow-orchestrator 继续项目“${bootstrap?.project_label ?? ''}”（项目路径：${bootstrap?.project_root ?? '由当前 Codex 项目上下文确定'}）中已启用的自定义工作流“${bootstrap?.active_workflow?.workflow_id ?? ''}”（运行 ${bootstrap?.active_workflow?.run_id ?? ''}）。先检查当前模式、等待确认的关卡和可执行阶段，告诉我下一阶段需要提供什么；确认关卡必须展示对应产物并取得我的明确答复后再记录。`;
 
   async function copyHandoff() {
     try {
@@ -656,6 +674,7 @@ export function App({ api: providedApi }: AppProps) {
       </div>}
       <WorkflowGuide editable={editable} active={bootstrap.mode === 'custom'} dirty={dirty} checked={lastValidation !== null && errors.length === 0} hintCount={advisoryHints.length} />
       {bootstrap.mode === 'custom' && <details className="handoff-panel" open><summary>下一步：回到 Codex 执行流程</summary><div><p>{handoffPrompt}</p><button type="button" className="button button--quiet" onClick={() => void copyHandoff()}>{handoffCopied ? '提示词已复制' : '复制继续执行提示词'}</button></div></details>}
+      {bootstrap.mode === 'custom' && (bootstrap.approvals ?? []).some((item) => item.state === 'awaiting_confirmation' || item.state === 'revision_requested') && <div className="active-workflow-banner" role="status">等待确认：{(bootstrap.approvals ?? []).filter((item) => item.state === 'awaiting_confirmation' || item.state === 'revision_requested').map((item) => `${item.node_id}（${item.state === 'revision_requested' ? '退回修改' : '待确认'}）`).join('、')}。回到 Codex 对话处理后刷新本页查看最新状态。<button type="button" className="text-button" disabled={refreshingStatus} onClick={() => void refreshRuntimeStatus()}>{refreshingStatus ? '刷新中…' : '刷新等待状态'}</button></div>}
       {revisionConflict && <div className="conflict-banner" role="status">
         <span>服务器中的流程版本或检查结果已变化。当前本地草稿仍保留，但保存与启用已锁定。</span>
         <button type="button" className="text-button" onClick={() => setConflictDialogOpen(true)}>处理版本冲突</button>
@@ -716,6 +735,7 @@ export function App({ api: providedApi }: AppProps) {
           onDeleteNode={(nodeId) => { if (performEdit((document) => deleteNode(document, nodeId))) setSelectedNodeId(null); }}
           onInsertBefore={(nodeId, type) => insertWorkflowNode(nodeId, type, 'before')}
           onInsertAfter={(nodeId, type) => insertWorkflowNode(nodeId, type, 'after')}
+          onAddApprovalGate={(sourceId, targetId) => { if (performEdit((document) => addApprovalGate(document, sourceId, [targetId]))) setActionMessage('已添加等待确认关卡；产物连线保持原样。'); }}
         />
       </div>
       {errors.length > 0 && <div className="screen-reader-only" role="alert">{errors[0]?.message}</div>}
