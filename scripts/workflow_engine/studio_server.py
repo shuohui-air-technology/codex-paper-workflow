@@ -26,7 +26,7 @@ from .catalog import (
     load_install_receipts,
     load_validator_registry,
 )
-from .schema import WorkflowError, WorkflowIssue, validator_form_metadata
+from .schema import WorkflowError, WorkflowIssue, document_data, parse_workflow, validator_form_metadata
 from .store import StoreError
 from .validators import ValidatorError
 from .fs import PathSafetyError, reject_duplicate_pairs, reject_nonfinite_constant
@@ -471,6 +471,12 @@ class StudioApplication:
                     "document_revision": 0 if draft is None else draft["document_revision"],
                 }
                 return 200, envelope(status="pass", data=data), False
+            if method == "GET" and path == "/api/templates/reference-led-figure":
+                template = parse_workflow(json.loads((_ROOT / "references" / "workflows" /
+                                           "reference-led-figure.custom.json").read_text(encoding="utf-8")))
+                return 200, envelope(status="pass", data={
+                    "workflow": document_data(template), "document_revision": 0,
+                }), False
             if method == "POST" and path == "/api/validate":
                 request = self._require_keys(body, {"workflow"}, "validate")
                 result = self.service.validate_document(request["workflow"])
@@ -635,6 +641,7 @@ class StudioApplication:
                 ), True
             known_paths = {
                 "/api/bootstrap", "/api/catalog", "/api/projection", "/api/workflow",
+                "/api/templates/reference-led-figure",
                 "/api/validate", "/api/compile", "/api/activate", "/api/deactivate",
                 "/api/shutdown",
             }

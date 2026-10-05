@@ -1,0 +1,4 @@
+interface:
+  display_name: "先参考后绘制科研配图"
+  short_description: "复用或检索已发表配图，查看并提取设计关系，绘制后对照修正"
+  default_prompt: "使用 $reference-first-figures，先核对并复用适用的已有论文参考，缺少时检索并实际看图，再从真实材料绘制、对照和修改。"

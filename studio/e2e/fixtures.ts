@@ -95,14 +95,15 @@ export const test = base.extend<{ studio: StudioSession }>({
     const projectRoot = join(tempRoot, 'paper-project');
     const skillsRoot = join(tempRoot, 'installed-skills');
     const codexHome = join(tempRoot, 'isolated-codex-home');
-    const testSkillId = 'research-skill-router';
     mkdirSync(projectRoot);
     mkdirSync(codexHome);
-    cpSync(
-      join(REPOSITORY_ROOT, 'companion-skills', testSkillId),
-      join(skillsRoot, testSkillId),
-      { recursive: true },
-    );
+    for (const skillId of ['research-skill-router', 'reference-first-figures', 'nature-figure']) {
+      cpSync(
+        join(REPOSITORY_ROOT, 'companion-skills', skillId),
+        join(skillsRoot, skillId),
+        { recursive: true },
+      );
+    }
 
     const launcher = join(REPOSITORY_ROOT, 'scripts', 'workflow_studio.py');
     const child = spawn(process.env.PYTHON ?? 'python3', [

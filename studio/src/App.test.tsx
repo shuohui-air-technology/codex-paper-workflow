@@ -89,6 +89,9 @@ function makeApi(options: {
     } : null })),
     getCatalog: vi.fn().mockResolvedValue(envelope(catalog)),
     getProjection: vi.fn().mockResolvedValue(envelope(projection)),
+    getFigureTemplate: vi.fn().mockResolvedValue(envelope({
+      workflow: createBlankWorkflow('reference-led-figure'), document_revision: 0,
+    })),
     getWorkflow: vi.fn().mockResolvedValue(envelope(workflowData)),
     validateWorkflow: vi.fn().mockImplementation(async (workflow: WorkflowDocument) => options.validateResult ?? envelope({
       document_sha256: 'd'.repeat(64),
@@ -118,6 +121,20 @@ function makeApi(options: {
 }
 
 describe('Workflow Studio app', () => {
+  it('loads the figure template only as a browser draft and protects unsaved work', async () => {
+    const api = makeApi();
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole('button', { name: '参考优先绘图模板' }));
+    expect(await screen.findByText(/参考优先绘图模板已载入/)).toBeInTheDocument();
+    expect(screen.getByText('正在编辑自定义草稿')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '参考优先绘图模板' })).toBeDisabled();
+    expect(api.getFigureTemplate).toHaveBeenCalledOnce();
+    expect(api.saveWorkflow).not.toHaveBeenCalled();
+    expect(api.activateWorkflow).not.toHaveBeenCalled();
+    expect(screen.getByText('官方流程 v1.0')).toBeInTheDocument();
+  });
+
   it('saves the workflow identifier entered immediately before clicking save', async () => {
     const api = makeApi();
     const user = userEvent.setup();

@@ -149,6 +149,7 @@ Each entry below describes a different user-visible job rather than repeating on
 | Check whether an experiment is ready to run | An experiment contract validator checks the question, resources, evaluation plan, and stopping conditions before execution | `scripts/experiment_contract_validator.py` |
 | Check a manuscript's shape before deeper review | A section validator parses Markdown headings and code fences, then reports missing or misplaced sections | `scripts/paper_section_validator.py`, `references/paper-section-contract.md` |
 | Keep a scientific figure tied to its evidence | A figure contract records data sources, claim links, relationships, and image metadata, then produces a fail-closed receipt | `scripts/figure_contract_validator.py`, `references/scientific-visualization-integration.md` |
+| Turn inspected paper figures into an actionable design | `reference-first-figures` transfers design relationships and compares actual exports; `nature-figure` implements applicable Python/R panels | `companion-skills/reference-first-figures/`, `companion-skills/nature-figure/` |
 | Review claims and revise a paper | Integrity checks cover citations, numbers, claims, and reproducibility; the review stage turns findings into a substantive revision plan | `SKILL.md`, `references/stage-contracts.md` |
 | Edit a stable manuscript without losing protected content | The bundled Final Editor applies manuscript-wide editorial rules and verifies the protected-content receipt | `companion-skills/academic-manuscript-final-editor/` |
 | Improve mechanical prose after the science is settled | Humanizer Preflight compares the candidate against protected content and records the content-difference evidence | `scripts/humanizer_preflight.py`, `references/humanizer-adapter.md` |
@@ -213,6 +214,8 @@ python3 scripts/install_workflow.py --profile full
 | `standard` | `core` plus research, writing, review, prose-naturalization, and scientific-visualization skills | Most paper projects |
 | `full` | `standard` plus autonomous experimentation and ARA review | Projects with a confirmed experiment contract and advanced review requirements |
 
+`standard` and `full` include both figure Skills independently. Use `reference-first-figures` for new/reference-led designs, and `nature-figure` for applicable Python/R implementation, statistics and export QA. Preserve the chosen backend and approved design; small corrections retain the current tool. Plotting runtimes are prepared separately from Skill installation.
+
 Common commands:
 
 ```bash
@@ -236,6 +239,8 @@ The `core` profile supports offline installation. The `standard` and `full` prof
 The scientific-figure workflow uses Python 3.11+, `uv`, and the plotting libraries selected for the task. Configure that Python runtime after installing the skills.
 
 ## Custom workflow editor
+
+Studio includes a reference-led figure template: design, drawing, human confirmation, visual comparison and validation. See the [template guide (Chinese)](docs/workflow-studio-guide.md#参考优先绘图流程). GIS/native-vector work retains its existing tools; mixed figures can hand only named quantitative panels to `nature-figure`.
 
 The official v1.0 workflow remains the default and is ready to use after installation. Advanced users who want to arrange their own stages can open the visual editor from a paper-project directory. The [Workflow Studio guide (Chinese)](docs/workflow-studio-guide.md) walks through a three-stage workflow: organize literature, draft an introduction, and review the draft.
 
@@ -400,6 +405,8 @@ paper-workflow-orchestrator/
 ├── tests/                                 # Workflow and installer tests
 └── companion-skills/
     ├── research-skill-router/             # Research-task routing entry point
+    ├── reference-first-figures/           # Reference-led design and visual comparison
+    ├── nature-figure/                    # Python/R figure implementation and export checks
     └── academic-manuscript-final-editor/  # Final editing
 ```
 

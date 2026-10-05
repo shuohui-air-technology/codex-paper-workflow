@@ -131,6 +131,16 @@ class WorkflowStudioServerTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(data["errors"][0]["code"], "http.invalid_session")
 
+    def test_figure_template_is_read_only_and_uses_separate_skill_nodes(self):
+        status, data, _ = self.request("GET", "/api/templates/reference-led-figure")
+        self.assertEqual(status, 200)
+        self.assertFalse(data["wrote_files"])
+        nodes = {node["id"]: node for node in data["data"]["workflow"]["nodes"]}
+        self.assertEqual(nodes["reference-design"]["skill_ref"], "reference-first-figures")
+        self.assertEqual(nodes["figure-implementation"]["skill_ref"], "nature-figure")
+        self.assertEqual(nodes["figure-approval"]["approval_source"], "figure-implementation")
+        self.assertFalse((self.project / ".research/custom-workflow/workflow.json").exists())
+
     def test_non_ascii_session_and_csrf_headers_return_bounded_errors(self):
         status, data, _ = self.request(
             "GET", "/api/bootstrap", headers={"Authorization": "Bearer \u00e9" * 32}
