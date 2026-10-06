@@ -85,9 +85,9 @@ class ReceiptAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             spec = fixture(root)
-            (root / "spec.json").write_text(json.dumps(spec))
+            (root / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
             result = subprocess.run([sys.executable, str(ROOT / "scripts/build_figure_receipt.py"),
-                "--project-root", str(root), "--spec", "spec.json"], capture_output=True, text=True)
+                "--project-root", str(root), "--spec", "spec.json"], capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertEqual(json.loads(result.stdout)["status"], "pass")
             self.assertFalse((root / ".research/figures/F001/figure_receipt.json").exists())
@@ -107,9 +107,9 @@ class ReceiptAdapterTests(unittest.TestCase):
                 with self.subTest(kind="number" if spec is numeric else "nesting"):
                     with self.assertRaises(FigureReceiptError):
                         build_receipt(spec, root)
-                    (root / "spec.json").write_text(json.dumps(spec))
+                    (root / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
                     result = subprocess.run([sys.executable, str(ROOT / "scripts/build_figure_receipt.py"),
-                        "--project-root", str(root), "--spec", "spec.json"], capture_output=True, text=True)
+                        "--project-root", str(root), "--spec", "spec.json"], capture_output=True, text=True, encoding="utf-8")
                     self.assertEqual(result.returncode, 1)
                     self.assertEqual(json.loads(result.stdout)["status"], "blocked")
                     self.assertNotIn("Traceback", result.stderr + result.stdout)
@@ -125,7 +125,7 @@ class FigureSkillDistributionTests(unittest.TestCase):
             folder = ROOT / "companion-skills" / name
             self.assertTrue((folder / "LICENSE").is_file())
             for file in folder.rglob("*.md"):
-                text = file.read_text()
+                text = file.read_text(encoding="utf-8")
                 self.assertNotIn("/Users/", text)
                 for link in re.findall(r"\]\(([^)]+)\)", text):
                     if "://" in link or link.startswith("#"):
@@ -154,7 +154,7 @@ class FigureSkillDistributionTests(unittest.TestCase):
             self.assertTrue(all(catalog.skills[name].locked for name in NAMES))
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(root / "empty-codex")}):
                 service = WorkflowService(project)
-                workflow = json.loads((ROOT / "references/workflows/reference-led-figure.custom.json").read_text())
+                workflow = json.loads((ROOT / "references/workflows/reference-led-figure.custom.json").read_text(encoding="utf-8"))
                 validation = service.validate_document(workflow)
                 self.assertEqual(validation["status"], "pass", validation)
                 self.assertNotIn("risk.control_removed.figure", validation["required_warning_codes"])
@@ -163,12 +163,12 @@ class FigureSkillDistributionTests(unittest.TestCase):
                 spec = fixture(project)
                 (project / "initial-spec.json").write_text(json.dumps(spec))
                 builder = subprocess.run([sys.executable, str(installed / "scripts/build_figure_receipt.py"),
-                    "--project-root", str(project), "--spec", "initial-spec.json"], capture_output=True, text=True)
+                    "--project-root", str(project), "--spec", "initial-spec.json"], capture_output=True, text=True, encoding="utf-8")
                 self.assertEqual(builder.returncode, 0, builder.stdout + builder.stderr)
                 self.assertEqual(json.loads(builder.stdout)["status"], "pass")
                 inputs = {"figure_plan": ".research/figure_plan.yml", "claim_evidence_matrix": ".research/claim_evidence_matrix.yml",
                           "source_data": "data.csv", "reference_image": "figure.png", "reference_notes": "references.md"}
-                (project / "references.md").write_text("Synthetic test reference; backend Python; 89 mm.")
+                (project / "references.md").write_text("Synthetic test reference; backend Python; 89 mm.", encoding="utf-8")
                 for key, path in inputs.items():
                     service.register_artifact(key, path, "Synthetic integration fixture.")
 
@@ -183,23 +183,23 @@ class FigureSkillDistributionTests(unittest.TestCase):
                         "consumed_sources": [{k: source[k] for k in ("id", "path", "sha256")}
                                              for source in invocation["input_artifacts"]]})
 
-                (project / "design.md").write_text("Read-only synthetic design record; Python, 89 mm.")
+                (project / "design.md").write_text("Read-only synthetic design record; Python, 89 mm.", encoding="utf-8")
                 submit("reference-design", {"design_notes": "design.md"})
-                (project / "qa-spec.json").write_text(json.dumps(spec))
+                (project / "qa-spec.json").write_text(json.dumps(spec), encoding="utf-8")
                 submit("figure-implementation", {"plot_code": "figure.py", "figure_vector": "figure.pdf",
                       "figure_preview": "figure-preview.png", "qa_spec": "qa-spec.json"})
                 self.assertEqual(service.ready()["ready"], [])
                 gate = next(x for x in service.summary()["nodes"] if x["node_id"] == "figure-approval")
                 self.assertEqual(gate["approval_state"], "awaiting_confirmation")
-                (project / "human-review.json").write_text(json.dumps(spec["visual_review"]))
+                (project / "human-review.json").write_text(json.dumps(spec["visual_review"]), encoding="utf-8")
                 service.register_artifact("human_review", "human-review.json", "Synthetic human-review fixture, not real publication acceptance.")
                 service.record_approval("figure-approval", "approve", "Synthetic test approval.")
                 self.assertEqual(service.ready()["ready"][0]["node_id"], "reference-review")
                 receipt = build_receipt(spec, project)
                 receipt_path = project / ".research/figures/F001/figure_receipt.json"
                 receipt_path.parent.mkdir(parents=True)
-                receipt_path.write_text(json.dumps(receipt))
-                (project / "review.md").write_text("Synthetic review; same design record, frozen files.")
+                receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                (project / "review.md").write_text("Synthetic review; same design record, frozen files.", encoding="utf-8")
                 stage = submit("reference-review", {"review_notes": "review.md", "figure_receipt": ".research/figures/F001/figure_receipt.json"})
                 self.assertEqual(stage["schema_version"], "stage-receipt-v3")
                 validator = service.run_validator("figure-check")
