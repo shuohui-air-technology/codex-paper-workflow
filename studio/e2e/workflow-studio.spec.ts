@@ -1,5 +1,21 @@
 import { test, expect } from './fixtures';
 
+test('figure template loads from the packaged API without switching or saving the default workflow', async ({ studio }, testInfo) => {
+  const { page } = studio;
+  await page.getByRole('button', { name: '参考优先绘图模板' }).click();
+  await expect(page.getByText(/参考优先绘图模板已载入/)).toBeVisible();
+  await expect(page.getByText('5 阶段')).toBeVisible();
+  await expect(page.getByText('官方流程 v1.0')).toBeVisible();
+  await expect(page.getByText('正在编辑自定义草稿')).toBeVisible();
+  await expect(page.getByLabel('主要 Skill')).toHaveValue('reference-first-figures');
+  await expect(page.getByLabel('主要 Skill').getByRole('option', { selected: true })).not.toContainText('缺失');
+  await expect(page.getByRole('button', { name: '参考优先绘图模板' })).toBeDisabled();
+  await page.screenshot({ path: testInfo.outputPath('figure-template.png'), fullPage: true, animations: 'disabled' });
+  await page.reload();
+  await expect(page.getByText('只读预览')).toBeVisible();
+  await expect(page.getByText('检测到已保存的自定义草稿；默认官方流程仍处于启用状态。')).not.toBeVisible();
+});
+
 test('official preview, keyboard-authored workflow, validation, activation, and return to official mode', async ({ studio }, testInfo) => {
   const { page } = studio;
   await expect(page.getByText('官方流程 v1.0')).toBeVisible();

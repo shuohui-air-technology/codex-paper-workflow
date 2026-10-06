@@ -42,6 +42,21 @@ with `progress_manager.py update-snapshot` for bounded, transactional field
 updates. Read historical progress events and artifact versions only when the
 current snapshot, active rules, or selected task require them.
 
+## Optional reference-led figure workflow
+
+For a requested new or substantially redesigned figure, use
+`reference-first-figures` for inspected references and design transfer. Use
+`nature-figure` for the applicable Python/R implementation when that route is
+selected. Retain the chosen backend and approved design, and reuse one working
+record. Local label/spacing fixes use the current tool directly.
+
+Read [reference-led-figures.md](references/reference-led-figures.md) for this
+optional subflow, explicit custom nodes, input declarations, and figure-receipt
+adaptation. In custom mode, each claimed task invokes its fixed primary Skill;
+an internal request to invoke another Skill becomes a separately configured
+node. The default Official v1.0 figure route remains the contract below; select
+the optional route explicitly in Studio or use the narrow figure Skills directly.
+
 <!-- OFFICIAL-V1-CONTRACT:BEGIN -->
 # Paper Workflow Orchestrator
 

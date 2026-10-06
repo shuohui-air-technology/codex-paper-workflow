@@ -295,6 +295,20 @@ export function App({ api: providedApi }: AppProps) {
     setActionMessage('已载入已保存的自定义草稿。官方流程仍保持原样。');
   }
 
+  async function openFigureTemplate() {
+    if (!api || busy || dirty || revisionConflict) return;
+    setBusy(true);
+    try {
+      const result = await api.getFigureTemplate();
+      if (!result.data?.workflow) throw new Error('未能读取绘图模板。');
+      startEditing({ ...result.data.workflow,
+        workflow_id: `reference-led-${slug(bootstrap?.project_label ?? 'figure')}` });
+      setActionMessage('参考优先绘图模板已载入。请核对阶段、参考材料和已选 Python/R 后端，再验证并启用。');
+    } catch (error) {
+      setActionMessage(safeErrorMessage(error));
+    } finally { setBusy(false); }
+  }
+
   function addWorkflowNode(type: WorkflowNodeType, skillRef?: string) {
     if (!editor) return;
     const id = nextNodeId(editor.document);
@@ -673,6 +687,7 @@ export function App({ api: providedApi }: AppProps) {
         <span>修改只影响草稿；保存不会改变当前运行版本。</span>
       </div>}
       <WorkflowGuide editable={editable} active={bootstrap.mode === 'custom'} dirty={dirty} checked={lastValidation !== null && errors.length === 0} hintCount={advisoryHints.length} />
+      <div className="saved-draft-banner"><span>从示例开始：参考设计 → Python/R 绘制 → 人工确认 → 视觉复核 → 图件验收。</span><button type="button" className="text-button" disabled={busy || dirty || revisionConflict} title={dirty ? '先保存当前草稿，再载入模板。' : '载入可编辑绘图草稿'} onClick={() => void openFigureTemplate()}>参考优先绘图模板</button></div>
       {bootstrap.mode === 'custom' && <details className="handoff-panel" open><summary>下一步：回到 Codex 执行流程</summary><div><p>{handoffPrompt}</p><button type="button" className="button button--quiet" onClick={() => void copyHandoff()}>{handoffCopied ? '提示词已复制' : '复制继续执行提示词'}</button></div></details>}
       {bootstrap.mode === 'custom' && (bootstrap.approvals ?? []).some((item) => item.state === 'awaiting_confirmation' || item.state === 'revision_requested') && <div className="active-workflow-banner" role="status">等待确认：{(bootstrap.approvals ?? []).filter((item) => item.state === 'awaiting_confirmation' || item.state === 'revision_requested').map((item) => `${item.node_id}（${item.state === 'revision_requested' ? '退回修改' : '待确认'}）`).join('、')}。回到 Codex 对话处理后刷新本页查看最新状态。<button type="button" className="text-button" disabled={refreshingStatus} onClick={() => void refreshRuntimeStatus()}>{refreshingStatus ? '刷新中…' : '刷新等待状态'}</button></div>}
       {revisionConflict && <div className="conflict-banner" role="status">

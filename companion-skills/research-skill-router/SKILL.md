@@ -23,6 +23,8 @@ Route the task before doing substantive work. Use the smallest useful skill set:
 | Scientifically stable manuscript; apply author feedback across the full draft, learn scoped author rules, or synchronize bilingual final versions | `academic-manuscript-final-editor` |
 | Generic AI-pattern or mechanical-prose cleanup after scientific content is frozen | `humanizer` |
 | Claim-bearing scientific figures or figure audit after inputs are frozen | `scientific-visualization` |
+| New scientific figure or substantive redesign requiring inspected published references | `reference-first-figures` |
+| Python/R manuscript figure implementation, statistics or export QA with an established design | `nature-figure` |
 | Explicit end-to-end gated paper workflow, progress memory, AI handoff, or workflow audit | `paper-workflow-orchestrator` |
 | General research-to-paper, systematic review, citation, or manuscript workflow | `academic-paper` (the `academic-research-suite` compatibility alias) |
 | Review an Agent-Native Research Artifact after structural validation | `ara-rigor-reviewer` |
@@ -53,6 +55,15 @@ Route the task before doing substantive work. Use the smallest useful skill set:
 - Keep `autoresearch` dormant unless the user explicitly asks for autonomous, iterative experimentation and the orchestrator has recorded a complete, user-confirmed bounded contract with `validation_status: pass`, `approved_by: orchestrator`, `user_confirmation: recorded`, `report_destination: local-only`, and a stage receipt. Invoke it only through the orchestrator's bounded local wrapper; never infer permission for indefinite loops, background operation, cron, external reports, or unattended changes.
 
 ## Output contract
+
+For figure tasks, pick the most specific route: a small correction retains the
+current tool; new/reference-led design uses `reference-first-figures`; a ready
+Python/R implementation uses `nature-figure`; general scientific visualization
+uses `scientific-visualization`. These are alternative primary implementations,
+not parallel reviews. A named handoff shares the established design, backend,
+source data and QA trail. GIS/native-vector work keeps its current tools; mixed
+figures may hand only named quantitative panels to `nature-figure`. Inside a
+custom workflow, route a different Skill through its own configured node.
 
 Before acting, provide:
 

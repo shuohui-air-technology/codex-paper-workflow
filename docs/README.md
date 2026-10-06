@@ -37,6 +37,8 @@
 - [已确认产物的生命周期与请求格式](../references/confirmed-artifacts.md)
 - [论文章节规则](../references/paper-section-contract.md)
 - [科研图件集成](../references/scientific-visualization-integration.md)
+- [参考优先绘图接续](../references/reference-led-figures.md)
+- [两份绘图 Skill 的分发范围](figure-skill-distribution.md)
 - [终稿编辑集成](../references/final-editor-integration.md)
 - [语言自然化集成](../references/humanizer-adapter.md)
 
