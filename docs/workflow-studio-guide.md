@@ -146,7 +146,7 @@ Codex 展示实际导出与你核对；你批准后登记 `human_review` 并记�
 `figure_receipt`。需要重画则退回并重开 `figure-implementation`，不在
 已领取的复核节点里临时调用绘图 Skill。最后由管理器运行验证器。
 
-R 图遇到缺少 R/包时报告具体缺口，保留 R 脚本候选。GIS、draw.io
+GIS、draw.io
 纯示意图使用各自原生编辑与验收；混合图可将这个模板限定为统计面板，
 整图装配另行记录。完整字段和命令见[接续合同](../references/reference-led-figures.md)。
 
