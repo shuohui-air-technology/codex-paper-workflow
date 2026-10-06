@@ -149,6 +149,7 @@ flowchart TD
 | 判断实验是否已经具备启动条件 | 实验合同验证目标、资源、评估方案和停止条件，再交给后续执行 | `scripts/experiment_contract_validator.py` |
 | 在深入审查前检查论文结构 | 章节验证器解析 Markdown 标题和代码围栏，报告缺失、重复或顺序不当的章节 | `scripts/paper_section_validator.py`、`references/paper-section-contract.md` |
 | 让科研图件与证据保持绑定 | 图件合同记录数据来源、主张关系、结构关系和图片元数据，形成失败即阻断的回执 | `scripts/figure_contract_validator.py`、`references/scientific-visualization-integration.md` |
+| 从论文参考图形成可执行设计 | `reference-first-figures` 实际看图、提取关系，并对照真实导出修订；适用的 Python/R 面板交给 `nature-figure` 实现 | `companion-skills/reference-first-figures/`、`companion-skills/nature-figure/` |
 | 处理引用、数字和主张问题 | 完整性检查与同行评审模拟把发现转成可执行的实质修订计划 | `SKILL.md`、`references/stage-contracts.md` |
 | 在不破坏受保护内容的前提下统一终稿 | 内置 Final Editor 扫描全文、维护编辑规则，并校验受保护内容回执 | `companion-skills/academic-manuscript-final-editor/` |
 | 科学内容稳定后再改善机械化表达 | Humanizer Preflight 对照受保护内容检查差异，并保存内容变化证据 | `scripts/humanizer_preflight.py`、`references/humanizer-adapter.md` |
@@ -213,6 +214,8 @@ python3 scripts/install_workflow.py --profile full
 | `standard` | `core` 加上研究、写作、审稿、语言自然化和科研绘图能力 | 大多数论文项目 |
 | `full` | `standard` 加上自主实验与 ARA 审查能力 | 已明确实验合同与高级审查需求的项目 |
 
+`standard` 和 `full` 包含两份独立绘图 Skill：`reference-first-figures` 用于新作或实质重设计的参考与对照，`nature-figure` 用于适用的 Python/R 绘制、统计说明和导出检查。保留既定后端与认可的设计；小修沿用当前工具。绘图运行库按所选后端准备，安装 Skill 本身不会安装 Python/R 图形环境。
+
 常用命令：
 
 ```bash
@@ -236,6 +239,8 @@ python3 scripts/install_workflow.py --profile core --update --prune
 科研图件功能使用 Python 3.11+、`uv` 和所选绘图库。完成 skill 安装后，请根据绘图任务配置相应的 Python 运行环境。
 
 ## 自定义工作流编排
+
+Studio 提供“参考优先绘图模板”，可以直接载入并编辑参考设计、绘制、人工确认、视觉复核与验收节点。使用方法见[绘图模板教程](docs/workflow-studio-guide.md#参考优先绘图流程)。GIS 和原生示意图沿用现有工具，混合图可只将统计面板交给 `nature-figure`。
 
 官方 v1.0 流程仍是默认流程，安装后即可直接使用。希望自行安排阶段的进阶用户，可以在论文项目目录中启动图形界面。第一次使用可跟着[Workflow Studio 入门指南](docs/workflow-studio-guide.md)，完成一个“整理文献 → 撰写引言 → 审查草稿”的三阶段流程。
 
@@ -389,7 +394,9 @@ paper-workflow-orchestrator/
 ├── tests/                                 # 工作流与安装器测试
 └── companion-skills/
     ├── research-skill-router/             # 科研任务路由入口
-    └── academic-manuscript-final-editor/  # 终稿编辑
+    ├── academic-manuscript-final-editor/  # 终稿编辑
+    ├── reference-first-figures/           # 参考设计与视觉对照
+    └── nature-figure/                     # Python/R 绘制与导出 QA
 ```
 
 ## 第三方 skill 来源

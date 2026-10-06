@@ -83,6 +83,10 @@ export class ApiClient {
     return this.get('./api/workflow');
   }
 
+  getFigureTemplate(): Promise<ApiEnvelope<WorkflowData>> {
+    return this.get('./api/templates/reference-led-figure');
+  }
+
   validateWorkflow(workflow: WorkflowDocument): Promise<ApiEnvelope<ValidationData>> {
     return this.write('./api/validate', 'POST', { workflow });
   }

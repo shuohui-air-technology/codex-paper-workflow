@@ -3,7 +3,11 @@
 The marked content below is the unchanged Official v1.0 stage contract. It is
 authoritative only when mode resolution selects Official v1.0. For a selected
 custom workflow, use [custom-workflow-contract.md](custom-workflow-contract.md)
-and its manager-mediated transitions instead.
+and its manager-mediated transitions instead. The optional
+[reference-led figure subflow](reference-led-figures.md) provides explicit
+reference-design, Python/R implementation, visual-review and validation nodes
+for selected custom workflows. It reuses the figure evidence contract and does
+not rename Official v1.0 progress stages.
 
 <!-- OFFICIAL-V1-CONTRACT:BEGIN -->
 # Stage Contracts and Delegation Boundaries

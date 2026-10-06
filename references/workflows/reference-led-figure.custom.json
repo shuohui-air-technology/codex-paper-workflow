@@ -1,0 +1,243 @@
+{
+  "schema_version": "paper-workflow-custom-v1",
+  "workflow_id": "reference-led-figure",
+  "document_revision": 0,
+  "semantic_revision": 1,
+  "derived_from": null,
+  "max_parallelism": 1,
+  "external_inputs": [
+    "figure_plan",
+    "claim_evidence_matrix",
+    "source_data",
+    "reference_image",
+    "reference_notes",
+    "human_review"
+  ],
+  "nodes": [
+    {
+      "enabled": true,
+      "entry": true,
+      "skill_ref": "reference-first-figures",
+      "validator_ref": null,
+      "validator_config": null,
+      "origin_projection_node_id": null,
+      "inputs": [
+        "figure_plan",
+        "claim_evidence_matrix",
+        "source_data",
+        "reference_image",
+        "reference_notes"
+      ],
+      "outputs": [
+        "design_notes"
+      ],
+      "outcomes": [
+        "succeeded"
+      ],
+      "write_scopes": [
+        "design_notes"
+      ],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active",
+      "approval_source": null,
+      "id": "reference-design",
+      "type": "task",
+      "display_name": "参考设计：只整理参考与设计记录"
+    },
+    {
+      "enabled": true,
+      "entry": false,
+      "skill_ref": "nature-figure",
+      "validator_ref": null,
+      "validator_config": null,
+      "origin_projection_node_id": null,
+      "inputs": [
+        "figure_plan",
+        "claim_evidence_matrix",
+        "source_data",
+        "reference_image",
+        "reference_notes",
+        "design_notes"
+      ],
+      "outputs": [
+        "plot_code",
+        "figure_vector",
+        "figure_preview",
+        "qa_spec"
+      ],
+      "outcomes": [
+        "succeeded"
+      ],
+      "write_scopes": [
+        "plot_code",
+        "figure_vector",
+        "figure_preview",
+        "qa_spec"
+      ],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active",
+      "approval_source": null,
+      "id": "figure-implementation",
+      "type": "task",
+      "display_name": "按已选 Python/R 绘制数据面板"
+    },
+    {
+      "enabled": true,
+      "entry": false,
+      "skill_ref": null,
+      "validator_ref": null,
+      "validator_config": null,
+      "origin_projection_node_id": null,
+      "inputs": [],
+      "outputs": [],
+      "outcomes": [],
+      "write_scopes": [],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active",
+      "approval_source": "figure-implementation",
+      "id": "figure-approval",
+      "type": "condition",
+      "display_name": "查看实际成图后确认"
+    },
+    {
+      "enabled": true,
+      "entry": false,
+      "skill_ref": "reference-first-figures",
+      "validator_ref": null,
+      "validator_config": null,
+      "origin_projection_node_id": null,
+      "inputs": [
+        "figure_plan",
+        "claim_evidence_matrix",
+        "source_data",
+        "reference_image",
+        "reference_notes",
+        "design_notes",
+        "plot_code",
+        "figure_vector",
+        "figure_preview",
+        "qa_spec",
+        "human_review"
+      ],
+      "outputs": [
+        "review_notes",
+        "figure_receipt"
+      ],
+      "outcomes": [
+        "succeeded"
+      ],
+      "write_scopes": [
+        "review_notes",
+        "figure_receipt"
+      ],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active",
+      "approval_source": null,
+      "id": "reference-review",
+      "type": "task",
+      "display_name": "只读对照导出并适配回执"
+    },
+    {
+      "enabled": true,
+      "entry": false,
+      "skill_ref": null,
+      "validator_ref": "figure-contract",
+      "validator_config": {
+        "input_roles": {
+          "receipt": "figure_receipt"
+        },
+        "options": {}
+      },
+      "origin_projection_node_id": null,
+      "inputs": [
+        "figure_receipt"
+      ],
+      "outputs": [],
+      "outcomes": [
+        "pass",
+        "fail",
+        "blocked"
+      ],
+      "write_scopes": [],
+      "failure_policy": "block",
+      "condition_cases": [],
+      "join_mode": "all_active",
+      "approval_source": null,
+      "id": "figure-check",
+      "type": "validator",
+      "display_name": "核验数据图合同"
+    }
+  ],
+  "edges": [
+    {
+      "id": "design-to-plot",
+      "source": "reference-design",
+      "target": "figure-implementation",
+      "trigger": "succeeded",
+      "output_map": {}
+    },
+    {
+      "id": "design-to-review",
+      "source": "reference-design",
+      "target": "reference-review",
+      "trigger": "succeeded",
+      "output_map": {}
+    },
+    {
+      "id": "plot-to-review",
+      "source": "figure-implementation",
+      "target": "reference-review",
+      "trigger": "succeeded",
+      "output_map": {}
+    },
+    {
+      "id": "plot-to-approval",
+      "source": "figure-implementation",
+      "target": "figure-approval",
+      "trigger": "succeeded",
+      "output_map": {}
+    },
+    {
+      "id": "approval-to-review",
+      "source": "figure-approval",
+      "target": "reference-review",
+      "trigger": "approved",
+      "output_map": {}
+    },
+    {
+      "id": "review-to-check",
+      "source": "reference-review",
+      "target": "figure-check",
+      "trigger": "succeeded",
+      "output_map": {}
+    }
+  ],
+  "ui": {
+    "positions": {
+      "reference-design": {
+        "x": 0,
+        "y": 120
+      },
+      "figure-implementation": {
+        "x": 320,
+        "y": 120
+      },
+      "figure-approval": {
+        "x": 640,
+        "y": 0
+      },
+      "reference-review": {
+        "x": 950,
+        "y": 120
+      },
+      "figure-check": {
+        "x": 1260,
+        "y": 120
+      }
+    }
+  }
+}

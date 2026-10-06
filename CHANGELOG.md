@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Bundles `reference-first-figures` and `nature-figure` independently in standard
+  and full installations, with portable reference resources and scoped Python/R
+  handoffs that preserve established designs, backends and native-tool panels.
+- Adds a selectable reference-led figure template in Studio: reference design,
+  implementation, human confirmation, read-only comparison and receipt validation.
+  Loading the template creates a browser draft without changing the active workflow.
+- Adds a read-only figure-receipt builder that binds actual files, preserves supplied
+  scientific/review facts and rejects unsafe paths, changed hashes, unresolved
+  findings and unsupported numeric values or nesting depths.
 - Flags evidence-free rigor, unexplained anomalies, and cross-section restatements in the
   final-editor scanner with auditable signal vectors, direction-aware anomaly detection,
   document-level probes, and one report per defect instead of one per sentence: a
