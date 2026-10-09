@@ -5,18 +5,24 @@ hit is a review prompt: the editor keeps, rewrites, or records a disposition.
 
 ## Zero-information defensive language
 
-A sentence qualifies only when its feature vector carries **no** scientific
-information: no digit, unit, variable name, metric name (`RMSE`, `MAE`, `skill`),
-interval, direction, citation, or table/figure reference. Reference to the
-study's own group labels ("三组", "四档") is not information.
+A scanner's sparse feature vector locates candidates; it does **not** establish
+that a sentence has no scientific information. The lexical filter looks for
+digits, units, variable or metric names (`RMSE`, `MAE`, `skill`), intervals,
+directions, citations, and table/figure references. Their absence is not grounds
+for deletion: unresolved provenance, confounding, and observation-versus-target
+distinctions can be essential without these markers. Their presence does not
+make an otherwise redundant sentence useful. Decide by its information gain
+relative to the surrounding definitions and argument.
 
-Two shapes:
+Three scanner shapes:
 
 1. **Usage/external-validity clause** — "可作为…参考", "可用于检验…", "可沿用…",
-   "提供证据", "共同界定使用范围". High confidence: the clause asserts usefulness
-   rather than reporting what was measured.
+   "提供证据", "共同界定使用范围". Review whether usefulness is specified or merely
+   asserted; the scanner's confidence label is not an editorial verdict.
 2. **Hedged filler** — limits and cautions ("限于", "据此解释为", "分别判断",
-   "尚未完成逐字段溯源", "并不必然", "在…范围内") with an empty feature vector.
+   "尚未完成逐字段溯源", "并不必然", "在…范围内") with a sparse feature vector.
+   In particular, unfinished provenance is an unresolved substantive issue, not
+   filler to hide. Record it or retain it in the appropriate disclosure.
 3. **Presentation narration** — a clause that only says how material is formatted
    or stored ("结果均按数值区间报告", "…均按面板保存"). It is judged inside its own
    clause: "年龄与时间均按 1/12 yr 推进" carries a value and is real method text,
