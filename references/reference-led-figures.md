@@ -7,6 +7,12 @@ installed in `standard` and `full`. Select one implementation per figure:
 for the general route. A small correction keeps the established tool and skips
 reference discovery. The default Official v1.0 projection is unchanged.
 
+Before dispatching implementation, read the project-owned
+[implementation adapter](figure-implementation-adapter.md) and include the
+applicable requirements in the brief alongside the fixed invocation. The
+adapter defines project integration; the installed third-party Skill retains
+its upstream content and identity.
+
 ## Roles and actual handoff
 
 | Task | Primary | Inputs | Outputs |
@@ -95,5 +101,8 @@ and diagram connections while reusing typography and colour semantics.
 is a local figure workflow example for already acquired references. It is not
 an extra Official v1.0 stage or a promise to complete a paper. See the
 [Studio guide](../docs/workflow-studio-guide.md#参考优先绘图流程) for loading it,
-mapping real inputs, waiting for review and submitting results. Install both
-bundled Skills from the repository instead of using maintenance-machine paths.
+mapping real inputs, waiting for review and submitting results. The installer
+copies the project-developed design Skill and retrieves the selected external
+dependencies at the commits in [the lock manifest](../dependencies.lock.json).
+Use installed Skill identities rather than maintenance-machine paths. See
+[distribution details](../docs/figure-skill-distribution.md) for source and license.

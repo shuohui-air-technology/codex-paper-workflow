@@ -17,7 +17,7 @@ Paper Workflow Orchestrator is a research workflow distributed as a Codex skill 
 
 It is designed for paper projects that span multiple files and sessions. You can begin with a vague idea, an existing draft, a confirmed study design, or a bounded experiment. The workflow identifies the current stage, activates the appropriate capability, preserves the important evidence, and pauses for confirmation at consequential decisions.
 
-Release `v1.1.0` adds the optional local Workflow Studio and the confirmed-artifact layer while keeping the official `paper-workflow-orchestrator-v1.0` workflow as the default route.
+The official `paper-workflow-orchestrator-v1.0` workflow remains the default. Optional Workflow Studio lets users with more advanced needs arrange their own stages.
 
 ## Start here
 
@@ -25,7 +25,9 @@ Release `v1.1.0` adds the optional local Workflow Studio and the confirmed-artif
 |---|---|
 | Use the default paper workflow | [Install and start](#quick-installation), then describe your research goal in Codex |
 | Arrange your own stages and Skills | [Open the visual editor](#custom-workflow-editor); follow the [three-stage tutorial (Chinese)](docs/workflow-studio-guide.md) |
-| Understand or contribute code | Read the [Developer Guide (Chinese)](DEVELOPMENT_GUIDE.md) or [documentation index (Chinese)](docs/README.md) |
+| Distinguish working drafts from adopted versions and avoid repeated approvals | Read [progress and current confirmed artifacts](#progress-and-current-confirmed-artifacts) |
+| Use this project's final editor or reference-led figure Skill independently | See [project-developed specialist Skills](#project-developed-specialist-skills) |
+| Understand or contribute code | Read the [Developer Guide (Chinese)](DEVELOPMENT_GUIDE.md); find all documents in the [documentation index (Chinese)](docs/README.md) |
 
 Start with the default workflow for your first project. Open Workflow Studio when you want to change stages, replace Skills, or arrange branches.
 
@@ -79,17 +81,54 @@ Literature evidence shapes topic selection, study design constrains experiments,
 
 A narrowly scoped request can go directly to a specialist skill. A request involving a complete paper, durable project state, or multiple research stages enters the orchestrator. The same capability system therefore supports both one-off research tasks and long-running paper projects.
 
+## Project-developed specialist Skills
+
+The orchestrator connects research stages; specialist Skills produce and review their outputs. This project develops and maintains two downstream Skills, usable independently or within the complete paper workflow:
+
+| Skill | When to use it | Work and checks |
+|---|---|---|
+| [`academic-manuscript-final-editor`](companion-skills/academic-manuscript-final-editor/SKILL.md) | Substantive revision is complete; the manuscript needs consistent expression and editorial changes | Find analogous issues across the full draft, record editorial rules and their scope, address each scanner finding, check numbers, equations, citations, and bilingual meaning, and deliver a reviewable candidate |
+| [`reference-first-figures`](companion-skills/reference-first-figures/SKILL.md) | A new or substantially redesigned scientific figure needs an evidence-led visual design | Inspect real references, translate layout and visual relationships into design decisions, draw from supplied scientific materials, and compare actual exports; retain suitable plotting, GIS, or native-vector tools |
+
+The final editor is included in `core`, `standard`, and `full`; reference-led figures are included in `standard` and `full`. Both can also be installed, invoked, and developed independently.
+
+Standalone usage examples live in each Skill's guide: [final editor](companion-skills/academic-manuscript-final-editor/README.md#独立调用示例) and [reference-led figures](companion-skills/reference-first-figures/README.md#调用示例).
+
 ## Progress and current confirmed artifacts
 
-Long-running projects keep two kinds of information separate: **progress records what to do next; the confirmation catalog records which output is currently adopted**. Working drafts can keep changing. After an output passes the relevant checks and you confirm its adoption, the workflow archives it in its artifact folder, updates the current version, and retains both the working source and previous confirmed versions.
+Long-running projects need three answers:
 
-Ask to “confirm this checked literature matrix as the current version” or “continue revising the current confirmed manuscript.” Later work resolves the confirmation record instead of choosing an old draft or a newer, unapproved file by its name or timestamp.
+| Question | How it is managed |
+|---|---|
+| What should happen next? | Official progress records the current stage and next action; custom state records node execution |
+| What changed in the working materials? | Candidates are registered under stable roles such as the main manuscript, Figure 2, or experiment results; content hashes identify changes, identical copies, and unambiguous moves |
+| Which version should later work use? | The confirmation catalog selects immutable adopted snapshots, keeping working drafts and historical versions separate |
 
-Open `artifacts/INDEX.md` to browse current outputs, organized by type and role under `artifacts/current/`. A multi-file deliverable can include the manuscript, figures, and bibliography together. See the [progress and confirmed-artifact guide (Chinese)](docs/progress-and-artifacts-guide.md).
+Resume resolves the workflow mode and progress, checks registered candidates, and opens the adopted versions needed for the task. Unchanged content reuses its confirmation. New or changed candidates report their file differences, with bounded previews for smaller text files. Selected changes can be adopted together; changes made after review require a refreshed check.
+
+If only Figure 2 changed, review Figure 2 rather than approving the unchanged manuscript and experiment results again. Refresh the material scan after moving working files so later edits at the new paths remain associated with the same tracked candidate.
+
+Ask Codex:
+
+```text
+Continue this paper project. Check material changes for the manuscript,
+Figure 2, and experiment results. Show the next action and adopted versions
+needed for this task, and ask me to approve only the changes I need to adopt.
+```
+
+After outputs pass the relevant checks and you confirm their adoption, the system saves a fixed version and organizes it by category, such as manuscripts and figures.
+
+Open `artifacts/INDEX.md` to see the currently confirmed outputs, or browse them by category under `artifacts/current/`.
+
+The manuscript, figures, and references are saved together as a bundle for subsequent editing.
+
+Later tasks read confirmed versions whose contents have been verified. A custom workflow already in progress keeps its previously selected inputs. On resume, the system reports differences from newly confirmed versions so you can decide which materials to use in the next run.
+
+See the [progress and artifact guide (Chinese)](docs/progress-and-artifacts-guide.md) for usage and the [material-management contract](references/materials.md) for registration and batch-confirmation formats.
 
 ### Where project state lives
 
-The repository contains the workflow tools. Your paper-project directory contains the durable state created while you use them:
+Your paper-project directory contains the durable state created while you use the workflow:
 
 ```text
 paper-project/
@@ -99,6 +138,7 @@ paper-project/
 │   └── current/<type>/<artifact-id>/   # generated view of the latest confirmed bundle
 └── .research/
     ├── progress.md                     # official stage, next action, risks, and resume details
+    ├── materials/                      # roles, candidates, scan baseline, and difference reviews
     ├── confirmed-artifacts/
     │   ├── catalog.json                # authoritative current-version selection
     │   └── versions/                   # immutable confirmed snapshots
@@ -146,27 +186,16 @@ Each entry below describes a different user-visible job rather than repeating on
 | Move from a research idea or draft toward a complete paper | The Orchestrator carries the project through gated stages, connects accepted outputs, and asks for confirmation at consequential decisions | `SKILL.md`, `references/stage-contracts.md` |
 | Resume after several sessions | A compact progress snapshot records the current stage, next action, risks, rules, and resume details; the event log remains available for audit | `scripts/progress_manager.py`, `references/progress-schema.md` |
 | Stop an old draft being mistaken for the adopted result | Explicit confirmation creates an immutable version, updates the role's current pointer, and keeps working files in place for further editing | `scripts/artifact_manager.py`, `scripts/confirmed_artifacts.py`, `references/confirmed-artifacts.md` |
+| Reduce repeated reading and approvals in long projects | Track candidates by role and content hash, adopt selected changes together, and resume with verified current snapshots | `scripts/material_manager.py`, `references/materials.md` |
 | Check whether an experiment is ready to run | An experiment contract validator checks the question, resources, evaluation plan, and stopping conditions before execution | `scripts/experiment_contract_validator.py` |
-| Check a manuscript's shape before deeper review | A section validator parses Markdown headings and code fences, then reports missing or misplaced sections | `scripts/paper_section_validator.py`, `references/paper-section-contract.md` |
+| Check a manuscript's shape before deeper review | A section validator parses Markdown headings and code fences, then reports missing, duplicated, or incorrectly ordered sections | `scripts/paper_section_validator.py`, `references/paper-section-contract.md` |
 | Keep a scientific figure tied to its evidence | A figure contract records data sources, claim links, relationships, and image metadata, then produces a fail-closed receipt | `scripts/figure_contract_validator.py`, `references/scientific-visualization-integration.md` |
-| Turn inspected paper figures into an actionable design | `reference-first-figures` transfers design relationships and compares actual exports; `nature-figure` implements applicable Python/R panels | `companion-skills/reference-first-figures/`, `companion-skills/nature-figure/` |
-| Review claims and revise a paper | Integrity checks cover citations, numbers, claims, and reproducibility; the review stage turns findings into a substantive revision plan | `SKILL.md`, `references/stage-contracts.md` |
-| Edit a stable manuscript without losing protected content | The bundled Final Editor applies manuscript-wide editorial rules and verifies the protected-content receipt | `companion-skills/academic-manuscript-final-editor/` |
+| Turn inspected paper figures into an actionable design | `reference-first-figures` transfers design relationships and compares actual exports; a selected plotting Skill implements the applicable panels | `companion-skills/reference-first-figures/`, `references/reference-led-figures.md` |
+| Address citation, number, and claim issues | Integrity checks and simulated peer review turn findings into an actionable substantive revision plan | `SKILL.md`, `references/stage-contracts.md` |
+| Apply local editorial changes consistently across a manuscript | The project-developed Final Editor finds analogous issues, records itemized decisions, and checks protected scientific content | `companion-skills/academic-manuscript-final-editor/` |
 | Improve mechanical prose after the science is settled | Humanizer Preflight compares the candidate against protected content and records the content-difference evidence | `scripts/humanizer_preflight.py`, `references/humanizer-adapter.md` |
 | Arrange stages without editing JSON | Workflow Studio offers a local graphical canvas for tasks, validators, conditions, parallel branches, joins, inputs, and outputs | `scripts/workflow_studio.py`, `studio/`, `assets/workflow-studio/` |
 | Install the same set of skills on another machine | The lock manifest pins sources, commits, licenses, backups, and an installation receipt for `core`, `standard`, or `full` | `dependencies.lock.json`, `scripts/install_workflow.py` |
-
-The orchestrator's core scripts use only the Python standard library and support Python 3.10 or later.
-
-## When to use it
-
-- You have an early research idea and need to turn it into a testable question.
-- You have a known set of papers and need to compare their methods, data, claims, and limitations.
-- You have chosen a topic and need a study design, experiment plan, and paper structure.
-- You have a draft and need to review its citations, claims, figures, and argumentative integrity.
-- You need to coordinate multiple rounds of writing, review, revision, and final editing.
-- You need project state to persist across multiple Codex sessions.
-- You know the research outcome you need and want the router to select the appropriate specialist skill.
 
 ## Quick installation
 
@@ -255,14 +284,14 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/paper-workflow-orchestrator/scripts/
 <details>
 <summary>Windows and custom installation directories</summary>
 
-If you installed to a custom Codex home, export `CODEX_HOME` with that same path in the shell where you launch Studio so the Studio process can use it too. The installer's setting is not automatically reused in a later shell; if you do not set it, the command looks under `~/.codex`. On Windows PowerShell, run:
+On Windows PowerShell, run:
 
 ```powershell
 $skillsHome = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $HOME '.codex\skills' }
 py -3 (Join-Path $skillsHome 'paper-workflow-orchestrator\scripts\workflow_studio.py') --project .
 ```
 
-On macOS or Linux, set a custom path and start Studio in the same terminal like this:
+If you installed to a custom Codex home, export `CODEX_HOME` with that same path in the shell where you launch Studio so the Studio process can use it too. The installer's setting is not automatically reused in a later shell; if you do not set it, the command looks under `~/.codex`. On macOS or Linux, set the path and start Studio in the same terminal:
 
 ```bash
 export CODEX_HOME="/path/to/codex-home"
@@ -271,24 +300,35 @@ python3 "$CODEX_HOME/skills/paper-workflow-orchestrator/scripts/workflow_studio.
 
 </details>
 
-Start from a copy of the official workflow or create a blank one. Arrange stages on the canvas, choose Skills that are already installed, connect steps, and add conditions, parallel branches, or joins. Review validation results and any risk notices before activating the custom workflow. The editor works without editing JSON; Skill installation remains a separate installer step. Its runtime needs Python 3.10 or later but no Node.js.
+Copy the official workflow or start with a blank one. Add and arrange stages on the canvas, choose an installed Skill for each stage, then connect the tasks. Add conditions, parallel branches, or joins where needed.
 
-Follow the sequence: edit stages, validate, then save or activate. Saving preserves a draft; activation selects the workflow that Codex will follow. The [guide (Chinese)](docs/workflow-studio-guide.md) explains saved drafts, active versions, artifact connections, and common errors.
+Save a draft while editing so you can return to it later. When you are ready to use it, validate the workflow, review any risk notices, and activate that version. Codex will then use it to guide subsequent tasks in this project.
 
-When you copy the official workflow, four high-impact checkpoints are added as
-waiting gates: topic lock, study-design confirmation, experiment authorization,
-and final delivery. A gate keeps the original artifact edges in place, but the
-downstream stage stays unavailable until you explicitly approve the exact
-upstream attempt. A revision request preserves the old receipt and makes the
-source closure stale; use the manager's explicit `rerun-stale` command after
-reviewing it.
+Configure these settings in the interface without editing JSON. Skills must be installed beforehand. The interface needs Python 3.10 or later but no Node.js.
 
-New custom activations also use a fixed Skill root and the `node-result-v2`
-source declaration. A task must report the project-relative files it actually
-used and their SHA-256 hashes. The manager checks those entries against the
-frozen claim and stores them in `stage-receipt-v3` for recovery replay. This is
-an auditable declaration of reported inputs; without OS-level file-access
-isolation it cannot prove that an executor did not read an unreported file.
+See the [guide (Chinese)](docs/workflow-studio-guide.md) for the distinction between drafts and active versions, how files pass between stages, and how to resolve common issues.
+
+### Confirmation at key decisions
+
+Copying the official workflow adds four confirmation checkpoints by default:
+
+- Topic lock
+- Study-design confirmation
+- Experiment authorization
+- Final delivery
+
+The original stage connections continue to pass materials. Each checkpoint waits for your approval of the outputs from the current attempt before allowing downstream work to continue.
+
+If you request revision, the system preserves earlier result records and pauses the affected downstream stages. Review the scope of the changes, then explicitly rerun the relevant stage.
+
+### Use the agreed Skills and materials
+
+Newly activated custom workflows perform two checks:
+
+- **Keep using the Skill you selected.** Activation records each stage's chosen Skill location and contents. Later execution reads and checks that location rather than selecting a different version by name alone.
+- **Check the materials reported for each stage.** When submitting a result, Codex lists the files it used. The system checks whether the listed files are among the stage's agreed inputs and whether their contents have changed. For example, if a plotting stage expects the new experiment data but the list points to an old data file, the submission is rejected.
+
+The check records are saved with stage results to support continuation and troubleshooting. Verification relies on the list Codex submits; it cannot verify unreported file reads. See the [custom execution guide](references/custom-workflow-contract.md) for operational details.
 
 After Studio confirms activation, return to a Codex conversation in the same paper-project directory and send:
 
@@ -345,13 +385,13 @@ cp -R companion-skills/research-skill-router/. "$SKILLS_HOME/research-skill-rout
 ### Start the complete paper workflow
 
 ```text
-Use paper-workflow-orchestrator to continue from the current research materials with stage confirmation and durable progress tracking.
+Use paper-workflow-orchestrator to start the workflow from the current research materials.
 ```
 
 ### Start from an existing draft
 
 ```text
-Use paper-workflow-orchestrator to audit this draft, identify the current stage and evidence gaps, and propose the next revision plan.
+Use paper-workflow-orchestrator to review this draft, identify the current stage, and propose the next revision plan.
 ```
 
 ### Let the router choose a specialist skill
@@ -382,6 +422,7 @@ paper-workflow-orchestrator/
 │   ├── paper-section-contract.md         # Paper-section contract
 │   ├── progress-schema.md                # Project progress and evidence format
 │   ├── confirmed-artifacts.md            # Confirmed versions, index, and recovery
+│   ├── materials.md                      # Material tracking, difference reviews, and resume
 │   ├── stage-contracts.md                # Stage, delegation, and acceptance rules
 │   ├── scientific-visualization-integration.md
 │   ├── final-editor-integration.md
@@ -389,6 +430,7 @@ paper-workflow-orchestrator/
 ├── scripts/
 │   ├── progress_manager.py               # Progress initialization, migration, recording, and recovery
 │   ├── artifact_manager.py               # Confirmation lookup, adoption, withdrawal, and repair
+│   ├── material_manager.py               # Material roles, differences, batch adoption, and resume
 │   ├── confirmed_artifacts.py            # Version snapshots and current-output folders
 │   ├── install_workflow.py               # Cross-platform fixed-version installer
 │   ├── workflow_studio.py                # Visual editor launcher
@@ -405,9 +447,8 @@ paper-workflow-orchestrator/
 ├── tests/                                 # Workflow and installer tests
 └── companion-skills/
     ├── research-skill-router/             # Research-task routing entry point
-    ├── reference-first-figures/           # Reference-led design and visual comparison
-    ├── nature-figure/                    # Python/R figure implementation and export checks
-    └── academic-manuscript-final-editor/  # Final editing
+    ├── academic-manuscript-final-editor/  # Final editing
+    └── reference-first-figures/           # Reference-led design and visual comparison
 ```
 
 ## Third-party skill sources
@@ -415,12 +456,11 @@ paper-workflow-orchestrator/
 External skills are retrieved at the fixed commits recorded in [`dependencies.lock.json`](dependencies.lock.json). The manifest also records each upstream project's license:
 
 - K-Dense scientific visualization: MIT
+- nature-skills: MIT at the pinned commit
 - research-hub: MIT
 - Orchestra AI Research Skills: MIT
 - humanizer: MIT
 - Academic Research Skills: CC BY-NC 4.0
-
-The pinned upstream repository for `clarify-research-idea` does not currently declare a license. Review its terms separately before use or redistribution.
 
 Each upstream project's original license continues to apply after skill installation.
 
@@ -429,10 +469,6 @@ Each upstream project's original license continues to apply after skill installa
 Issues and improvements are welcome. Code contributions should keep the orchestrator's core scripts within the Python standard library and describe the verification performed in the pull request.
 
 Contributors can start with the [Developer Guide](DEVELOPMENT_GUIDE.md), which explains the repository layout, local test commands, and how the Python runtime and Workflow Studio fit together.
-
-The [documentation index (Chinese)](docs/README.md) groups user instructions and implementation contracts by purpose.
-
-Keep personal papers, `.research/`, `.paper/`, experimental data, credentials, and machine-generated caches local and managed through `.gitignore`.
 
 ## License
 

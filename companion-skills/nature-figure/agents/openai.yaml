@@ -1,4 +1,0 @@
-interface:
-  display_name: "Nature Figure"
-  short_description: "Implement Python/R figures with preserved design and export QA"
-  default_prompt: "Use $nature-figure to implement the established figure design in the selected Python or R backend and inspect the actual exports."

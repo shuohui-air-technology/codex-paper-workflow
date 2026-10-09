@@ -53,7 +53,7 @@
     "research-skill-router": {"source": "bundled", "path": "companion-skills/research-skill-router", "license": "MIT"},
     "academic-manuscript-final-editor": {"source": "bundled", "path": "companion-skills/academic-manuscript-final-editor", "license": "MIT"},
     "reference-first-figures": {"source": "bundled", "path": "companion-skills/reference-first-figures", "license": "MIT"},
-    "nature-figure": {"source": "bundled", "path": "companion-skills/nature-figure", "license": "MIT"},
+    "nature-figure": {"source": "github", "repository": "Yuan1z0825/nature-skills", "commit": "f3941a1722e39af78b24bc7a34167b8880629545", "path": "skills/nature-figure", "license": "MIT"},
     "scientific-visualization": {"source": "github", "repository": "K-Dense-AI/scientific-agent-skills", "commit": "36d8f13a1e754618794bf42f417884940077b4ae", "path": "skills/scientific-visualization", "license": "MIT"},
     "clarify-research-idea": {"source": "github", "repository": "cpt13-g/clarify-research-idea", "commit": "1f8334d144b39f9fb029293d26e1dc16196212d2", "path": ".agents/skills/clarify-research-idea", "license": "Not declared in upstream repository"},
     "research-hub": {"source": "github", "repository": "WenyuChiou/research-hub", "commit": "3143d2d62f798960731cae5a2b4f91aeaca25e75", "path": "skills/research-hub", "license": "MIT"},
