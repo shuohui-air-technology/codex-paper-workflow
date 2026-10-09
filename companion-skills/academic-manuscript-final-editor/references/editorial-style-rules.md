@@ -47,6 +47,17 @@ Never use a word-counting rule to remove negation. Look for repeated defensive t
 - Replace implementation warnings such as "do not apply twice" with the mathematical definition and unit convention that make the operation unambiguous.
 - Do not delete ethics, conflicts, funding, data provenance, or required journal statements by default. Their inclusion and timing depend on the study and submission stage.
 
+## Judge meaning before polishing
+
+Read [readability-examples.md](readability-examples.md) when a passage is grammatically sound but contributes little or is hard to unpack.
+
+- Compare a candidate sentence with its nearby definitions and premises. If it merely restates a consequence already explicit there, delete it unless it supplies useful navigation, contrast, or interpretation. A methods definition and a short abstract reminder can serve different readers; similarity alone is not a defect.
+- A replacement must either preserve needed information more clearly or remove repetition. "共同构建解释对象界定" becoming "共同界定解释范围" is still empty if the preceding sentences already state each analysis's task. Do not add a generic concluding sentence after deleting one.
+- Distinguish repeated self-defense from a substantive limit: sample support, negative controls, observation-versus-target distinctions, unresolved provenance, and identified confounding may change the inference even without numbers. Retain a necessary limit where it governs the claim; do not soften it merely to use positive wording.
+- Unpack nominal chains by identifying who or what does what to which object. Replace "实施……的开展" with the operation; replace abstract "支持" only when the supplied evidence specifies the comparison. Never infer causal effects, validation, or mechanisms from an attractive verb.
+- Separate paragraphs by the question they answer. Prediction performance, directional identification, and external-index comparability have different limitations. Preserve logical connections and citation scope; paragraph splitting is not evidence repair.
+- Check a difficult term against definitions, equations, captions, and supplied context. Preserve a defined technical name; explain its concrete operation on first use when useful. For an undefined compound, identify the missing quantity or relation and request clarification instead of guessing its meaning or declaring it fabricated.
+
 ## Preserve the paper's altitude
 
 - Decide whether a definition belongs by audience and journal. Avoid dictionary-like explanations that interrupt a specialist introduction; move elementary teaching to a guide or glossary when appropriate.
@@ -83,6 +94,7 @@ Never use a word-counting rule to remove negation. Look for repeated defensive t
 - Rule scope and any deferred restoration status are recorded.
 - Scientific payload matches the frozen baseline.
 - Necessary limits remain without repeated defensive wording.
+- Deleted restatements were not replaced by abstract filler; difficult prose names its actual object and operation or records the missing definition.
 - Purely internal workflow language is absent from ordinary prose.
 - Bilingual versions have matching scientific meaning.
 - Artifact rendering has no important defect.
