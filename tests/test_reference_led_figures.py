@@ -150,6 +150,25 @@ class FigureSkillDistributionTests(unittest.TestCase):
         for name in ("README.md", "README.zh-CN.md"):
             self.assertNotIn("companion-skills/nature-figure", (ROOT / name).read_text(encoding="utf-8"))
 
+    def test_studio_e2e_fixture_skills_ship_in_the_repository(self):
+        """The Studio E2E fixture copies skills by id; every id must exist here.
+
+        A fresh checkout has no empty directories, so a removed skill makes the
+        fixture fail before any browser test runs. A local run can still pass
+        while stale directories remain, which is why this is checked directly.
+        """
+        fixture = (ROOT / "studio/e2e/fixtures.ts").read_text(encoding="utf-8")
+        listed = re.search(r"for \(const skillId of \[([^\]]*)\]\)", fixture)
+        self.assertIsNotNone(listed, "the Studio E2E fixture no longer declares its bundled skills")
+        names = re.findall(r"'([^']+)'", listed.group(1))
+        self.assertTrue(names, "the Studio E2E fixture declares no skills")
+        for name in names:
+            folder = ROOT / "companion-skills" / name
+            self.assertTrue(
+                (folder / "SKILL.md").is_file(),
+                f"the Studio E2E fixture copies a skill that does not ship in this repository: {name}",
+            )
+
     def test_managed_bundled_copy_updates_to_pinned_dependency_with_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

@@ -38,6 +38,12 @@ from scripts.workflow_engine.store import StoreError
 
 BASE = ".research/materials"
 REGISTRY = f"{BASE}/registry.json"
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 SCAN = f"{BASE}/last-scan.json"
 INDEX = f"{BASE}/INDEX.md"
 REGISTRY_SCHEMA = "material-registry-v1"

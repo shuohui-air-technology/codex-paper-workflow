@@ -95,7 +95,7 @@ class MaterialManagerTests(unittest.TestCase):
         self.assertTrue(retry["idempotent"])
         self.assertEqual(self.service.catalog.metadata()["revision"], revision)
         self.service.review(save_scan=True)
-        index = (self.project / mm.INDEX).read_text()
+        index = (self.project / mm.INDEX).read_text(encoding="utf-8")
         self.assertIn("内容未变，沿用确认", index)
         self.assertIn(self.service.catalog.resolve("source-notes")["version_id"], index)
 
@@ -123,7 +123,7 @@ class MaterialManagerTests(unittest.TestCase):
         self.assertEqual(changed["changes"]["modified"], ["main.md"])
         self.assertNotIn("work/b.md", inspected["discovery"]["unregistered"])
         self.adopt(review=inspected)
-        self.assertEqual((self.project / self.service.catalog.resolve("source-notes")["snapshot_path"]).read_text(), "revised after moving\n")
+        self.assertEqual((self.project / self.service.catalog.resolve("source-notes")["snapshot_path"]).read_text(encoding="utf-8"), "revised after moving\n")
 
     def test_artifacts_working_files_are_not_reserved_display_sources(self):
         self.register(paths={"draft.md": "artifacts/draft.md"})
@@ -151,7 +151,7 @@ class MaterialManagerTests(unittest.TestCase):
         self.assertTrue(result["committed"])
         bound = self.service.catalog.resolve("source-notes")
         self.assertEqual(bound["provenance"]["mode"], "material-input")
-        self.assertEqual((self.project / bound["snapshot_path"]).read_text(), "input v1\n")
+        self.assertEqual((self.project / bound["snapshot_path"]).read_text(encoding="utf-8"), "input v1\n")
 
     def test_unchanged_needs_no_approval_and_creates_no_version(self):
         self.register()
@@ -174,9 +174,9 @@ class MaterialManagerTests(unittest.TestCase):
         self.assertIn("+input v2", candidate["changes"]["text_previews"][0]["diff"])
         resumed = mm.MaterialService(self.project).resume(["source-notes"])
         self.assertTrue(resumed["ready_to_read"])
-        self.assertEqual((self.project / resumed["bindings"][0]["snapshot_path"]).read_text(), "input v1\n")
+        self.assertEqual((self.project / resumed["bindings"][0]["snapshot_path"]).read_text(encoding="utf-8"), "input v1\n")
         self.adopt()
-        self.assertEqual((self.project / self.service.catalog.resolve("source-notes")["snapshot_path"]).read_text(), "input v2\n")
+        self.assertEqual((self.project / self.service.catalog.resolve("source-notes")["snapshot_path"]).read_text(encoding="utf-8"), "input v2\n")
 
     def test_two_candidates_never_select_by_filename_or_modification_date(self):
         self.register(candidate="original")
@@ -184,7 +184,7 @@ class MaterialManagerTests(unittest.TestCase):
         self.write("inputs/latest-final.md", "other content\n")
         self.register(candidate="alternative", paths={"notes.md": "inputs/latest-final.md"})
         resumed = self.service.resume(["source-notes"])
-        self.assertEqual((self.project / resumed["bindings"][0]["snapshot_path"]).read_text(), "input v1\n")
+        self.assertEqual((self.project / resumed["bindings"][0]["snapshot_path"]).read_text(encoding="utf-8"), "input v1\n")
         self.write("inputs/third.md", "third content\n")
         self.register(candidate="third", paths={"notes.md": "inputs/third.md"})
         role = self.service.review()["roles"][0]
@@ -300,7 +300,7 @@ class MaterialManagerTests(unittest.TestCase):
         self.assertEqual(self.candidate(review, candidate="v1")["state"], "historical")
         self.assertFalse(review["roles"][0]["needs_confirmation"])
         self.adopt(candidate="v1", review=review)
-        self.assertEqual((self.project / self.service.catalog.resolve("source-notes")["snapshot_path"]).read_text(), "input v1\n")
+        self.assertEqual((self.project / self.service.catalog.resolve("source-notes")["snapshot_path"]).read_text(encoding="utf-8"), "input v1\n")
 
     def official_output(self):
         self.write(".research/progress.md", progress.template("paper"))
@@ -411,7 +411,7 @@ class MaterialManagerTests(unittest.TestCase):
         script = str(ROOT / "scripts/material_manager.py")
 
         def cli(*args):
-            result = subprocess.run([sys.executable, "-B", script, *args, "--project", str(self.project), "--json"], capture_output=True, text=True)
+            result = subprocess.run([sys.executable, "-B", script, *args, "--project", str(self.project), "--json"], capture_output=True, text=True, encoding="utf-8")
             return result.returncode, json.loads(result.stdout)
 
         code, reviewed = cli("scan", "--output", output)
@@ -426,9 +426,30 @@ class MaterialManagerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(resolved["bindings"][0]["verification"], "snapshot_verified")
 
+    def test_cli_json_survives_a_windows_style_stdout(self):
+        """Windows pipes default to a legacy codec such as cp1252.
+
+        The resume payload carries the non-ASCII confirmation text, so a
+        locale-encoded stdout made the child fail before writing anything and
+        the caller only saw empty output. PYTHONIOENCODING reproduces that
+        Windows stream deterministically on every platform.
+        """
+        self.register()
+        self.adopt()
+        result = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "scripts/material_manager.py"), "resume",
+             "--role", "source-notes", "--project", str(self.project), "--json"],
+            capture_output=True, text=True, encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        resumed = json.loads(result.stdout)
+        self.assertEqual(resumed["roles"][0]["candidates"][0]["state"], "unchanged")
+        self.assertEqual(resumed["bindings"][0]["confirmation"], "采用本次所选材料版本。")
+
     def activate_custom(self):
         self.write(".agents/skills/material-test/SKILL.md", "---\nname: material-test\ndescription: Use supplied notes to create a fixture draft.\n---\nRead the declared input and write a draft.\n")
-        doc = json.loads((ROOT / "tests/fixtures/workflow_valid_linear.json").read_text())
+        doc = json.loads((ROOT / "tests/fixtures/workflow_valid_linear.json").read_text(encoding="utf-8"))
         node = doc["nodes"][0]
         node.update(skill_ref="material-test", inputs=["user_request"], outputs=["draft"], write_scopes=["draft"])
         doc.update(nodes=[node], edges=[], ui={"positions": {node["id"]: {"x": 0, "y": 0}}})
@@ -479,7 +500,7 @@ class MaterialManagerTests(unittest.TestCase):
         self.adopt()
         workflow = self.activate_custom()
         proc = subprocess.run([sys.executable, "-B", str(ROOT / "scripts/workflow_manager.py"), "register-confirmed-input",
-            "--project", str(self.project), "--artifact-id", "user_request", "--role", "source-notes", "--expect-catalog-revision", "1", "--json"], capture_output=True, text=True)
+            "--project", str(self.project), "--artifact-id", "user_request", "--role", "source-notes", "--expect-catalog-revision", "1", "--json"], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["confirmed_role"], "source-notes")
         resolved = self.service.catalog.resolve("source-notes")
