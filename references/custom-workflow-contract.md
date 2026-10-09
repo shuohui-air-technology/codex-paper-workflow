@@ -62,6 +62,12 @@ Skill root and requires a `node-result-v2` result. For each claim, invoke only
 that Skill; do not disclose the token in reports or receipts, and do not invent
 a result or claim an output file that the Skill did not actually create.
 
+For a reference-led figure implementation node, the controller reads
+[the figure implementation adapter](figure-implementation-adapter.md) and passes
+its applicable requirements in the task brief. The installed third-party Skill
+remains unchanged. Its reusable examples do not replace this run's fixed
+inputs, approved design, output scope or confirmation requirements.
+
 Write the actual result using the schema named by the invocation. A
 `node-result-v2` task result includes `consumed_sources`, a sorted list of the
 project-relative files actually used, each with its SHA-256 hash. Every listed
@@ -94,6 +100,13 @@ an enabled instance blocks activation, while a disabled instance remains only
 as a dormant draft node and can never run.
 
 ## Register inputs and record branch facts
+
+To use a confirmed bundle as a declared external input, run
+`workflow_manager.py register-confirmed-input --project <project-root>
+--artifact-id <declared-id> --role <role-id> --expect-catalog-revision <revision>`.
+It verifies the snapshot and binds its entrypoint (or `--file <relative-path>`)
+and hash inside the run transaction. Later adoption never rewrites that binding.
+See [material management](materials.md) for version differences on resume.
 
 Existing project files become workflow inputs only through
 `workflow_manager.py register-artifact`, which records the declared ID,

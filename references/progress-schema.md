@@ -4,6 +4,11 @@ The marked schema below is authoritative only in Official v1.0 mode. In custom
 mode, the workflow manager's validated custom state is authoritative; do not
 read or update `.research/progress.md` or `current_stage` for custom execution.
 
+Material roles, working candidates and content differences are tracked separately
+by [the material manager](materials.md). Its resume operation resolves mode first
+and combines current progress with verified adopted bindings. Material registration
+never advances a stage or changes the confirmation catalog's authority.
+
 <!-- OFFICIAL-V1-CONTRACT:BEGIN -->
 # Progress Schema and Reliability Rules
 

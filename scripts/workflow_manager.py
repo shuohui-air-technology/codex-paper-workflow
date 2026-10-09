@@ -127,6 +127,12 @@ def _build_cli_parser():
         item = commands.add_parser(command)
         _add_cli_common(item, skills=True)
         item.add_argument(argument, required=True)
+    confirmed_input = commands.add_parser("register-confirmed-input")
+    _add_cli_common(confirmed_input)
+    confirmed_input.add_argument("--artifact-id", required=True, help="declared external input ID in the selected workflow")
+    confirmed_input.add_argument("--role", required=True, help="confirmed material/artifact role")
+    confirmed_input.add_argument("--expect-catalog-revision", required=True, type=int)
+    confirmed_input.add_argument("--file", help="relative file within the confirmed bundle; defaults to its entrypoint")
     return parser
 
 
@@ -214,6 +220,8 @@ def _run_cli(args):
         return service.register_artifact(
             payload["artifact_id"], payload["path"], payload["provenance_summary"]
         )
+    if args.command == "register-confirmed-input":
+        return service.register_confirmed_input(args.artifact_id, args.role, args.expect_catalog_revision, args.file)
     if args.command == "record-decision":
         payload = _read_project_json(project, args.decision)
         if set(payload) != {"name", "value", "provenance_summary"}:
@@ -663,7 +671,25 @@ class WorkflowService:
             "attempts_after": dict(event.payload["attempts_after"]),
         }
 
-    def register_artifact(self, artifact_id, path, provenance_summary):
+    def register_confirmed_input(self, artifact_id, role, expected_revision, relative_file=None):
+        """Bind a declared custom input to an exact adopted snapshot file."""
+        from scripts.confirmed_artifacts import ConfirmedArtifactError, ConfirmedArtifactStore
+
+        try:
+            resolved = ConfirmedArtifactStore(self.project_root).resolve(role, expected_revision=expected_revision)
+        except ConfirmedArtifactError as exc:
+            raise WorkflowManagerError(exc.code, str(exc)) from exc
+        selected = relative_file if relative_file is not None else resolved["entrypoint"]
+        matches = [item for item in resolved["files"] if item["relative_path"] == selected]
+        if len(matches) != 1:
+            raise WorkflowManagerError("runtime.confirmed_file_missing", "Select one relative file declared in the confirmed bundle.")
+        item = matches[0]
+        result = self.register_artifact(artifact_id, item["snapshot_path"],
+            f'Confirmed {role}/{resolved["version_id"]}: {selected}', expected_sha256=item["sha256"])
+        return {**result, "confirmed_role": role, "confirmed_version": resolved["version_id"],
+                "catalog_revision": resolved["catalog_revision"]}
+
+    def register_artifact(self, artifact_id, path, provenance_summary, *, expected_sha256=None):
         """Hash and register one declared project input with recorded provenance."""
         if (
             not isinstance(artifact_id, str)
@@ -697,6 +723,8 @@ class WorkflowService:
                             "runtime.artifact_unsafe",
                             "artifact path is not a safely readable project file",
                         ) from exc
+                    if expected_sha256 is not None and digest != expected_sha256:
+                        raise WorkflowManagerError("runtime.confirmed_input_changed", "The confirmed snapshot changed before input registration.")
                     artifact = ArtifactRuntime(
                         artifact_id, path, digest, "verified", "external", 0
                     )

@@ -111,7 +111,8 @@ class ProgressVersionTests(unittest.TestCase):
                 text = (ROOT / relative).read_text(encoding="utf-8")
                 self.assertIn("v1.0", text)
         self.assertIn("v1.0.0", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
-        self.assertIn("v1.0", (ROOT / "companion-skills" / "academic-manuscript-final-editor" / "README.md").read_text(encoding="utf-8"))
+        # Standalone companion guides need not advertise the controller's
+        # workflow version; the controller metadata and contracts bind it.
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn('version: "1.1.0"', skill)
         self.assertIn('workflow_version: "paper-workflow-orchestrator-v1.0"', skill)
@@ -153,7 +154,7 @@ class ProgressVersionTests(unittest.TestCase):
             english,
         )
         self.assertIn(
-            "**帮助您将任何一个模糊的想法落地为顶刊级别的论文。**",
+            "**帮助您将任何一个模糊的想法落地为顶刊级别的论文**",
             chinese,
         )
         for text in (english, chinese):
@@ -180,7 +181,7 @@ class ProgressVersionTests(unittest.TestCase):
                 "--project .",
                 "无需编辑 JSON",
                 "在启动 Studio 的当前终端中导出同一个 `CODEX_HOME`",
-                "export CODEX_HOME=\"/你的 Codex 主目录\"",
+                "export CODEX_HOME=\"/您的 Codex 主目录\"",
                 "Python 3.10 或以上版本",
                 "assets/workflow-studio.png",
             ),

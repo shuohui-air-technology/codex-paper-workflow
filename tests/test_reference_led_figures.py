@@ -1,7 +1,8 @@
-"""Bundled installation and manager-mediated figure handoff integration tests."""
+"""Pinned installation and manager-mediated figure handoff integration tests."""
 
 import copy
 import hashlib
+import io
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -116,12 +118,19 @@ class ReceiptAdapterTests(unittest.TestCase):
 
 
 class FigureSkillDistributionTests(unittest.TestCase):
-    def test_profiles_and_bundled_resource_links(self):
+    def test_profiles_sources_and_bundled_resource_links(self):
         manifest = load_manifest(ROOT / "dependencies.lock.json")
         for profile in ("standard", "full"):
             self.assertTrue(set(NAMES) <= {x["name"] for x in resolve_profile(manifest, profile)})
         self.assertTrue(set(NAMES).isdisjoint({x["name"] for x in resolve_profile(manifest, "core")}))
-        for name in NAMES:
+        external = manifest["skills"]["nature-figure"]
+        self.assertEqual(external["source"], "github")
+        self.assertEqual(external["repository"], "Yuan1z0825/nature-skills")
+        self.assertEqual(external["commit"], "f3941a1722e39af78b24bc7a34167b8880629545")
+        self.assertEqual(external["path"], "skills/nature-figure")
+        self.assertEqual(external["license"], "MIT")
+        self.assertFalse((ROOT / "companion-skills/nature-figure/SKILL.md").exists())
+        for name in ("reference-first-figures",):
             folder = ROOT / "companion-skills" / name
             self.assertTrue((folder / "LICENSE").is_file())
             for file in folder.rglob("*.md"):
@@ -133,23 +142,94 @@ class FigureSkillDistributionTests(unittest.TestCase):
                     target = link.split("#")[0]
                     self.assertTrue((file.parent / target).exists(), f"missing link: {file}: {link}")
 
-    def test_clean_bundled_install_is_receipted_and_runs_template(self):
+    def test_adapter_is_reachable_without_modifying_the_upstream_skill(self):
+        adapter = ROOT / "references/figure-implementation-adapter.md"
+        self.assertTrue(adapter.is_file())
+        for name in ("SKILL.md", "references/reference-led-figures.md", "references/custom-workflow-contract.md"):
+            self.assertIn("figure-implementation-adapter.md", (ROOT / name).read_text(encoding="utf-8"))
+        for name in ("README.md", "README.zh-CN.md"):
+            self.assertNotIn("companion-skills/nature-figure", (ROOT / name).read_text(encoding="utf-8"))
+
+    def test_studio_e2e_fixture_skills_ship_in_the_repository(self):
+        """The Studio E2E fixture copies skills by id; every id must exist here.
+
+        A fresh checkout has no empty directories, so a removed skill makes the
+        fixture fail before any browser test runs. A local run can still pass
+        while stale directories remain, which is why this is checked directly.
+        """
+        fixture = (ROOT / "studio/e2e/fixtures.ts").read_text(encoding="utf-8")
+        listed = re.search(r"for \(const skillId of \[([^\]]*)\]\)", fixture)
+        self.assertIsNotNone(listed, "the Studio E2E fixture no longer declares its bundled skills")
+        names = re.findall(r"'([^']+)'", listed.group(1))
+        self.assertTrue(names, "the Studio E2E fixture declares no skills")
+        for name in names:
+            folder = ROOT / "companion-skills" / name
+            self.assertTrue(
+                (folder / "SKILL.md").is_file(),
+                f"the Studio E2E fixture copies a skill that does not ship in this repository: {name}",
+            )
+
+    def test_managed_bundled_copy_updates_to_pinned_dependency_with_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = root / "old-source"
+            source.mkdir()
+            old_skill = "---\nname: nature-figure\ndescription: Old bundled fixture.\n---\n"
+            (source / "SKILL.md").write_text(old_skill)
+            (source / "workflow-handoff.md").write_text("Obsolete bundled integration.")
+            target = root / "skills"
+            old = {"schema_version": "workflow-dependencies-v1",
+                   "profiles": {p: ["nature-figure"] for p in ("core", "standard", "full")},
+                   "skills": {"nature-figure": {"source": "bundled", "path": "old-source", "license": "MIT"}}}
+            install(old, "standard", target, root)
+            pinned = load_manifest(ROOT / "dependencies.lock.json")["skills"]["nature-figure"]
+            new = {**old, "skills": {"nature-figure": pinned}}
+            self.assertEqual(verify(target, "standard", new)["status"], "blocked")
+            upstream = "---\nname: nature-figure\ndescription: Pinned external fixture.\n---\n"
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("snapshot/skills/nature-figure/SKILL.md", upstream)
+                bundle.writestr("snapshot/LICENSE", "MIT License\nSynthetic upstream fixture\n")
+            with mock.patch("scripts.install_workflow.urllib.request.urlopen", return_value=io.BytesIO(archive.getvalue())):
+                result = install(new, "standard", target, root, update=True)
+            self.assertEqual(verify(target, "standard", new)["status"], "pass")
+            backup = Path(result["backups"]["nature-figure"])
+            self.assertEqual((backup / "SKILL.md").read_text(), old_skill)
+            self.assertTrue((backup / "workflow-handoff.md").is_file())
+            self.assertEqual((target / "nature-figure/SKILL.md").read_text(), upstream)
+            self.assertFalse((target / "nature-figure/workflow-handoff.md").exists())
+
+    def test_clean_pinned_install_is_receipted_and_runs_template(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             project = root / "project"
             project.mkdir()
             target = project / ".agents/skills"
             manifest = load_manifest(ROOT / "dependencies.lock.json")
-            # Exercise the real installer on the bundled subset without
-            # downloading unrelated remote writing/experiment dependencies.
+            # The HTTP fixture makes the pinned dependency deterministic and
+            # offline. Archive parsing, installation and receipt checks are real.
             selected = ["paper-workflow-orchestrator", *NAMES]
             mini = {**manifest, "profiles": {p: selected for p in ("core", "standard", "full")},
                     "skills": {name: manifest["skills"][name] for name in selected}}
-            install(mini, "standard", target, ROOT)
+            archive = io.BytesIO()
+            upstream_skill = "---\nname: nature-figure\ndescription: Synthetic external fixture.\n---\n\n# Fixture\n"
+            upstream_license = "MIT License\nCopyright (c) 2026 Synthetic upstream fixture\n"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                prefix = "nature-skills-" + manifest["skills"]["nature-figure"]["commit"] + "/"
+                bundle.writestr(prefix + "LICENSE", upstream_license)
+                bundle.writestr(prefix + "skills/nature-figure/SKILL.md", upstream_skill)
+            with mock.patch("scripts.install_workflow.urllib.request.urlopen", return_value=io.BytesIO(archive.getvalue())) as opened:
+                install(mini, "standard", target, ROOT)
+            self.assertEqual(opened.call_count, 1)
+            self.assertIn(manifest["skills"]["nature-figure"]["commit"], opened.call_args.args[0])
+            self.assertEqual((target / "nature-figure/SKILL.md").read_text(), upstream_skill)
+            self.assertEqual((target / "nature-figure/UPSTREAM-LICENSE").read_text(), upstream_license)
+            self.assertFalse((target / "nature-figure/references/workflow-handoff.md").exists())
             self.assertEqual(verify(target, "standard", mini)["status"], "pass")
             installed = target / "paper-workflow-orchestrator"
             self.assertTrue((installed / "scripts/build_figure_receipt.py").is_file())
             self.assertTrue((installed / "references/workflows/reference-led-figure.custom.json").is_file())
+            self.assertTrue((installed / "references/figure-implementation-adapter.md").is_file())
             catalog = discover_skills((target,), load_install_receipts((target,)))
             self.assertTrue(all(catalog.skills[name].locked for name in NAMES))
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(root / "empty-codex")}):

@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -117,19 +118,26 @@ class ArtifactService:
             "bindings": bindings, "evidence": self._evidence(request),
         }
 
-    def accept(self, request, *, confirmed=False):
-        if confirmed is not True:
-            _fail("confirmation.required", "Confirm adoption of the verified artifact before publishing a current version.")
-        request = normalize_request(request)
+    @contextmanager
+    def confirmation_context(self):
+        """Hold the existing mode/progress/run locks while validating adoption."""
         selection = self.workflow.store.read_selection(repair_projection=False)
         if selection.mode == "official":
             with self.workflow.store.locked_official():
                 path = resolve_project_path(self.project_root, ".research/progress.md")
                 resolve_project_path(self.project_root, ".research/progress.md.lock")
                 with progress.progress_lock(path):
-                    return self.catalog.accept(request, self._official_provenance)
+                    yield self._official_provenance
+            return
         with self.workflow.store.locked_run() as transaction:
-            return self.catalog.accept(request, lambda value: self._custom_provenance(transaction, value))
+            yield lambda value: self._custom_provenance(transaction, value)
+
+    def accept(self, request, *, confirmed=False):
+        if confirmed is not True:
+            _fail("confirmation.required", "Confirm adoption of the verified artifact before publishing a current version.")
+        request = normalize_request(request)
+        with self.confirmation_context() as provenance:
+            return self.catalog.accept(request, provenance)
 
 
 class _Parser(argparse.ArgumentParser):

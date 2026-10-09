@@ -10,6 +10,7 @@
 | 找到自定义流程的常见问题处理方法 | [问题排查](workflow-studio-guide.md#问题排查) |
 | 接着推进长期项目，找到目前认可的成果 | [进度与已确认产物使用指南](progress-and-artifacts-guide.md) |
 | 区分工作草稿、当前确认版本与历史版本 | [修改、确认与撤回](progress-and-artifacts-guide.md#修改确认与撤回) |
+| 找出材料变化、避免重复确认 | [材料版本与按差异确认](progress-and-artifacts-guide.md#材料版本与按差异确认) |
 | 修改程序或参与贡献 | [开发指南](../DEVELOPMENT_GUIDE.md) |
 | 了解版本变化 | [更新记录](../CHANGELOG.md) |
 
@@ -21,6 +22,7 @@
 | 在浏览器中编辑自定义流程 | `scripts/workflow_studio.py` | 启动编辑器时；命令见教程 |
 | 了解自定义流程如何校验和推进 | `scripts/workflow_manager.py`、`scripts/workflow_engine/` | 开发、调试或扩展执行机制时 |
 | 更新官方进度或查看当前确认版本 | `scripts/progress_manager.py`、`scripts/artifact_manager.py` | 调试进度更新、产物采纳和恢复时 |
+| 登记候选材料、对比内容并批量确认 | `scripts/material_manager.py` | 调试版本识别、材料扫描和恢复读取时 |
 | 修改编辑器界面 | `studio/` | 前端开发时 |
 | 安装后运行图形界面 | `assets/workflow-studio/` | 由启动器自动加载；日常使用无需处理这些文件 |
 | 检查实现是否符合预期 | `tests/`、`studio/src/` 中的测试、`studio/e2e/` | 开发和验证改动时 |
@@ -35,9 +37,11 @@
 - [自定义工作流执行合同](../references/custom-workflow-contract.md)
 - [进度与证据记录格式](../references/progress-schema.md)
 - [已确认产物的生命周期与请求格式](../references/confirmed-artifacts.md)
+- [材料角色、扫描与按差异确认](../references/materials.md)
 - [论文章节规则](../references/paper-section-contract.md)
 - [科研图件集成](../references/scientific-visualization-integration.md)
 - [参考优先绘图接续](../references/reference-led-figures.md)
+- [绘图实现适配](../references/figure-implementation-adapter.md)
 - [两份绘图 Skill 的分发范围](figure-skill-distribution.md)
 - [终稿编辑集成](../references/final-editor-integration.md)
 - [语言自然化集成](../references/humanizer-adapter.md)
@@ -47,3 +51,4 @@
 这些文件记录实现时的决策与当时的检查结果，适合回溯设计原因。当前功能和用法以 README、用户教程及现有代码为准。
 
 - [v1.1.0 验证记录](release-verification-v1.1.0.md)
+- [材料版本管理本地验证记录](material-management-verification.md)

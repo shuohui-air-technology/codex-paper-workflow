@@ -43,12 +43,13 @@ Paper Workflow Orchestrator 是一套面向 Codex 的研究到论文工作流。
 codex-paper-workflow/
 ├── SKILL.md                         # 顶层工作流、阶段路由和运行时合同
 ├── agents/openai.yaml               # Codex 中展示和调用 Skill 的接口元数据
-├── companion-skills/                # 与主工作流共同发布的 Router 和终稿编辑 Skill
+├── companion-skills/                # 本项目维护的 Router、终稿编辑和参考优先绘图 Skill
 ├── references/                      # 阶段、章节、进度及集成合同
 ├── scripts/                         # 验证器、状态管理器和安装器
 │   ├── workflow_studio.py            # 面向使用者的本地界面启动器
 │   ├── workflow_manager.py           # 自定义流程的 JSON 命令行接口
 │   ├── artifact_manager.py           # 已确认产物的索引、解析、采纳与展示恢复
+│   ├── material_manager.py           # 候选材料登记、哈希差异与批量确认
 │   ├── confirmed_artifacts.py        # 版本快照、确认目录与可重建展示存储
 │   └── workflow_engine/              # 流程解析、校验、调度、存储与本地服务
 ├── tests/                           # unittest 测试与历史版本夹具
@@ -154,6 +155,7 @@ python -B -m unittest discover -s tests -v
 | 修改论文章节规则 | `references/paper-section-contract.md` | `paper_section_validator.py` 及对应测试 |
 | 修改进度状态 | `scripts/progress_manager.py` | `progress-schema.md`、历史 fixtures、版本测试 |
 | 修改已确认产物管理 | `scripts/artifact_manager.py` | 确认索引、快照完整性、并发确认及展示恢复测试 |
+| 修改候选材料与恢复摘要 | `scripts/material_manager.py`、[材料合同](references/materials.md) | `tests/test_material_manager.py`：身份、差异、事务、旧项目与冻结输入 |
 | 修改科研图件规则 | `scripts/figure_contract_validator.py` | visualization integration、figure tests |
 | 修改语言自然化检查 | `scripts/humanizer_preflight.py` | humanizer adapter、受保护内容测试 |
 | 修改终稿回执 | Final Editor Skill 与回执验证器 | final-editor integration、完整性测试 |

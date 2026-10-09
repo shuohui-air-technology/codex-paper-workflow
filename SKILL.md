@@ -9,10 +9,14 @@ metadata:
 ## Resolve workflow mode before reading project progress
 
 At the start of a project session, use the installed Orchestrator's
-`scripts/workflow_manager.py summary --project <project-root> --json` and check
-its `mode` before opening `progress.md` or any workflow state. A `mode: official`
+`scripts/material_manager.py resume --project <project-root> --json` (add
+`--role <role-id>` for the task's required roles). It resolves mode through
+`workflow_manager.py summary` before reading progress, detects candidate changes,
+and returns hash-verified confirmed snapshot bindings. Check its `mode` before
+opening `progress.md` or any workflow state. A `mode: official`
 result, including the default when no selection has been recorded, selects
-Official v1.0: follow only the official contract marked below; do not inspect
+Official v1.0: follow the official stage contract marked below and the shared
+material handling in this file; do not inspect
 custom drafts or run files. If it reports
 `custom`, follow the [custom workflow contract](references/custom-workflow-contract.md).
 In custom mode, the custom state is the only runtime authority. Do not update
@@ -22,11 +26,13 @@ cannot be verified, stop and report the issue; never fall back silently.
 
 ## Keep working outputs separate from confirmed versions
 
-In both workflow modes, use the compact confirmation-catalog summary on resume.
-Resolve the relevant artifact role with `scripts/artifact_manager.py resolve`
-before preparing a new context pack; use the returned catalog revision and
-verified snapshot path. Treat filename suffixes and modification times as
-working-file information, not confirmation authority.
+In both workflow modes, resume with the combined material summary above. Read
+the task's verified snapshot bindings, not a working candidate or a generated
+index view. Unrelated candidate changes do not block reading an intact adopted
+version. A missing or damaged required snapshot does block that read. Treat
+filename suffixes and modification times as working-file information, not
+confirmation authority. `scripts/artifact_manager.py resolve` remains available
+for direct, revision-bound resolution.
 
 After the appropriate stage checks pass and the user confirms adoption, use
 `scripts/artifact_manager.py accept` to record the confirmation, preserve an
@@ -40,7 +46,38 @@ confirmed snapshots become new-run external inputs only through explicit
 registration. For official progress, use the latest summary's document digest
 with `progress_manager.py update-snapshot` for bounded, transactional field
 updates. Read historical progress events and artifact versions only when the
-current snapshot, active rules, or selected task require them.
+current snapshot, active rules, or selected task require them. When preparing
+custom external inputs, use `workflow_manager.py register-confirmed-input` to
+bind the resolved role/version to a declared artifact ID. Existing runs retain
+their frozen inputs; report `run_input_differences` before a newer-run decision.
+
+## Register materials and review only changes
+
+For continuing projects, register stable roles such as `main-manuscript`,
+`figure-2`, or `experiment-results`, each with named candidates and an explicit
+multi-file bundle. Explain proposed roles/files to the user; registration records
+working material and grants no adoption. Existing confirmed roles appear without
+re-registering. Read [materials.md](references/materials.md) when registering,
+scanning, selecting a batch, or diagnosing a stale review.
+
+Use `material_manager.py review` to compare candidates with adopted content. Reuse
+unchanged content without a fresh approval or version, even at another path.
+Present only changed files, useful bounded text differences, and any ambiguous
+candidate selection. Ask for one explicit decision for the selected batch;
+`accept` binds that decision to the saved review's hashes and catalog revision.
+Stage outputs retain their original progress/receipt verification requirements.
+Input adoption records which supplied materials to use, not scientific validity.
+
+Keep historical alternatives available without repeatedly asking to adopt them.
+New unregistered files and duplicate names are discovery hints, not role assignments.
+Persist a suitable discovery scope with `scan`; later resumes reuse that scope
+and still inspect all registered candidates. Surface incomplete scans and ask to
+adjust scopes rather than claiming an exhaustive inventory. Use read-only `resume`
+between edits; update the scan baseline when intentionally refreshing the inventory.
+If resume detects a unique candidate relocation, save a `scan` before editing
+at the new path so later changes retain that candidate's identity. This updates
+working associations, not the adopted version. Ambiguous moves require an
+explicit candidate/path choice instead.
 
 ## Optional reference-led figure workflow
 
@@ -52,7 +89,10 @@ record. Local label/spacing fixes use the current tool directly.
 
 Read [reference-led-figures.md](references/reference-led-figures.md) for this
 optional subflow, explicit custom nodes, input declarations, and figure-receipt
-adaptation. In custom mode, each claimed task invokes its fixed primary Skill;
+adaptation. Before dispatching a plotting node, read
+[figure-implementation-adapter.md](references/figure-implementation-adapter.md)
+and include its applicable scope and handoff requirements in the task brief.
+In custom mode, each claimed task invokes its fixed primary Skill;
 an internal request to invoke another Skill becomes a separately configured
 node. The default Official v1.0 figure route remains the contract below; select
 the optional route explicitly in Studio or use the narrow figure Skills directly.

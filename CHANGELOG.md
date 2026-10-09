@@ -2,9 +2,20 @@
 
 ## Unreleased
 
-- Bundles `reference-first-figures` and `nature-figure` independently in standard
-  and full installations, with portable reference resources and scoped Python/R
-  handoffs that preserve established designs, backends and native-tool panels.
+- Tracks stable material roles and explicit candidate bundles, compares actual
+  content with adopted snapshots, and recognizes exact duplicates, historical
+  content and unambiguous moves without choosing versions by name or date.
+- Adds saved-scope scanning and a compact, read-only resume with bounded text
+  differences, verified snapshot bindings and frozen-run input differences.
+  Changed roles can be adopted in one revision-checked catalog transaction;
+  unchanged roles reuse their confirmation and checked outputs retain their gates.
+- Registers confirmed snapshots as declared custom inputs by role and catalog
+  revision, with a second hash check inside the run transaction.
+
+- Bundles the project-developed `reference-first-figures` and installs the
+  third-party `nature-figure` from a fixed `Yuan1z0825/nature-skills` commit in
+  standard and full profiles. Keeps project-specific figure handoff rules in
+  the orchestrator's references while preserving the upstream Skill and license.
 - Adds a selectable reference-led figure template in Studio: reference design,
   implementation, human confirmation, read-only comparison and receipt validation.
   Loading the template creates a browser draft without changing the active workflow.

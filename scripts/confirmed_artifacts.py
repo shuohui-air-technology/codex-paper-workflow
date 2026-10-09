@@ -438,6 +438,10 @@ class ConfirmedArtifactStore:
     def list(self, *, verify=False):
         return self.status(verify=verify)
 
+    def metadata(self):
+        """Read validated version metadata without verifying or changing files."""
+        return _clone(self._catalog())
+
     def resolve(self, artifact_id, expected_revision=None):
         _identifier(artifact_id)
         catalog = self._catalog()
@@ -578,33 +582,65 @@ class ConfirmedArtifactStore:
             existing = self._idempotent(catalog, request["operation_id"], digest)
             if existing:
                 return self._operation_result(catalog, existing, idempotent=True)
-            self._cas(catalog, request["expected_catalog_revision"])
-            artifact_id = request["artifact_id"]
-            old = catalog["artifacts"].get(artifact_id)
-            if old and old["artifact_type"] != request["artifact_type"]:
-                _fail("artifact_type_changed", "An artifact identifier retains its original type across versions.")
-            provenance = provenance_factory(_clone(request, MAX_REQUEST_BYTES))
-            if type(provenance) is not dict:
-                _fail("invalid_provenance", "Provenance callback must return a JSON object.")
-            provenance = _clone(provenance, MAX_PROVENANCE_BYTES)
-            version_id = f'v{catalog["revision"] + 1:08d}-{secrets.token_hex(8)}'
-            snapshot = self._snapshot_root(artifact_id, version_id)
-            self._mkdir(snapshot)
-            sizes = {}
-            for item in request["files"]:
-                sizes[item["relative_path"]] = self._copy_verified(item["source_path"], f'{snapshot}/{item["relative_path"]}', item["sha256"])
-                if sum(sizes.values()) > MAX_BUNDLE_BYTES:
-                    _fail("bundle_too_large", "Bundle exceeds the total byte limit.")
-            version = {"request": request, "provenance": provenance,
-                       "accepted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "sizes": sizes}
-            self._verify_snapshot(artifact_id, version_id, version)
-            artifact = old or {"artifact_type": request["artifact_type"], "current_version": None, "versions": {}, "withdrawal": None}
-            artifact["versions"][version_id] = version
-            artifact["current_version"] = version_id
-            artifact["withdrawal"] = None
-            catalog["artifacts"][artifact_id] = artifact
-            operation = self._new_operation(catalog, request["operation_id"], digest, "accept", artifact_id, version_id)
+            operation = self._stage_accept(catalog, request, provenance_factory)
             return self._commit(catalog, request["operation_id"], operation)
+
+    def accept_batch(self, requests, provenance_factory):
+        """Publish all selected roles with one catalog commit and one display update.
+
+        Each request retains the existing per-role evidence and operation receipt.
+        An interrupted preparation can leave unreferenced snapshots, but none of
+        the selected roles becomes current until the complete catalog is committed.
+        """
+        if type(requests) is not list or not 1 <= len(requests) <= MAX_FILES:
+            _fail("invalid_batch", "Select a bounded, non-empty list of roles.")
+        requests = [normalize_request(item) for item in requests]
+        if not callable(provenance_factory):
+            _fail("invalid_provenance", "A provenance validation callback is required.")
+        for field in ("artifact_id", "operation_id"):
+            if len({item[field] for item in requests}) != len(requests):
+                _fail("invalid_batch", "Each role and operation occurs once in a batch.")
+        with self._lock():
+            catalog = self._catalog()
+            existing = [self._idempotent(catalog, item["operation_id"], _digest(item)) for item in requests]
+            if any(existing):
+                if not all(existing):
+                    _fail("partial_batch", "Only part of this batch is recorded; inspect its receipts.")
+                results = [self._operation_result(catalog, item, idempotent=True) for item in existing]
+                return {"committed": True, "idempotent": True, "catalog_revision": catalog["revision"],
+                        "projection_pending": any(item["projection_pending"] for item in results), "results": results}
+            operations = [self._stage_accept(catalog, item, provenance_factory) for item in requests]
+            committed = self._commit(catalog, requests[-1]["operation_id"], operations[-1])
+            results = [self._operation_result(catalog, item, idempotent=False) for item in operations]
+            return {**committed, "results": results}
+
+    def _stage_accept(self, catalog, request, provenance_factory):
+        self._cas(catalog, request["expected_catalog_revision"])
+        artifact_id = request["artifact_id"]
+        old = catalog["artifacts"].get(artifact_id)
+        if old and old["artifact_type"] != request["artifact_type"]:
+            _fail("artifact_type_changed", "An artifact identifier retains its original type across versions.")
+        provenance = provenance_factory(_clone(request, MAX_REQUEST_BYTES))
+        if type(provenance) is not dict:
+            _fail("invalid_provenance", "Provenance callback must return a JSON object.")
+        provenance = _clone(provenance, MAX_PROVENANCE_BYTES)
+        version_id = f'v{catalog["revision"] + 1:08d}-{secrets.token_hex(8)}'
+        snapshot = self._snapshot_root(artifact_id, version_id)
+        self._mkdir(snapshot)
+        sizes = {}
+        for item in request["files"]:
+            sizes[item["relative_path"]] = self._copy_verified(item["source_path"], f'{snapshot}/{item["relative_path"]}', item["sha256"])
+            if sum(sizes.values()) > MAX_BUNDLE_BYTES:
+                _fail("bundle_too_large", "Bundle exceeds the total byte limit.")
+        version = {"request": request, "provenance": provenance,
+                   "accepted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "sizes": sizes}
+        self._verify_snapshot(artifact_id, version_id, version)
+        artifact = old or {"artifact_type": request["artifact_type"], "current_version": None, "versions": {}, "withdrawal": None}
+        artifact["versions"][version_id] = version
+        artifact["current_version"] = version_id
+        artifact["withdrawal"] = None
+        catalog["artifacts"][artifact_id] = artifact
+        return self._new_operation(catalog, request["operation_id"], _digest(request), "accept", artifact_id, version_id)
 
     def withdraw(self, artifact_id, expected_revision, operation_id, reason):
         _identifier(artifact_id)

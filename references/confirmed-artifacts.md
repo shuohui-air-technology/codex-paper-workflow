@@ -10,6 +10,13 @@
 
 ## Authorities and directories
 
+For working candidate registration, content differences and batch decisions,
+use [material management](materials.md). It reuses this catalog as the single
+adoption authority. Input-role adoption records supplied material selection;
+output-role adoption retains the checked-stage provenance below. The combined
+`material_manager.py resume` resolves mode before progress and returns verified
+bindings rather than guessing a version from dates, filenames or generated views.
+
 Keep three separate facts:
 
 | Fact | Authority |

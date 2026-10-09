@@ -97,7 +97,7 @@ export const test = base.extend<{ studio: StudioSession }>({
     const codexHome = join(tempRoot, 'isolated-codex-home');
     mkdirSync(projectRoot);
     mkdirSync(codexHome);
-    for (const skillId of ['research-skill-router', 'reference-first-figures', 'nature-figure']) {
+    for (const skillId of ['research-skill-router', 'reference-first-figures']) {
       cpSync(
         join(REPOSITORY_ROOT, 'companion-skills', skillId),
         join(skillsRoot, skillId),
